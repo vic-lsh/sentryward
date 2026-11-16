@@ -197,7 +197,7 @@ EVIDENCE_FIELDS = frozenset({"races", "race_count", "race_samples_truncated", "f
     "failed_required_orders_count", "failed_required_orders_sample_limit", "failed_required_orders_truncated",
     "counterexample", "rejection", "rejection_kind", "source_events", "synthetic_events", "source_event_scope",
     "provenance_events_total", "unmapped_witness_events", "witness_event_list_limit",
-    "witness_event_lists_truncated", "unsupported_memory_pair"})
+    "witness_event_lists_truncated", "unsupported_memory_pair", "footprint"})
 
 def public_stage(stage):
     """Public stage of an internal stage name (mirrors result.h PublicStage).
@@ -223,7 +223,7 @@ def public_stage(stage):
     if stage == "memory_effect_binding" or stage.startswith(("value_", "semantic_ir", "scalar_", "expression",
             "equivalence", "reference_", "left_", "right_")) or stage.endswith("_s"):
         return "equivalence"
-    if stage.startswith(("ptx_execution", "source_ir", "event_view", "memory_", "synchronization", "lifecycle",
+    if stage.startswith(("ptx_execution", "source_ir", "event_view", "memory_", "footprint_", "synchronization", "lifecycle",
                          "cluster_", "shared_memory", "verification", "frontend")):
         return "synchronization"
     return "pipeline"
@@ -241,7 +241,8 @@ def is_public(report):
     if "internal" in report or "evidence" in report:
         return True
     checks = report.get("checks")
-    return (isinstance(checks, dict) and set(checks) == {"synchronization", "equivalence"}
+    return (isinstance(checks, dict) and set(checks) in ({"synchronization", "equivalence"},
+                                                         {"synchronization", "equivalence", "footprint"})
             and all(key in PUBLIC_FIELDS or key.startswith("_") for key in report))
 
 def _strip_sections(section):
@@ -290,6 +291,8 @@ def publish(report):
     if "diagnostics" in report:
         published["diagnostics"] = diagnostics
     published["checks"] = {"synchronization": merged, "equivalence": checks.get("equivalence", "not_requested")}
+    if "footprint" in checks:
+        published["checks"]["footprint"] = checks["footprint"]
     if evidence:
         published["evidence"] = evidence
     _strip_sections(internal)

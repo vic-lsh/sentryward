@@ -4,6 +4,7 @@
     "race_free",
     "not_wellsynced",
     "potential_race",
+    "footprint_violation",
     "invalid_lifecycle",
     "undefined_behavior",
     "equivalence_not_proven",
