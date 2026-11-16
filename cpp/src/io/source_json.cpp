@@ -4,6 +4,7 @@
 #include "sentryward/algorithm/diagnostics/ir_size_profile.h"
 #include "sentryward/algorithm/diagnostics/memory_profile.h"
 #include "sentryward/algorithm/io/source_json.h"
+#include "sentryward/algorithm/checker/footprint_checker.h"
 #include "sentryward/algorithm/io/source_storage.h"
 
 #include <algorithm>
@@ -1850,6 +1851,17 @@ std::string Analyze(Input&& source, bool verify, MemoryRaceOptions memory_option
       record_hb("memory", before);
       if (memory) result.memory = std::move(memory.value());
       else result.memory_error = memory.error();
+      // Footprint containment over the same accesses and address model (all CTAs of this program).
+      if (!input.footprints_json.empty()) {
+        if (memory_options.units)
+          throw std::logic_error("footprint check requires the per-unit path (CTA class mode is disabled by a footprint declaration)");
+        auto footprint = ProfileCall("memory.footprint", [&] {
+          return CheckFootprints(*compute_accesses, input.program.actors, memory_model, input.footprints_json);
+        });
+        report["footprint"] = Json::parse(footprint.json);
+        report["checks"]["footprint"] = footprint.status == FootprintStatus::kContained ? "passed"
+            : footprint.status == FootprintStatus::kViolated ? "failed" : "incomplete";
+      }
     }
     switch (result.status()) {
       case VerificationStatus::kSynchronizationRejected:

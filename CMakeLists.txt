@@ -100,6 +100,7 @@ add_library(sentryward_algorithm STATIC
   cpp/src/checker/duplicate_tma_stores.cpp
   cpp/src/checker/same_value_writes.cpp
   cpp/src/checker/verifier.cpp
+  cpp/src/checker/footprint_checker.cpp
 )
 add_library(sentryward::algorithm ALIAS sentryward_algorithm)
 target_link_libraries(sentryward_algorithm PUBLIC Threads::Threads)
