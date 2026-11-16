@@ -354,7 +354,7 @@ KernelInput ParseKernelInput(const Json &value) {
     for (std::size_t i = 0; i < root["footprints"].size(); ++i) {
       auto &f = root["footprints"][i];
       const auto path = ItemPath("footprints", i);
-      Object(f, {"object", "direction", "extent_bytes", "extent_elements", "element_type"}, path);
+      Object(f, {"object", "direction", "extent_bytes", "extent_elements", "element_type", "periodic"}, path);
       String(f.value("object", Json()), path + ".object");
       if (!objects.insert(f["object"].get<std::string>()).second)
         Fail("duplicate_footprint", path + ".object", "object already has a footprint");
@@ -374,6 +374,19 @@ KernelInput ParseKernelInput(const Json &value) {
         f["extent_bytes"] = count * element_bytes.at(type.get<std::string>());
         f.erase("extent_elements");
         f.erase("element_type");
+      }
+      // Optional interleaved layout: piece c, byte j of row k is byte k*stride + offset + c*period + j
+      // (c < count, j < width). Accesses must fall inside one piece; extent_bytes is still the allocation.
+      if (f.contains("periodic")) {
+        auto &q = f["periodic"];
+        Object(q, {"stride", "period", "count", "offset", "width"}, path + ".periodic");
+        const auto stride = Natural(q.value("stride", Json()), path + ".periodic.stride", 1);
+        const auto period = Natural(q.value("period", Json()), path + ".periodic.period", 1);
+        const auto count = Natural(q.value("count", Json()), path + ".periodic.count", 1);
+        const auto offset = Natural(q.value("offset", Json()), path + ".periodic.offset");
+        const auto width = Natural(q.value("width", Json()), path + ".periodic.width", 1);
+        if (width > period || offset + (count - 1) * period + width > stride)
+          Fail("invalid_footprint", path + ".periodic", "pieces must fit the period and the row stride");
       }
     }
   }

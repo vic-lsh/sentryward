@@ -18,9 +18,21 @@ using Json = nlohmann::json;
 constexpr std::size_t kSamplesPerKind = 4;
 constexpr std::size_t kSamplesTotal = 32;
 
+struct Periodic {
+  std::uint64_t stride, period, count, offset, width;
+  // Whether [low, low + bytes) lies inside one piece of one row.
+  [[nodiscard]] bool Contains(std::uint64_t low, std::uint64_t bytes) const {
+    const auto column = low % stride, piece = (column - std::min(column, offset)) / period;
+    if (column < offset || piece >= count) return false;
+    const auto start = offset + piece * period;
+    return column >= start && column - start + bytes <= width;
+  }
+};
+
 struct Declared {
   std::string direction;  // read, write, readwrite
   std::uint64_t extent = 0;
+  std::optional<Periodic> periodic;
 };
 
 struct ObjectStats {
@@ -47,9 +59,14 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
   };
   const auto grid = dims("grid_dim"), block = dims("block_dim");
   std::map<std::string, Declared> declared;
-  for (const auto& item : spec.at("objects"))
-    declared[item.at("object").get<std::string>()] = {item.at("direction").get<std::string>(),
-                                                      item.at("extent_bytes").get<std::uint64_t>()};
+  for (const auto& item : spec.at("objects")) {
+    Declared decl{item.at("direction").get<std::string>(), item.at("extent_bytes").get<std::uint64_t>(), std::nullopt};
+    if (item.contains("periodic")) {
+      const auto& q = item.at("periodic");
+      decl.periodic = Periodic{q.at("stride"), q.at("period"), q.at("count"), q.at("offset"), q.at("width")};
+    }
+    declared[item.at("object").get<std::string>()] = std::move(decl);
+  }
   // Block and in-block thread ordinal of each actor (actor ids of one CTA are consecutive in thread order).
   ActorCtas ctas(actors);
   std::unordered_map<std::uint32_t, std::uint32_t> thread_of;
@@ -121,6 +138,27 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     } else {
       st.interval_complete = false;
     }
+    if (decl.periodic && verdict.status == ContainmentVerdict::Status::kContained) {
+      // Interleaved layout: the byte range must lie in one declared piece (exact for constant offsets only).
+      if (!verdict.constant_offset) {
+        auto undecided_verdict = verdict;
+        undecided_verdict.status = ContainmentVerdict::Status::kUnknown;
+        undecided_verdict.reason = "periodic footprint is checked for constant offsets only";
+        ++report.unknown;
+        ++st.undecided;
+        if (undecided_reasons[undecided_verdict.reason]++ == 0 && undecided.size() < kSamplesTotal)
+          undecided.push_back(sample(access, "undecided", object, undecided_verdict, decl.extent));
+        continue;
+      }
+      if (!decl.periodic->Contains(static_cast<std::uint64_t>(*verdict.min_byte), *access.bytes)) {
+        auto outside = verdict;
+        outside.status = ContainmentVerdict::Status::kViolated;
+        outside.side = "outside_declared_pieces";
+        outside.witness = "offset=" + std::to_string(*verdict.min_byte);
+        violation(access, "outside_declared_pieces", object, outside, decl.extent);
+      }
+      continue;
+    }
     switch (verdict.status) {
       case ContainmentVerdict::Status::kContained: break;
       case ContainmentVerdict::Status::kViolated:
@@ -142,6 +180,7 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     if (const auto it = declared.find(name); it != declared.end()) {
       entry["declared_direction"] = it->second.direction;
       entry["declared_extent_bytes"] = it->second.extent;
+      if (it->second.periodic) entry["declared_periodic"] = true;
     }
     entry["inferred_direction"] = st.reads && st.writes ? "readwrite" : st.writes ? "write" : "read";
     if (st.min_byte && st.max_byte) {
