@@ -848,40 +848,117 @@ struct SymbolicAddressModel::Impl {
       verdict.status = ContainmentVerdict::Status::kContained;
       return verdict;
     }
+    // The supremum and infimum of the symbolic part (offset without its constant) over the
+    // environment, found once per symbolic part by bisection with the solver; every access with
+    // that symbolic part and any constant (a loop's offsets differ only in the constant) is then
+    // decided by arithmetic.
+    Affine symbolic = offset;
+    symbolic.constant = 0;
+    auto& extremes = ExtremesOf(symbolic, hull, timeout_ms);
+    if (extremes.env_unsat)
+      return unknown("address invariants and tensor properties are unsatisfiable for this access");
+    const auto violated = [&](const char* side, const std::string& valuation, std::optional<Int> total) {
+      verdict.status = ContainmentVerdict::Status::kViolated;
+      verdict.side = side;
+      verdict.witness = valuation + (total ? ", offset=" + ToString(*total) : std::string{});
+      return verdict;
+    };
+    if (extremes.inf_unbounded || (extremes.inf && offset.constant + *extremes.inf < 0))
+      return violated("below_zero", extremes.inf_witness,
+                      extremes.inf ? std::optional<Int>(offset.constant + *extremes.inf) : std::nullopt);
+    if (extremes.sup_unbounded || (extremes.sup && offset.constant + *extremes.sup + width > Int(*extent)))
+      return violated("past_extent", extremes.sup_witness,
+                      extremes.sup ? std::optional<Int>(offset.constant + *extremes.sup) : std::nullopt);
+    if (extremes.inf_unknown || extremes.sup_unknown) return unknown(extremes.reason);
+    verdict.status = ContainmentVerdict::Status::kContained;
+    return verdict;
+  }
+
+  struct Extremes final {
+    bool env_unsat = false, sup_unknown = false, inf_unknown = false, sup_unbounded = false, inf_unbounded = false;
+    std::optional<Int> sup, inf;
+    std::string sup_witness, inf_witness, reason;
+  };
+  std::map<std::string, Extremes> extreme_cache;
+
+  Extremes& ExtremesOf(const Affine& symbolic, const std::optional<std::pair<Int, Int>>& hull, unsigned timeout_ms) {
+    auto [slot, fresh] = extreme_cache.try_emplace(symbolic.key());
+    auto& result = slot->second;
+    if (!fresh) return result;
     std::set<AtomId> selected;
-    for (const auto& [atom, ignored] : offset.terms) { (void)ignored; selected.insert(atom); }
-    const Int infinity = Int(1) << 100;
-    struct Side { const char* name; Int lower, upper; };
-    const Side sides[] = {{"below_zero", -infinity, 0}, {"past_extent", Int(*extent) - width, infinity}};
-    bool all_unsat = true;
-    for (const auto& side : sides) {
+    for (const auto& [atom, ignored] : symbolic.terms) { (void)ignored; selected.insert(atom); }
+    // An atom that no tensor property or invariant constrains is a free integer: the symbolic part
+    // is unbounded both ways, with no solver call (one per atom would dominate large launches).
+    const auto constrained = [&](AtomId atom) {
+      const auto& a = atoms[atom];
+      if (!a.gather.empty() && (gather_policies.contains(a.gather) || pinned_gathers.contains(a.gather))) return true;
+      for (const auto& bound : term_bounds)
+        for (const auto& [member, ignored] : bound.term.terms) { (void)ignored; if (member == atom) return true; }
+      return false;
+    };
+    if (std::none_of(selected.begin(), selected.end(), constrained)) {
+      const auto& free = atoms[*selected.begin()];
+      result.sup_unbounded = result.inf_unbounded = true;
+      result.sup_witness = result.inf_witness = "unconstrained value " + free.key;
+      return result;
+    }
+    using address_solver::Verdict;
+    // Is there a valuation of the environment with T strictly between lower and upper?
+    struct Probe { Verdict environment, goal; std::string detail; };
+    const auto probe = [&](Int lower, Int upper) {
       std::map<AtomId, std::size_t> variables;
       auto query = Instantiate(selected, variables);
-      query.goal = {offset.constant, {}};
-      for (const auto& [atom, coefficient] : offset.terms) query.goal.terms.emplace_back(variables.at(atom), coefficient);
-      query.goal_lower = side.lower;
-      query.goal_upper = side.upper;
+      query.goal = {0, {}};
+      for (const auto& [atom, coefficient] : symbolic.terms) query.goal.terms.emplace_back(variables.at(atom), coefficient);
+      query.goal_lower = lower;
+      query.goal_upper = upper;
       ++stats.solver_queries;
-      const auto answer = solver->solve(query, timeout_ms);
-      using address_solver::Verdict;
-      if (answer.environment == Verdict::kUnsat) {
-        ++stats.solver_unknown;
-        return unknown("address invariants and tensor properties are unsatisfiable for this access");
+      auto answer = solver->solve(query, timeout_ms);
+      (answer.goal == Verdict::kSat ? stats.solver_sat : answer.goal == Verdict::kUnsat ? stats.solver_unsat
+                                                                                         : stats.solver_unknown)++;
+      return Probe{answer.environment, answer.goal, std::move(answer.detail)};
+    };
+    const Int far = Int(1) << 100;
+    // Bisection for the supremum (upper) or, mirrored, the infimum of T.
+    const auto bisect = [&](bool upper, std::optional<Int>& value, std::string& witness, bool& unbounded,
+                            bool& unknown) {
+      const auto beyond = [&](Int threshold) { return upper ? probe(threshold, far) : probe(-far, threshold); };
+      Int outside = hull ? (upper ? hull->second : hull->first) : (upper ? far / 2 : -far / 2);
+      auto first = beyond(outside);
+      if (first.environment == Verdict::kUnsat) { result.env_unsat = true; return; }
+      if (first.goal == Verdict::kSat) { unbounded = true; witness = first.detail; return; }
+      if (first.goal != Verdict::kUnsat) { unknown = true; result.reason = first.detail; return; }
+      if (!hull) { unknown = true; result.reason = "symbolic part has no interval hull"; return; }
+      // Invariant: T beyond `inside` is satisfiable, T beyond `outside` is not.
+      Int inside = upper ? hull->first - 1 : hull->second + 1;
+      auto best = beyond(inside);
+      if (best.goal != Verdict::kSat) {
+        unknown = true;
+        result.reason = best.detail.empty() ? "SMT result unknown" : best.detail;
+        return;
       }
-      if (answer.environment == Verdict::kSat && answer.goal == Verdict::kSat) {
-        ++stats.solver_sat;
-        verdict.status = ContainmentVerdict::Status::kViolated;
-        verdict.side = side.name;
-        verdict.witness = answer.detail;
-        return verdict;
+      while ((upper ? outside - inside : inside - outside) > 1) {
+        const Int middle = inside + (outside - inside) / 2;
+        auto answer = beyond(middle);
+        if (answer.goal == Verdict::kSat) { inside = middle; best = std::move(answer); }
+        else if (answer.goal == Verdict::kUnsat) outside = middle;
+        else {
+          unknown = true;
+          result.reason = answer.detail.empty() ? "SMT result unknown" : answer.detail;
+          return;
+        }
       }
-      if (answer.environment == Verdict::kSat && answer.goal == Verdict::kUnsat) { ++stats.solver_unsat; continue; }
-      ++stats.solver_unknown;
-      all_unsat = false;
-      verdict.reason = answer.detail.empty() ? "SMT result unknown" : answer.detail;
+      value = outside;  // the extreme itself: a valuation beyond `inside` exists, none beyond `outside`
+      witness = best.detail;
+    };
+    if (solver) {
+      bisect(true, result.sup, result.sup_witness, result.sup_unbounded, result.sup_unknown);
+      if (!result.env_unsat) bisect(false, result.inf, result.inf_witness, result.inf_unbounded, result.inf_unknown);
+    } else {
+      result.sup_unknown = result.inf_unknown = true;
+      result.reason = "symbolic offset needs the SMT layer, which this build lacks";
     }
-    verdict.status = all_unsat ? ContainmentVerdict::Status::kContained : ContainmentVerdict::Status::kUnknown;
-    return verdict;
+    return result;
   }
 
   OverlapEvidence Evidence(const Shape& a, std::uint64_t wa, const Shape& b, std::uint64_t wb, Int d) const {
