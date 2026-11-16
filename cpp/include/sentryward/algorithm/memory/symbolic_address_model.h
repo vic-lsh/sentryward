@@ -68,6 +68,21 @@ struct SymbolicAddressStats final {
   friend bool operator==(const SymbolicAddressStats&, const SymbolicAddressStats&) = default;
 };
 
+// Containment of one access's byte range in [0, extent) of its allocation (footprint check).
+struct ContainmentVerdict final {
+  enum class Status { kContained, kViolated, kUnknown };
+  Status status = Status::kUnknown;
+  std::string address_space;
+  std::string allocation;
+  // Touched byte interval [min_byte, max_byte_exclusive) of the access when it is bounded:
+  // exact for a constant offset, the interval hull over the atom bounds for a symbolic one.
+  std::optional<std::int64_t> min_byte, max_byte_exclusive;
+  bool constant_offset = false;
+  // kViolated: which side ("below_zero" or "past_extent") and the offset (constant) or the
+  // solver's candidate valuation (symbolic); kUnknown: why.
+  std::string side, witness, reason;
+};
+
 // Symbolic dynamic-address overlap (dynamic.pdf, layers 0 and 2).
 //
 // Addresses are allocation-tagged affine forms over interned atoms. Pairs the
@@ -118,6 +133,13 @@ class SymbolicAddressModel final : public MemoryModel {
   // bindings. Unknown when either footprint has another suffix or is not affine.
   [[nodiscard]] OverlapResult translatedFamilyOverlap(const MemoryAccessFamily& a, const FamilyFootprint& x,
                                                       const MemoryAccessFamily& b, const FamilyFootprint& y) override;
+  // Footprint containment. `extent_bytes` null: only the touched interval is computed. Shapes the
+  // address model cannot express (unresolved allocation, TMA regions, non-affine offsets) are
+  // kUnknown, never kContained. Symbolic offsets are decided by the address solver over the
+  // tensor-property and address-invariant environment, with `timeout_ms` per query.
+  [[nodiscard]] ContainmentVerdict containment(const MemoryAccess& access,
+                                                std::optional<std::uint64_t> extent_bytes,
+                                                unsigned timeout_ms = 2000);
   [[nodiscard]] SymbolicAddressStats stats() const noexcept;
   // Whether this build links an SMT backend, and its name ("z3" or "unavailable").
   [[nodiscard]] static bool SolverAvailable() noexcept;

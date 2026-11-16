@@ -780,6 +780,110 @@ struct SymbolicAddressModel::Impl {
     return OverlapResult::Unknown(answer.detail.empty() ? "SMT result unknown" : answer.detail, "address_solver_inconclusive");
   }
 
+
+  // ---- Footprint containment ----
+
+  // The interval of an affine offset over the declared atom bounds (nullopt when an atom is unbounded).
+  std::optional<std::pair<Int, Int>> Hull(const Affine& offset) const {
+    Int low = offset.constant, high = offset.constant;
+    for (const auto& [atom, coefficient] : offset.terms) {
+      const auto policy = gather_policies.find(atoms[atom].gather);
+      if (atoms[atom].gather.empty() || policy == gather_policies.end() || !policy->second.lower ||
+          !policy->second.upper)
+        return std::nullopt;
+      const Int a = coefficient * *policy->second.lower, b = coefficient * *policy->second.upper;
+      low += std::min(a, b);
+      high += std::max(a, b);
+    }
+    return std::pair{low, high};
+  }
+
+  static std::int64_t Clamp(Int value) {
+    const Int limit = Int(std::numeric_limits<std::int64_t>::max());
+    return static_cast<std::int64_t>(std::max(-limit, std::min(limit, value)));
+  }
+
+  ContainmentVerdict Contain(const MemoryAccess& access, std::optional<std::uint64_t> extent,
+                             unsigned timeout_ms) {
+    ContainmentVerdict verdict;
+    const auto unknown = [&](std::string reason) { verdict.status = ContainmentVerdict::Status::kUnknown;
+                                                   verdict.reason = std::move(reason); return verdict; };
+    if (error) return unknown("invalid symbolic-address model: " + error->message);
+    const auto* address = std::get_if<AddressId>(&access.address);
+    if (!address) return unknown("register endpoint");
+    const auto found = binding_shapes.find(address->value());
+    if (found == binding_shapes.end()) return unknown("access has no address binding");
+    const Shape& shape = shapes[found->second];
+    verdict.address_space = names[shape.space];
+    if (shape.base == Base::kAllocation) verdict.allocation = names[shape.identity];
+    if (shape.absent) { verdict.status = ContainmentVerdict::Status::kContained; return verdict; }
+    if (shape.base != Base::kAllocation) return unknown("allocation is unresolved: " + Describe(shape));
+    if (shape.region_bytes) return unknown("TMA region footprint is not an exact byte range");
+    if (!shape.offset) return unknown("offset is not an affine form");
+    if (!access.bytes) return unknown("access width is unknown");
+    const Int width = Int(*access.bytes);
+    const Affine& offset = *shape.offset;
+    const auto hull = Hull(offset);
+    if (hull) {
+      verdict.min_byte = Clamp(hull->first);
+      verdict.max_byte_exclusive = Clamp(hull->second + width);
+    }
+    verdict.constant_offset = offset.terms.empty();
+    if (!extent && !verdict.constant_offset) return verdict;
+    if (verdict.constant_offset) {
+      const Int low = offset.constant;
+      const bool below = low < 0, past = extent && low + width > Int(*extent);
+      if (below || past) {
+        verdict.status = ContainmentVerdict::Status::kViolated;
+        verdict.side = below ? "below_zero" : "past_extent";
+        verdict.witness = "offset=" + ToString(low);
+      } else {
+        verdict.status = ContainmentVerdict::Status::kContained;
+      }
+      return verdict;
+    }
+    if (!solver) return unknown("symbolic offset needs the SMT layer, which this build lacks");
+    // Interval arithmetic first: a hull inside [0, extent) needs no solver.
+    if (hull && hull->first >= 0 && hull->second + width <= Int(*extent)) {
+      verdict.status = ContainmentVerdict::Status::kContained;
+      return verdict;
+    }
+    std::set<AtomId> selected;
+    for (const auto& [atom, ignored] : offset.terms) { (void)ignored; selected.insert(atom); }
+    const Int infinity = Int(1) << 100;
+    struct Side { const char* name; Int lower, upper; };
+    const Side sides[] = {{"below_zero", -infinity, 0}, {"past_extent", Int(*extent) - width, infinity}};
+    bool all_unsat = true;
+    for (const auto& side : sides) {
+      std::map<AtomId, std::size_t> variables;
+      auto query = Instantiate(selected, variables);
+      query.goal = {offset.constant, {}};
+      for (const auto& [atom, coefficient] : offset.terms) query.goal.terms.emplace_back(variables.at(atom), coefficient);
+      query.goal_lower = side.lower;
+      query.goal_upper = side.upper;
+      ++stats.solver_queries;
+      const auto answer = solver->solve(query, timeout_ms);
+      using address_solver::Verdict;
+      if (answer.environment == Verdict::kUnsat) {
+        ++stats.solver_unknown;
+        return unknown("address invariants and tensor properties are unsatisfiable for this access");
+      }
+      if (answer.environment == Verdict::kSat && answer.goal == Verdict::kSat) {
+        ++stats.solver_sat;
+        verdict.status = ContainmentVerdict::Status::kViolated;
+        verdict.side = side.name;
+        verdict.witness = answer.detail;
+        return verdict;
+      }
+      if (answer.environment == Verdict::kSat && answer.goal == Verdict::kUnsat) { ++stats.solver_unsat; continue; }
+      ++stats.solver_unknown;
+      all_unsat = false;
+      verdict.reason = answer.detail.empty() ? "SMT result unknown" : answer.detail;
+    }
+    verdict.status = all_unsat ? ContainmentVerdict::Status::kContained : ContainmentVerdict::Status::kUnknown;
+    return verdict;
+  }
+
   OverlapEvidence Evidence(const Shape& a, std::uint64_t wa, const Shape& b, std::uint64_t wb, Int d) const {
     OverlapEvidence evidence{"symbolic byte ranges intersect for every valuation (offset difference " +
                                  ToString(d) + ")", std::nullopt};
@@ -971,6 +1075,12 @@ std::unique_ptr<MemoryConflictCandidates> SymbolicAddressModel::conflictCandidat
     std::span<const AccessId> exempt_writes) {
   return impl_->error ? nullptr
       : impl_->constants.conflictCandidatesWithExemptions(accesses, ranks, exempt_writes);
+}
+
+ContainmentVerdict SymbolicAddressModel::containment(const MemoryAccess& access,
+                                                     std::optional<std::uint64_t> extent_bytes,
+                                                     unsigned timeout_ms) {
+  return impl_->Contain(access, extent_bytes, timeout_ms);
 }
 
 SymbolicAddressStats SymbolicAddressModel::stats() const noexcept { return impl_->stats; }
