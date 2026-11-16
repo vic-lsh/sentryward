@@ -158,9 +158,13 @@ inline void Normalize(Json& out,const std::string& operation="") {
  for(auto& d:diagnostics)if(d.is_object() && !d.contains("stage"))d["stage"]=stage;
  for(const auto& d:diagnostics)if(d.is_object() && (d.value("code","")=="unexpected_exception" || d.value("code","")=="active_thread_context_missing"))result="tool_failure";
  // Footprint containment (optional check): a violation or an undecided access never leaves a pass.
- if(out.contains("footprint") && out["footprint"].is_object() && (result=="race_free" || result=="verified")) {
+ if(out.contains("footprint") && out["footprint"].is_object()) {
    const auto fstatus=out["footprint"].value("status",std::string{});
-   if(fstatus=="violated"||fstatus=="inconclusive") {
+   const bool passing=result=="race_free" || result=="verified";
+   // A violation is a definite finding, so it also replaces an inconclusive race or equivalence result;
+   // a race or well-synchronization failure keeps its name (the footprint evidence is still reported).
+   const bool replaceable=passing || result=="unsupported" || result=="equivalence_not_proven";
+   if((fstatus=="violated" && replaceable) || (fstatus=="inconclusive" && passing)) {
      const bool violated=fstatus=="violated";
      result=violated?"footprint_violation":"unsupported";
      diagnostics.insert(diagnostics.begin(),Json{{"code",violated?"footprint_violation":"footprint_undecided"},{"stage","footprint_check"},
