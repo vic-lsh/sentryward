@@ -3,6 +3,26 @@
 The CLI emits one JSON object and Python verify returns the same structure.
 result is one of 14 categories; checks and diagnostics explain the conclusion.
 
+## Footprint check
+
+With `footprints` in the input, `checks.footprint` is `passed`, `failed` or `incomplete`, and
+`evidence.footprint` holds the report. A violation changes a `race_free` or `verified` result to
+`footprint_violation`; an access the model cannot decide changes it to `unsupported` (diagnostic
+`footprint_undecided`). A `potential_race` or `not_wellsynced` result keeps its name and still
+carries the footprint evidence. Like a race, a violation is relative to the stated premises: it
+means some valuation of the table elements that the properties allow leaves the declared extent,
+not that a given execution does.
+
+`evidence.footprint`: `status` (`contained`, `violated`, `inconclusive`), `checked_accesses`,
+`violation_count`, `undecided_count`, `objects` and `violations` / `undecided` samples.
+Each object lists the reads and writes, the declared and inferred direction, the declared extent
+and the inferred touched interval `[inferred_min_byte, inferred_max_byte_exclusive)`
+(`unused_declared_bytes_outside_hull` is the declared bytes outside that interval). Each
+violation sample has `kind` (`out_of_bounds`, `write_to_read_only`, `read_from_write_only`,
+`undeclared_object`, `outside_declared_pieces`), `object`, `mode`, `bytes`, `extent_bytes`,
+`cta`, `block`, `thread`, `thread_idx`, the PTX `location`, and for `out_of_bounds` the `side`
+and the `witness` (the offset, or the solver's valuation of the table elements and the offset).
+
 ## JSON structure
 
 The CLI writes one raw JSON object to stdout; Python returns the same structure.

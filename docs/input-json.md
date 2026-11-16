@@ -38,6 +38,7 @@ size at parameter 1. Change the ABI and launch to match the actual PTX.
 | `assumptions` | Optional Boolean overrides of the [named analysis assumptions](input-json.md#assumptions) |
 | `address_invariants` | Optional trusted address constraints; see [forms and semantics](assumptions.md#address-invariants) |
 | `tensor_properties` | Optional trusted element properties of input objects; see [Tensor properties](#tensor-properties) |
+| `footprints` | Optional declared extent and access direction per input object, checked against every access; see [Footprints](#footprints) |
 | `data_branch_loop_iterations` | Optional positive iteration bound for loops under `bounded_computation_loops`; default 4; does not itself enable that assumption |
 
 Omitted record arrays are empty. Missing values needed during analysis produce
@@ -198,6 +199,34 @@ shifted or clamped element (`idx[b] & 0xffffff`, `idx[b] >> 24`, `min(idx[b], n)
 is a function of that one element: it is a symbol of its own, bounded by its
 range and never injective, and an affine offset in such symbols places the
 access the same way.
+
+## Footprints
+
+Each record declares what a kernel may touch in one global input object: its byte extent and
+its direction. The verifier then checks every global access of every CTA (it does not trust the
+declaration). Without `footprints`, no containment check runs and the report is unchanged.
+
+| Field | Meaning |
+| --- | --- |
+| `object` | Declared pointer object (same names as `tensor_properties`); one record per object |
+| `direction` | `read` (no store), `write` (no load) or `readwrite` |
+| `extent_bytes` | Allocation size in bytes; every access must lie in `[0, extent_bytes)` |
+| `extent_elements`, `element_type` | Alternative to `extent_bytes`: element count and a scalar type (`bf16`, `f32`, `s32`, ...) |
+| `periodic` | Optional `{stride, period, count, offset, width}`: piece `c` of row `k` is bytes `k*stride + offset + c*period + [0, width)`; each constant-offset access must lie in one piece |
+
+```json
+{"footprints": [
+  {"object": "x", "direction": "read", "extent_bytes": 32768},
+  {"object": "hn", "direction": "write", "extent_elements": 8192, "element_type": "bf16"}]}
+```
+
+Once any record is present, a global access to an object without a record is a violation
+(`undeclared_object`), and CTA class mode is off so every CTA is enumerated. Constant offsets are
+decided by arithmetic. A symbolic offset (a loaded `tensor_properties` element) is decided by the
+address solver under the stated properties; with no property bounding the loaded value, containment
+fails with a witness. Extents and directions are the declared contract; the premises in
+`tensor_properties` stay trusted. Results go under `evidence.footprint`
+([output](output-json.md#footprint-check)).
 
 ## Tensor-map descriptors
 
