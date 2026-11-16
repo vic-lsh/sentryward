@@ -142,7 +142,7 @@ void TensorMaps(Json &root) {
 } // namespace
 
 KernelInput ParseKernelInput(const Json &value) {
-  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties"}, "$");
+  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints"}, "$");
   if (value.value("schema", Json()) != "spverify.kernel-input/v1")
     Fail("invalid_schema", "$.schema", "expected spverify.kernel-input/v1");
   Json root = value;
@@ -342,6 +342,40 @@ KernelInput ParseKernelInput(const Json &value) {
     if ((property == "injective") == t.contains("value"))
       Fail("invalid_tensor_property", path + ".value", property == "injective" ? "injective takes no value" : "a bound requires a value");
     if (t.contains("value")) Scalar(t["value"], type.get<std::string>(), path + ".value");
+  }
+  // Declared footprint of an input object (optional): the allocation extent and the access
+  // direction the kernel's contract allows. Checked, not trusted, by the containment check.
+  if (root.contains("footprints")) {
+    static const std::map<std::string, std::uint64_t> element_bytes{
+        {"u8", 1}, {"s8", 1}, {"b8", 1}, {"u16", 2}, {"s16", 2}, {"b16", 2}, {"f16", 2}, {"bf16", 2},
+        {"u32", 4}, {"s32", 4}, {"b32", 4}, {"f32", 4}, {"tf32", 4}, {"u64", 8}, {"s64", 8}, {"b64", 8}, {"f64", 8}};
+    Array(root["footprints"], "$.footprints");
+    std::set<std::string> objects;
+    for (std::size_t i = 0; i < root["footprints"].size(); ++i) {
+      auto &f = root["footprints"][i];
+      const auto path = ItemPath("footprints", i);
+      Object(f, {"object", "direction", "extent_bytes", "extent_elements", "element_type"}, path);
+      String(f.value("object", Json()), path + ".object");
+      if (!objects.insert(f["object"].get<std::string>()).second)
+        Fail("duplicate_footprint", path + ".object", "object already has a footprint");
+      const auto direction = f.value("direction", Json());
+      if (direction != "read" && direction != "write" && direction != "readwrite")
+        Fail("invalid_footprint", path + ".direction", "expected read, write or readwrite");
+      if (f.contains("extent_bytes") == f.contains("extent_elements"))
+        Fail("invalid_footprint", path, "expected exactly one of extent_bytes and extent_elements");
+      if (f.contains("extent_bytes")) {
+        if (f.contains("element_type")) Fail("invalid_footprint", path + ".element_type", "element_type belongs to extent_elements");
+        f["extent_bytes"] = Natural(f["extent_bytes"], path + ".extent_bytes");
+      } else {
+        const auto count = Natural(f["extent_elements"], path + ".extent_elements");
+        const auto type = f.value("element_type", Json());
+        if (!type.is_string() || !element_bytes.contains(type.get<std::string>()))
+          Fail("invalid_footprint", path + ".element_type", "extent_elements requires a scalar element_type");
+        f["extent_bytes"] = count * element_bytes.at(type.get<std::string>());
+        f.erase("extent_elements");
+        f.erase("element_type");
+      }
+    }
   }
   TensorMaps(root);
   std::set<std::uint64_t> lines;

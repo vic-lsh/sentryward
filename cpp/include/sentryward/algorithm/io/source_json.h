@@ -60,6 +60,9 @@ struct SourceArtifact final {
   std::string address_invariants_json = "[]";
   // Normalized tensor_properties records (frontend fixed_input.tensor_property_inputs).
   std::string tensor_properties_json = "[]";
+  // Footprint declarations (grid_dim, block_dim, objects[{object, direction, extent_bytes}]); empty
+  // when the input declared none, in which case no containment check runs.
+  std::string footprints_json;
   SymbolicSolverOptions address_solver;
 };
 

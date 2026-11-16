@@ -404,6 +404,12 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
     if (JsonInteger(record["lower_bound"]) > JsonInteger(record["upper_bound"]))
       Fail("inconsistent_tensor_property", path, "the object's bounds are contradictory");
   }
+  // Footprint declarations name input objects (same names as tensor_properties).
+  const Json footprints = input.value("footprints", Json::array());
+  for (std::size_t n = 0; n < footprints.size(); ++n)
+    if (!object_resources.contains(footprints[n]["object"].get<std::string>()))
+      Fail("unknown_footprint_object", "$.footprints[" + std::to_string(n) + "].object",
+           "no input object has this name (names come from pointer and tensor_map declarations)");
   Json raw{{"schema", "spverify.ptx-front-end-config/v1"}, {"entry", function.name},
       {"cta", {{"block_dim", block}, {"cluster_dim", cluster}}}, {"parameter_regions", regions},
       {"pointer_parameters", pointer_inputs}, {"resources", resources},
@@ -411,6 +417,7 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
       {"opaque_tensor_maps", opaque}, {"parameter_field_types", types}, {"input_objects", objects},
       {"null_pointer_fields", null_fields}, {"semantic_assumptions", supplied.fields.value("assumptions", Json::object())},
       {"address_invariants", supplied.fields.value("address_invariants", Json::array())},
+      {"footprints", footprints},
       {"data_branch_loop_iterations", supplied.fields.value("data_branch_loop_iterations", Json(4))},
       {"elect_lane", options.elect_lane}, {"max_steps_per_lane", options.max_steps_per_thread},
       {"compress_compute", options.compress_compute},
