@@ -16,6 +16,7 @@
 
 #include "sentryward/value_analysis/scalar_specialization.h"
 #include "sentryward/value_ir/operations.h"
+#include "sentryward/value_ir/ptx_operation.h"
 #include "sentryward/value_ir/type_conversion.h"
 
 namespace sentryward::value_analysis {
@@ -76,7 +77,7 @@ Set unite(const Set& a, const Set& b) {
 // ---- The term (schema sentryward.structural-term/v1). ----
 struct Object {
   std::string name, element, allocation;
-  std::uint64_t bytes = 0, stride = 0, rows = 0, cols = 0;
+  std::uint64_t bytes = 0, stride = 0, rows = 0, cols = 0, base = 0;
   bool row_indexed = true;  // rows follow the launch's row space (else a fixed table, e.g. a weight)
 };
 struct Index {
@@ -90,11 +91,16 @@ struct Arg {
   std::string convert;  // the element type a primitive operand is converted to; empty: none
   std::vector<Pattern> reads;
 };
+// A role signature of an opaque atom's argument: none, or a structural fact that tells
+// equal-shaped operands apart.
+enum class Role { None, ThroughTranscendental, AvoidsTranscendental };
 struct TermNode {
   std::string op;
   bool primitive = false;
-  std::string operation, type;
+  std::string operation, type;  // type: the format clause's compute element
+  std::string store;            // the out port's element the result is converted to; empty: none
   bool commutative = false;
+  std::vector<Role> roles;      // opaque: per argument
   std::vector<Arg> args;
   std::optional<std::size_t> out;  // the object holding this node's value
 };
@@ -112,7 +118,7 @@ std::size_t objectIndex(const Term& t, const std::string& name) {
 }
 
 Term parseTerm(const Json& j) {
-  if (j.at("schema") != "sentryward.structural-term/v1") throw std::invalid_argument("term: schema");
+  if (j.at("schema") != "sentryward.structural-term/v2") throw std::invalid_argument("term: schema");
   Term t;
   t.row = j.value("row", "");
   for (const auto& o : j.at("objects")) {
@@ -124,6 +130,7 @@ Term parseTerm(const Json& j) {
     x.rows = o.at("rows");
     x.cols = o.at("cols");
     x.row_indexed = o.at("row_indexed");
+    x.base = o.at("base_bytes");
     x.allocation = AllocationIdentity("global", x.name);
     if (!x.bytes || x.stride % x.bytes || x.cols * x.bytes > x.stride)
       throw std::invalid_argument("term: object layout " + x.name);
@@ -135,11 +142,20 @@ Term parseTerm(const Json& j) {
     x.op = n.at("op");
     const auto& atom = n.at("atom");
     x.primitive = atom.at("kind") == "primitive";
+    const auto& format = n.at("format");
+    x.type = format.at("compute").is_null() ? "" : std::string(format.at("compute"));
+    if (!format.at("store").is_null()) x.store = format.at("store");
     if (x.primitive) {
       x.operation = atom.at("operation");
-      x.type = atom.at("type");
-      x.commutative = atom.value("commutative", false);
-    } else if (atom.at("kind") != "opaque") {
+      x.commutative = atom.at("commutative");
+    } else if (atom.at("kind") == "opaque") {
+      for (const auto& r : atom.at("roles")) {
+        if (r.is_null()) x.roles.push_back(Role::None);
+        else if (r == Json{{"through", "transcendental"}}) x.roles.push_back(Role::ThroughTranscendental);
+        else if (r == Json{{"avoids", "transcendental"}}) x.roles.push_back(Role::AvoidsTranscendental);
+        else throw std::invalid_argument("term: role " + r.dump());
+      }
+    } else {
       throw std::invalid_argument("term: atom kind");
     }
     for (const auto& a : n.at("args")) {
@@ -169,6 +185,7 @@ Term parseTerm(const Json& j) {
       x.args.push_back(std::move(y));
     }
     if (n.contains("out") && !n.at("out").is_null()) x.out = objectIndex(t, n.at("out"));
+    if (!x.primitive && x.roles.size() != x.args.size()) throw std::invalid_argument("term: one role per argument");
     t.nodes.push_back(std::move(x));
   }
   return t;
@@ -260,19 +277,38 @@ class Checker {
     return normalize(std::move(xs));
   }
 
-  // Leaves of the bytes [offset, offset + bytes) of allocation `allocation`'s initial contents.
-  Set regionLeaves(const std::string& allocation, std::uint64_t offset, std::uint64_t bytes) {
-    std::uint64_t space = 0, unit = 1;
-    bool found = false;
-    for (std::size_t i = 0; i < t_.objects.size(); ++i)
-      if (t_.objects[i].allocation == allocation) space = i, unit = t_.objects[i].bytes, found = true;
-    if (!found) {
-      auto it = std::find(foreign_.begin(), foreign_.end(), allocation);
-      space = t_.objects.size() + t_.nodes.size() + std::size_t(it - foreign_.begin());
-      if (it == foreign_.end()) foreign_.push_back(allocation);
+  // The term object holding byte `offset` of allocation `allocation` and that byte's element
+  // index (row * (stride / bytes) + column, from the object's base), or none.
+  std::optional<std::pair<std::size_t, std::uint64_t>> elementAt(const std::string& allocation,
+                                                                 std::uint64_t offset) const {
+    for (std::size_t i = 0; i < t_.objects.size(); ++i) {
+      const auto& o = t_.objects[i];
+      if (o.allocation != allocation || offset < o.base) continue;
+      const auto rel = offset - o.base, row = rel / o.stride, col = rel % o.stride / o.bytes;
+      if (row < o.rows && col < o.cols) return std::pair{i, row * (o.stride / o.bytes) + col};
     }
-    if (!bytes) return {};
-    return {{(space << kShift) | (offset / unit), (space << kShift) | ((offset + bytes + unit - 1) / unit)}};
+    return std::nullopt;
+  }
+
+  // Leaves of the bytes [offset, offset + bytes) of allocation `allocation`'s initial contents:
+  // the elements of the term objects they lie in; bytes in no term object are leaves of a space
+  // per allocation (never a match).
+  Set regionLeaves(const std::string& allocation, std::uint64_t offset, std::uint64_t bytes) {
+    std::vector<Interval> xs;
+    for (std::uint64_t b = offset; b < offset + bytes;) {
+      if (const auto e = elementAt(allocation, b)) {
+        const auto& o = t_.objects[e->first];
+        xs.push_back({(std::uint64_t(e->first) << kShift) | e->second, ((std::uint64_t(e->first) << kShift) | e->second) + 1});
+        b = b - (b - o.base) % o.bytes + o.bytes;
+        continue;
+      }
+      auto it = std::find(foreign_.begin(), foreign_.end(), allocation);
+      const auto space = t_.objects.size() + t_.nodes.size() + std::size_t(it - foreign_.begin());
+      if (it == foreign_.end()) foreign_.push_back(allocation);
+      xs.push_back({(space << kShift) | b, ((space << kShift) | b) + 1});
+      ++b;
+    }
+    return normalize(std::move(xs));
   }
 
   v::Value resolve(v::Value x) { return spec_.selected(g_.canonicalInterpretation(x)); }
@@ -410,6 +446,85 @@ class Checker {
     return s->front().begin;
   }
 
+  static bool transcendental(const v::Operation& op) {
+    if (dynamic_cast<const v::IdealExp2Op*>(&op)) return true;
+    const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op);
+    if (!p) return false;
+    using O = v::PtxScalarOpcode;
+    const auto c = p->opcode();
+    return c == O::Exp2 || c == O::Log2 || c == O::Sin || c == O::Cos || c == O::Tanh;
+  }
+
+  // The leaves x reaches by a path through a transcendental operation (memoized).
+  Set transLeaves(v::Value x, unsigned depth = 0) {
+    if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
+    x = resolve(x);
+    if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
+    if (x.conversion()) return transLeaves(x.conversion()->source, depth + 1);
+    const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
+    const bool plain = x.indices().empty() && !x.pointer();
+    if (plain)
+      if (auto it = trans_memo_.find(key); it != trans_memo_.end()) return *it->second;
+    const auto& node = g_.definingNode(x);
+    Set s;
+    if (transcendental(node.operation())) {
+      s = leaves(x, depth + 1);
+    } else if (dynamic_cast<const v::LoadOp*>(&node.operation())) {
+      if (const auto* r = m_.readReplacement({x.nodeId(), x.instanceIndex()}))
+        if (const auto* value = std::get_if<v::Value>(r)) s = transLeaves(*value, depth + 1);
+    } else {
+      for (const auto& a : g_.instanceOperands(x)) s = unite(s, transLeaves(a, depth + 1));
+    }
+    if (plain) trans_memo_.emplace(key, std::make_shared<const Set>(s));
+    return s;
+  }
+
+  // The expected leaves of argument k of term node m when m is evaluated at outer pattern `at`
+  // (identity for a node at its own output), at output element (r, c).
+  Set argLeaves(std::size_t m, std::size_t k, const Pattern& at, std::uint64_t r, std::uint64_t c) const {
+    const auto& a = t_.nodes[m].args[k];
+    std::vector<SpacePattern> ps;
+    for (const auto& p : a.reads) {
+      const auto here = compose(p, at);
+      if (!a.body) ps.push_back({t_.inputs[a.ref], here});
+      else
+        for (const auto& q : patterns(t_, a.ref, false)) ps.push_back({q.space, compose(q.at, here)});
+    }
+    return materialize(ps, r, c);
+  }
+
+  // Role signatures of opaque node m over its value `root` (m at outer pattern `at`).
+  void checkRoles(std::size_t m, const v::Value& root, const Pattern& at, std::uint64_t r, std::uint64_t c,
+                  const Json& where) {
+    const auto& tn = t_.nodes[m];
+    if (tn.primitive || std::all_of(tn.roles.begin(), tn.roles.end(), [](Role x) { return x == Role::None; })) return;
+    const auto through = transLeaves(root);
+    for (std::size_t k = 0; k < tn.args.size(); ++k) {
+      if (tn.roles[k] == Role::None) continue;
+      const auto e = argLeaves(m, k, at, r, c);
+      const bool ok = tn.roles[k] == Role::ThroughTranscendental ? unite(through, e) == through
+                                                                  : disjoint(through, e);
+      if (!ok) {
+        auto d = where;
+        d["argument"] = k;
+        d["role"] = tn.roles[k] == Role::ThroughTranscendental ? "through transcendental" : "avoids transcendental";
+        d["argument_leaves"] = render(e);
+        d["through_transcendental"] = render(through);
+        refuse("role", "an argument's role signature does not hold", d);
+      }
+    }
+  }
+
+  static bool disjoint(const Set& a, const Set& b) {
+    std::size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+      if (a[i].end <= b[j].begin) ++i;
+      else if (b[j].end <= a[i].begin) ++j;
+      else return false;
+    }
+    return true;
+  }
+
   // Class mode: the representatives' written rows, and each member's rows as a representative's
   // shifted by k, where the member's offset of every row-indexed object is k of its rows and of
   // every other object zero. Together they must cover every row of every output object once.
@@ -457,7 +572,9 @@ class Checker {
       for (const auto& m : it->second) {
         std::optional<std::int64_t> k;
         for (const auto& o : t_.objects) {
-          const auto d = m.delta.contains(o.allocation) ? m.delta.at(o.allocation) : 0;
+          // An allocation the kernel does not access has no offset and constrains nothing.
+          if (!m.delta.contains(o.allocation)) continue;
+          const auto d = m.delta.at(o.allocation);
           if (!o.row_indexed) {
             if (d) refuse("class_shift", "a member moves a fixed object", {{"object", o.name}, {"delta", d}});
             continue;
@@ -497,25 +614,24 @@ class Checker {
     std::map<std::uint64_t, std::set<std::uint64_t>> rows_by_cta;
     m_.forEachOutput(g_, [&](const OutputWrite& w) {
       ++writes;
-      std::optional<std::size_t> obj;
-      for (const auto& [o, _] : stored)
-        if (t_.objects[o].allocation == w.region.allocation) obj = o;
-      if (!obj) refuse("unexpected_output", "a write to an object no term node outputs", {{"allocation", w.region.allocation}, {"offset", w.region.offset}});
-      const auto& o = t_.objects[*obj];
+      const auto at = elementAt(w.region.allocation, w.region.offset);
+      if (!at || !stored.contains(at->first))
+        refuse("unexpected_output", "a write outside every term node's output object",
+               {{"allocation", w.region.allocation}, {"offset", w.region.offset}});
+      const auto obj = at->first;
+      const auto& o = t_.objects[obj];
       if (w.reduced || !w.base.empty())
         unsupported("output_form", "a reduced or symbolically placed output", {{"object", o.name}});
-      if (w.region.bytes != o.bytes || w.region.offset % o.bytes || w.value_byte_offset ||
+      if (w.region.bytes != o.bytes || (w.region.offset - o.base) % o.bytes || w.value_byte_offset ||
           !g_.type(w.value).isScalar())
         unsupported("output_granularity", "an output write that is not one element of its object",
                     {{"object", o.name}, {"offset", w.region.offset}, {"bytes", w.region.bytes}});
-      const auto e = w.region.offset / o.bytes;
+      const auto e = at->second;
       const auto per = o.stride / o.bytes;
-      if (e / per >= o.rows || e % per >= o.cols)
-        refuse("output_outside", "an output write outside the term's elements", {{"object", o.name}, {"offset", w.region.offset}});
-      auto& slot = stored[*obj][e];
+      auto& slot = stored[obj][e];
       if (slot) refuse("duplicate_output", "two final writes to one element", {{"object", o.name}, {"offset", w.region.offset}});
       slot = w.value;
-      written_rows[*obj].insert(e / per);
+      written_rows[obj].insert(e / per);
       const auto cta = g_.node(w.writer.node).instanceOrigin(w.writer.instance).cta;
       if (lifting_ && !cta) unsupported("writer_cta", "an output write without a writer CTA");
       rows_by_cta[cta.value_or(0)].insert(e / per);
@@ -525,11 +641,12 @@ class Checker {
     for (std::size_t n = 0; n < t_.nodes.size(); ++n) {
       const auto& tn = t_.nodes[n];
       if (!tn.out) {
-        bool used = false;
+        bool searched = false;
         for (const auto& u : t_.nodes)
-          for (const auto& a : u.args) used |= a.body && a.ref == n;
-        if (used) unsupported("inner_without_output", "an inner term node without an output object (cut search not built)", {{"node", n}, {"op", tn.op}});
-        continue;
+          for (const auto& a : u.args) searched |= a.body && a.ref == n && !u.primitive;
+        if (searched)
+          unsupported("inner_without_output", "an inner term node without an output object under an opaque atom (cut search not built)", {{"node", n}, {"op", tn.op}});
+        continue;  // its value is the operand of each primitive user, checked there
       }
       const auto& o = t_.objects[*tn.out];
       const auto per = o.stride / o.bytes;
@@ -537,7 +654,7 @@ class Checker {
       const bool has_body = std::any_of(tn.args.begin(), tn.args.end(), [](const Arg& a) { return a.body; });
       // The cut leaves: each inner node's stored values, by element.
       std::map<Key, std::uint64_t> stop;
-      if (has_body)
+      if (has_body && !tn.primitive)
         for (const auto& a : tn.args) {
           if (!a.body) continue;
           const auto m = a.ref;
@@ -572,44 +689,94 @@ class Checker {
             d["actual"] = render(actual);
             refuse("leaves", "the output's leaf set differs from the term's operands", d);
           }
-          // 2. Primitive.
+          // 2. Primitive: the stored value (less the format clause's store conversion) is the one
+          // operation on the operands, up to commutativity: an input element through its
+          // conversion, an inner node's stored value, or an inner node's value (the cut) whose leaves
+          // are that node's operands there.
           if (tn.primitive) {
-            const auto x = resolve(*slot);
-            const auto* b = x.conversion() ? nullptr : dynamic_cast<const v::BinaryOp*>(&g_.definingNode(x).operation());
+            auto x = resolve(*slot);
+            auto d = where;
+            d["found"] = describe(x);
+            // The store: the op's result converted to the out port's element, or already of it; a
+            // same-width bitcast (a BF16 element stored as u16) is representation.
+            while (x.conversion() && x.conversion()->spec->kind == v::TypeConversionKind::Bitcast &&
+                   g_.type(x.conversion()->source).element().width() == g_.type(x).element().width() &&
+                   x.indices().empty())
+              x = resolve(x.conversion()->source);
+            if (!tn.store.empty()) {
+              if (x.conversion() && x.conversion()->spec->kind == v::TypeConversionKind::Convert &&
+                  x.conversion()->spec->target.element().toString() == tn.store)
+                x = resolve(x.conversion()->source);
+              else if (!x.conversion() && dynamic_cast<const v::ConvertOp*>(&g_.definingNode(x).operation()) &&
+                       g_.type(x).element().toString() == tn.store)
+                x = resolve(g_.instanceOperands(x).at(0));
+              else if (x.conversion() || g_.type(x).element().toString() != tn.store)
+                refuse("format", "the stored value is not of, or converted to, the out port's element", d);
+            }
+            const auto& xop = g_.definingNode(x).operation();
+            const auto* ptx = dynamic_cast<const v::PtxScalarOp*>(&xop);
+            if (!x.conversion() && (tn.operation == "add" || tn.operation == "sub") &&
+                (dynamic_cast<const v::FmaOp*>(&xop) || (ptx && ptx->opcode() == v::PtxScalarOpcode::MultiplyAdd)))
+              refuse("contraction",
+                     "the add is contracted with a product into one fma: no value at the term's atom boundary", d);
+            const auto* b = x.conversion() ? nullptr : dynamic_cast<const v::BinaryOp*>(&xop);
             static const std::map<std::string, v::BinaryOpcode> opcodes{
                 {"add", v::BinaryOpcode::Add}, {"sub", v::BinaryOpcode::Subtract},
                 {"mul", v::BinaryOpcode::Multiply}, {"max", v::BinaryOpcode::Maximum}, {"min", v::BinaryOpcode::Minimum}};
             const auto want = opcodes.find(tn.operation);
             if (want == opcodes.end()) unsupported("primitive_operation", "no PTX opcode for " + tn.operation);
-            if (!b || b->opcode() != want->second || g_.type(x).element().toString() != tn.type || tn.args.size() != 2) {
-              auto d = where;
-              d["found"] = std::string(g_.definingNode(x).operation().name()) + " " + g_.type(x).toString();
+            // The compute element is the op's numerics unless the term names it (D199).
+            const auto op_type = g_.type(x).element().toString();
+            if (!b || b->opcode() != want->second || tn.args.size() != 2 || g_.type(x).element().kind() != v::ElementKind::Floating ||
+                (!tn.type.empty() && op_type != tn.type))
               refuse("primitive", "the stored value is not the term's primitive operation", d);
-            }
-            const auto operands = g_.instanceOperands(x);
-            std::array<std::optional<std::uint64_t>, 2> want_leaf;
-            for (std::size_t k = 0; k < 2; ++k) {
-              const auto& a = tn.args[k];
-              if (a.body || a.reads.size() != 1 || a.reads[0][0].kind == Index::All || a.reads[0][1].kind == Index::All)
-                unsupported("primitive_operand", "a primitive operand that is not one input element", where);
-              const auto s = materialize({{t_.inputs[a.ref], a.reads[0]}}, r, c);
-              want_leaf[k] = s.front().begin;
-            }
-            const auto match = [&](std::size_t i, std::size_t j) {
-              const auto& e0 = t_.objects[t_.inputs[tn.args[0].ref]].element;
-              const auto& e1 = t_.objects[t_.inputs[tn.args[1].ref]].element;
-              return operandLeaf(operands[i], tn.args[0].convert, e0) == want_leaf[0] &&
-                     operandLeaf(operands[j], tn.args[1].convert, e1) == want_leaf[1];
+            // An operand of another element than the op's is converted to the op's.
+            const auto convert_to = [&](const std::string& elem, const std::string& named) {
+              return !named.empty() ? named : elem == op_type ? std::string() : op_type;
             };
-            if (!match(0, 1) && !(tn.commutative && match(1, 0)))
-            {
-              auto d = where;
-              d["found"] = describe(x);
-              refuse("primitive_operands", "the primitive's operands are not the term's elements in their formats", d);
-            }
+            const auto operands = g_.instanceOperands(x);
+            const auto matches = [&](const v::Value& operand, std::size_t k) -> bool {
+              const auto& a = tn.args[k];
+              if (a.reads.size() != 1 || a.reads[0][0].kind == Index::All || a.reads[0][1].kind == Index::All)
+                unsupported("primitive_operand", "a primitive operand that is not one element", where);
+              if (!a.body) {
+                const auto s = materialize({{t_.inputs[a.ref], a.reads[0]}}, r, c);
+                const auto& elem = t_.objects[t_.inputs[a.ref]].element;
+                return operandLeaf(operand, convert_to(elem, a.convert), elem) == s.front().begin;
+              }
+              auto y = resolve(operand);
+              const auto& inner = t_.nodes[a.ref];
+              if (inner.out) {
+                const auto cv = convert_to(t_.objects[*inner.out].element, a.convert);
+                if (!cv.empty()) {
+                  if (!(y.conversion() && y.conversion()->spec->target.element().toString() == cv)) return false;
+                  y = resolve(y.conversion()->source);
+                }
+              }
+              if (inner.out) {  // the inner node's stored value at the operand's element
+                const auto e = materialize({{t_.objects.size() + a.ref, a.reads[0]}}, r, c).front().begin & kElementMask;
+                const auto& sv = stored.at(*inner.out).at(e);
+                if (!sv) return false;
+                const auto z = resolve(*sv);
+                return !y.conversion() && !z.conversion() && y.nodeId() == z.nodeId() &&
+                       y.resultIndex() == z.resultIndex() && y.instanceIndex() == z.instanceIndex();
+              }
+              // The cut: a value whose leaves are the inner node's operands at that element.
+              const auto at = a.reads[0];
+              std::vector<SpacePattern> ps;
+              for (const auto& q : patterns(t_, a.ref, false)) ps.push_back({q.space, compose(q.at, at)});
+              if (leaves(y) != materialize(ps, r, c)) return false;
+              checkRoles(a.ref, y, at, r, c, where);
+              return true;
+            };
+            if (!(matches(operands[0], 0) && matches(operands[1], 1)) &&
+                !(tn.commutative && matches(operands[1], 0) && matches(operands[0], 1)))
+              refuse("primitive_operands", "the primitive's operands are not the term's operands in their formats", d);
+          } else {
+            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
           }
           // 3. Factorization.
-          if (has_body) {
+          if (has_body && !tn.primitive) {
             const auto expected_cut = materialize(cut, r, c);
             const auto actual_cut = cutter.leaves(*slot);
             if (actual_cut != expected_cut) {
@@ -624,8 +791,9 @@ class Checker {
       }
       nodes.push_back({{"node", n}, {"op", tn.op}, {"atom", tn.primitive ? "primitive" : "opaque"},
                        {"object", o.name}, {"elements", checked},
-                       {"checks", has_body ? Json{"leaves", tn.primitive ? "primitive" : "-", "factorization"}
-                                           : Json{"leaves", tn.primitive ? "primitive" : "-"}}});
+                       {"checks", tn.primitive ? Json{"leaves", "primitive"}
+                                               : has_body ? Json{"leaves", "roles", "factorization"}
+                                                          : Json{"leaves", "roles"}}});
     }
     return {{"result", "matched"}, {"nodes", nodes}, {"class_mode", class_mode}, {"output_writes", writes}, {"memoized_values", memo_.size()}};
   }
@@ -638,6 +806,7 @@ class Checker {
   ScalarSpecialization spec_;
   std::map<Key, std::uint64_t> stop_;
   std::map<Key, SetRef> memo_;
+  std::map<Key, SetRef> trans_memo_;
   std::vector<std::string> foreign_;
 };
 
