@@ -213,7 +213,7 @@ declaration). Without `footprints`, no containment check runs and the report is 
 | `extent_bytes` | Allocation size in bytes; every access must lie in `[0, extent_bytes)` |
 | `extent_elements`, `element_type` | Alternative to `extent_bytes`: element count and a scalar type (`bf16`, `f32`, `s32`, ...) |
 | `periodic` | Optional `{stride, period, count, offset, width}`: piece `c` of row `k` is bytes `k*stride + offset + c*period + [0, width)`; each access must lie in one piece |
-| `pieces` | Optional array of piece sets `{base, rows, stride, period, count, width, direction}`: run `c < count` of row `r < rows` is bytes `[base + r*stride + c*period, + width)` (defaults: `base` 0, `rows` 1, `count` 1); `direction` (default the object's, and within it) says whether the set may be read or written. Each access must lie in one run of one row of a set that allows it. One set per declared port of the object: a field offset, a row stride wider than the row, interleaved runs, several ports through one pointer |
+| `pieces` | Optional array of piece sets `{base, rows, stride, period, count, width, direction}`: run `c < count` of row `r < rows` is bytes `[base + r*stride + c*period, + width)` (defaults: `base` 0, `rows` 1, `count` 1); `direction` (default the object's, and within it) says whether the set may be read or written. Each access must lie in one run of one row of a set that allows it. One set per declared port of the object: a field offset, a row stride wider than the row (or narrower: overlapping windows), interleaved runs, several ports through one pointer |
 
 ```json
 {"footprints": [

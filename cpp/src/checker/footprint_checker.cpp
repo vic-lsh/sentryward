@@ -28,14 +28,6 @@ struct Piece {
   std::uint64_t base = 0, rows = 1, stride = 0, period = 0, count = 1, width = 0;
   bool read = true, write = true;
   [[nodiscard]] bool Allows(bool is_read) const { return is_read ? read : write; }
-  // The column of `low` within its row, when `low` lies in a row of this set.
-  [[nodiscard]] std::optional<std::uint64_t> ColumnOf(std::int64_t low) const {
-    if (rows == 0 || low < std::int64_t(base)) return std::nullopt;
-    const auto rel = std::uint64_t(low) - base;
-    if (rows <= 1 || stride == 0) return rel;
-    if (rel / stride >= rows) return std::nullopt;
-    return rel % stride;
-  }
   // Whether [column, column + bytes) lies inside one run.
   [[nodiscard]] bool RunHolds(std::uint64_t column, std::uint64_t bytes) const {
     const auto step = count > 1 ? period : width;
@@ -44,10 +36,21 @@ struct Piece {
     const auto start = run * step;
     return column - start + bytes <= width;
   }
-  // [low, low + bytes) inside one run of one row.
+  [[nodiscard]] std::uint64_t RowBytes() const { return (count - 1) * (count > 1 ? period : width) + width; }
+  // [low, low + bytes) inside one run of one row. Rows may overlap (a window such as an indptr's
+  // [r, r + 2) at a one-entry stride): every row whose bytes reach `low` is tried.
   [[nodiscard]] bool Contains(std::int64_t low, std::uint64_t bytes) const {
-    const auto column = ColumnOf(low);
-    return column && RunHolds(*column, bytes);
+    if (rows == 0 || low < std::int64_t(base)) return false;
+    const auto rel = std::uint64_t(low) - base;
+    if (rows <= 1 || stride == 0) return RunHolds(rel, bytes);
+    const auto row_bytes = RowBytes();
+    for (auto r = std::min(rel / stride, rows - 1);; --r) {
+      const auto column = rel - r * stride;
+      if (column >= row_bytes) break;
+      if (RunHolds(column, bytes)) return true;
+      if (r == 0) break;
+    }
+    return false;
   }
   // A symbolic access c + g*(atoms) whose touched hull is [low, high): inside (every valuation
   // lands in one run of some row) when the hull lies inside the rows and g is a multiple of the
@@ -59,7 +62,7 @@ struct Piece {
     const auto top = std::int64_t(base + (rows <= 1 || stride == 0 ? (rows ? (count - 1) * (count > 1 ? period : width) + width : 0)
                                                                    : rows * stride));
     if (rows == 0 || high <= std::int64_t(base) || low >= top) return Rows3::kOut;
-    if (rows <= 1 || stride == 0 || gcd == 0 || gcd % stride != 0) return Rows3::kUnknown;
+    if (rows <= 1 || stride == 0 || gcd == 0 || gcd % stride != 0 || stride < RowBytes()) return Rows3::kUnknown;
     if (low < std::int64_t(base) || high > top) return Rows3::kUnknown;
     const auto s = std::int64_t(stride);
     const auto column = ((constant - std::int64_t(base)) % s + s) % s;

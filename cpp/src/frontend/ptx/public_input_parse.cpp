@@ -403,8 +403,7 @@ KernelInput ParseKernelInput(const Json &value) {
           const auto period = q.contains("period") ? Natural(q["period"], qpath + ".period") : 0;
           const auto stride = q.contains("stride") ? Natural(q["stride"], qpath + ".stride") : 0;
           if (count > 1 && period < width) Fail("invalid_footprint", qpath + ".period", "runs must not overlap (period >= width)");
-          const auto row_bytes = (count - 1) * period + width;
-          if (rows > 1 && stride < row_bytes) Fail("invalid_footprint", qpath + ".stride", "rows must not overlap (stride >= row bytes)");
+          if (rows > 1 && stride == 0) Fail("invalid_footprint", qpath + ".stride", "several rows need a positive stride");
           if (q.contains("direction")) {
             const auto pd = q["direction"];
             if (pd != "read" && pd != "write" && pd != "readwrite")
