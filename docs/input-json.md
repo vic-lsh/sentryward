@@ -210,7 +210,8 @@ the field whose elements include every byte it may read, else by the whole-objec
 is unbounded. In a CTA class, a symbolic address over a field-bounded element is decided per unit.
 
 The result lists, per field property, the most distinct elements of the field whose loads it
-bounded in one CTA (`frontend_assumptions.field_reads`: `object`, `field`, `max_elements_per_cta`).
+bounded in one CTA (`frontend_assumptions.field_reads`: `object`, `field`, `max_elements_per_cta`;
+an empty list when the input has properties and no field load used one).
 A load over several candidate elements counts each. A caller that splits a field's values into cases
 (one input per case, every element in that case) covers a launch whose elements mix the cases only
 when this is at most 1: each CTA then reads one element, so its accesses are those of the case that

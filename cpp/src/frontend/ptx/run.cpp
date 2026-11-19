@@ -1494,6 +1494,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
       if (config.fixed_input.contains("tensor_property_contract")) {
         input_metadata["frontend_assumptions"]["tensor_properties"] = config.fixed_input["tensor_property_contract"];
         input_metadata["frontend_assumptions"]["tensor_property_decisions"] = Json::array();
+        input_metadata["frontend_assumptions"]["field_reads"] = Json::array();
       }
       const ptx::Function *function = nullptr;
       const bool explicit_prefix = config.entry.starts_with("prefix:");
@@ -1932,7 +1933,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         // Field properties: the most distinct elements one CTA's bounded loads read (a case
         // split over a field's values covers a launch only when this is at most 1).
         if (!field_reads.empty()) {
-          auto &reads = input_metadata["frontend_assumptions"]["field_reads"] = Json::array();
+          auto &reads = input_metadata["frontend_assumptions"]["field_reads"];
           for (const auto &[field, n] : field_reads) {
             const auto &[object, offset, stride, count] = field;
             reads.push_back({{"object", object},
