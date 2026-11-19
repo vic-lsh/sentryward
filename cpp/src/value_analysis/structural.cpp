@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -76,6 +77,7 @@ Set unite(const Set& a, const Set& b) {
 struct Object {
   std::string name, element, allocation;
   std::uint64_t bytes = 0, stride = 0, rows = 0, cols = 0;
+  bool row_indexed = true;  // rows follow the launch's row space (else a fixed table, e.g. a weight)
 };
 struct Index {
   enum Kind { Out, All, Const } kind;
@@ -121,6 +123,7 @@ Term parseTerm(const Json& j) {
     x.stride = o.at("row_stride_bytes");
     x.rows = o.at("rows");
     x.cols = o.at("cols");
+    x.row_indexed = o.at("row_indexed");
     x.allocation = AllocationIdentity("global", x.name);
     if (!x.bytes || x.stride % x.bytes || x.cols * x.bytes > x.stride)
       throw std::invalid_argument("term: object layout " + x.name);
@@ -200,8 +203,8 @@ using Key = std::tuple<std::size_t, std::size_t, std::size_t>;  // node, result,
 
 class Checker {
  public:
-  Checker(const v::Graph& g, const MemoryEliminationResult& m, const Term& t, bool lift)
-      : g_(g), m_(m), t_(t), lift_(lift), spec_(g, lift) {}
+  Checker(const v::Graph& g, const MemoryEliminationResult& m, const Term& t, const UnitLifting* lifting)
+      : g_(g), m_(m), t_(t), lifting_(lifting), spec_(g, lifting != nullptr) {}
 
   // The layout object of a space (a cut space has its node's output layout).
   const Object& layout(std::uint64_t space) const {
@@ -407,12 +410,91 @@ class Checker {
     return s->front().begin;
   }
 
+  // Class mode: the representatives' written rows, and each member's rows as a representative's
+  // shifted by k, where the member's offset of every row-indexed object is k of its rows and of
+  // every other object zero. Together they must cover every row of every output object once.
+  // The term's leaf patterns must then shift with the rows: a row-indexed object read at the
+  // output's row only. Null without lifting.
+  Json classMode(const std::map<std::size_t, std::set<std::uint64_t>>& written,
+                 const std::map<std::uint64_t, std::set<std::uint64_t>>& by_cta) {
+    if (!lifting_) return nullptr;
+    std::optional<std::set<std::uint64_t>> rep_rows;
+    std::uint64_t rows = 0;
+    for (const auto& n : t_.nodes) {
+      if (!n.out) continue;
+      const auto it = written.find(*n.out);
+      const auto here = it == written.end() ? std::set<std::uint64_t>{} : it->second;
+      if (rep_rows && *rep_rows != here) refuse("class_rows", "output objects' representative rows differ");
+      rep_rows = here;
+      rows = t_.objects[*n.out].rows;
+      for (std::size_t n2 = 0; n2 < t_.nodes.size(); ++n2)
+        for (const bool cut : {false, true})
+          for (const auto& p : patterns(t_, n2, cut))
+            if (layout(p.space).row_indexed && p.at[0].kind != Index::Out)
+              unsupported("class_mode_pattern", "a row-indexed object read at another row than the output's");
+    }
+    for (const auto& n : t_.nodes)
+      if (n.out && (t_.objects[*n.out].rows != rows || !t_.objects[*n.out].row_indexed))
+        unsupported("class_mode_rows", "output objects with different row spaces");
+    const auto& L = *lifting_;
+    std::vector<bool> covered(rows, false);
+    std::size_t members = 0, member_rows = 0;
+    const auto cover = [&](std::uint64_t r) {
+      if (r >= rows || covered[r]) refuse("class_coverage", "a row covered twice or outside the launch", {{"row", r}});
+      covered[r] = true;
+    };
+    std::map<UnitLifting::Origin, std::set<std::uint64_t>> by_origin;
+    for (const auto& [cta, rs] : by_cta) {
+      const UnitLifting::Origin c{cta % L.grid[0], cta / L.grid[0] % L.grid[1], cta / (L.grid[0] * L.grid[1])};
+      UnitLifting::Origin o;
+      for (std::size_t a = 0; a < 3; ++a) o[a] = c[a] / L.unit_shape[a] * L.unit_shape[a];
+      by_origin[o].insert(rs.begin(), rs.end());
+    }
+    for (const auto& [origin, rs] : by_origin) {
+      for (const auto r : rs) cover(r);
+      const auto it = L.members.find(origin);
+      if (it == L.members.end()) continue;
+      for (const auto& m : it->second) {
+        std::optional<std::int64_t> k;
+        for (const auto& o : t_.objects) {
+          const auto d = m.delta.contains(o.allocation) ? m.delta.at(o.allocation) : 0;
+          if (!o.row_indexed) {
+            if (d) refuse("class_shift", "a member moves a fixed object", {{"object", o.name}, {"delta", d}});
+            continue;
+          }
+          if (d % std::int64_t(o.stride)) refuse("class_shift", "a member's offset is not whole rows", {{"object", o.name}, {"delta", d}});
+          const auto ko = d / std::int64_t(o.stride);
+          if (k && *k != ko) refuse("class_shift", "a member shifts objects by different rows", {{"object", o.name}, {"delta", d}});
+          k = ko;
+        }
+        for (const auto& [alloc, d] : m.delta) {
+          bool known = false;
+          for (const auto& o : t_.objects) known |= o.allocation == alloc;
+          if (!known && d) refuse("class_shift", "a member moves an allocation the term does not name", {{"allocation", alloc}});
+        }
+        if (!k) unsupported("class_shift", "no row-indexed object");
+        ++members;
+        for (const auto r : rs) {
+          if (std::int64_t(r) + *k < 0) refuse("class_coverage", "a member row below zero");
+          cover(std::uint64_t(std::int64_t(r) + *k));
+          ++member_rows;
+        }
+      }
+    }
+    for (std::uint64_t r = 0; r < rows; ++r)
+      if (!covered[r]) refuse("class_coverage", "a row no representative or member covers", {{"row", r}});
+    return {{"representatives", by_origin.size()}, {"representative_rows", rep_rows ? rep_rows->size() : 0},
+            {"members", members}, {"member_rows", member_rows}};
+  }
+
   Json run() {
     // Stored values per output object element.
     std::map<std::size_t, std::vector<std::optional<v::Value>>> stored;
     for (const auto& n : t_.nodes)
       if (n.out) stored[*n.out].assign(t_.objects[*n.out].rows * (t_.objects[*n.out].stride / t_.objects[*n.out].bytes), std::nullopt);
     std::size_t writes = 0;
+    std::map<std::size_t, std::set<std::uint64_t>> written_rows;
+    std::map<std::uint64_t, std::set<std::uint64_t>> rows_by_cta;
     m_.forEachOutput(g_, [&](const OutputWrite& w) {
       ++writes;
       std::optional<std::size_t> obj;
@@ -433,7 +515,12 @@ class Checker {
       auto& slot = stored[*obj][e];
       if (slot) refuse("duplicate_output", "two final writes to one element", {{"object", o.name}, {"offset", w.region.offset}});
       slot = w.value;
+      written_rows[*obj].insert(e / per);
+      const auto cta = g_.node(w.writer.node).instanceOrigin(w.writer.instance).cta;
+      if (lifting_ && !cta) unsupported("writer_cta", "an output write without a writer CTA");
+      rows_by_cta[cta.value_or(0)].insert(e / per);
     });
+    const auto class_mode = classMode(written_rows, rows_by_cta);
     Json nodes = Json::array();
     for (std::size_t n = 0; n < t_.nodes.size(); ++n) {
       const auto& tn = t_.nodes[n];
@@ -467,10 +554,11 @@ class Checker {
               refuse("ambiguous_cut", "one value stored at two elements of an inner node", {{"node", m}});
           }
         }
-      Checker cutter(g_, m_, t_, lift_);
+      Checker cutter(g_, m_, t_, lifting_);
       cutter.stop_ = std::move(stop);
       std::size_t checked = 0;
-      for (std::uint64_t r = 0; r < o.rows; ++r)
+      for (std::uint64_t r = 0; r < o.rows; ++r) {
+        if (lifting_ && !written_rows[*tn.out].contains(r)) continue;  // a member row: by its shift
         for (std::uint64_t c = 0; c < o.cols; ++c) {
           const auto& slot = stored.at(*tn.out)[r * per + c];
           const Json where = {{"node", n}, {"op", tn.op}, {"object", o.name}, {"element", {r, c}}};
@@ -533,19 +621,20 @@ class Checker {
           }
           ++checked;
         }
+      }
       nodes.push_back({{"node", n}, {"op", tn.op}, {"atom", tn.primitive ? "primitive" : "opaque"},
                        {"object", o.name}, {"elements", checked},
                        {"checks", has_body ? Json{"leaves", tn.primitive ? "primitive" : "-", "factorization"}
                                            : Json{"leaves", tn.primitive ? "primitive" : "-"}}});
     }
-    return {{"result", "matched"}, {"nodes", nodes}, {"output_writes", writes}, {"memoized_values", memo_.size()}};
+    return {{"result", "matched"}, {"nodes", nodes}, {"class_mode", class_mode}, {"output_writes", writes}, {"memoized_values", memo_.size()}};
   }
 
  private:
   const v::Graph& g_;
   const MemoryEliminationResult& m_;
   const Term& t_;
-  bool lift_;
+  const UnitLifting* lifting_;
   ScalarSpecialization spec_;
   std::map<Key, std::uint64_t> stop_;
   std::map<Key, SetRef> memo_;
@@ -555,13 +644,13 @@ class Checker {
 }  // namespace
 
 std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryEliminationResult& memory,
-                                const std::string& term_json, bool lift_block_index) {
+                                const std::string& term_json, const UnitLifting* lifting) {
   Json report{{"schema", "sentryward.structural-report/v1"}};
   try {
     const auto term = parseTerm(Json::parse(term_json));
     report["row"] = term.row;
     if (!memory.complete) unsupported("memory_elimination", "memory elimination is not complete");
-    Checker checker(graph, memory, term, lift_block_index);
+    Checker checker(graph, memory, term, lifting);
     report.update(checker.run());
   } catch (const Stop& s) {
     report["result"] = s.result;
