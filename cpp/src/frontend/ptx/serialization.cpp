@@ -825,6 +825,9 @@ class Serializer {
     for(const auto& record:properties) {
       Require(record.is_object() && record.contains("object") && record.contains("element_type"),
           "invalid_tensor_properties","Tensor property record has no object or element type");
+      // A field record bounds only the elements of its field; a fact here is read as the bound of
+      // every element of the object (findTensorProperty), so it is not one.
+      if(record.contains("field"))continue;
       const auto bound=[&](const char* key)->std::optional<std::int64_t> {
         const auto found=record.find(key);
         if(found==record.end() || !found->is_number_integer())return {};

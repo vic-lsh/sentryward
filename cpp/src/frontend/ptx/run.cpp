@@ -1027,7 +1027,7 @@ Json AnalyzeScalarFold(const sentryward::value_ir::Graph& values,
 // the mapped objects on both sides (the same trusted premises the race check and memory
 // elimination use; injectivity is not one). Records without a bound beyond their type's
 // range, objects the mapping does not name on both sides, and objects/types the mapping
-// already declares are skipped.
+// already declares, and field records (bounds of some elements only), are skipped.
 void AppendTensorPropertyContract(Json& mapping, const Json& properties) {
   if (!properties.is_array() || properties.empty() || !mapping.is_object()) return;
   auto& context = mapping["checker_context"];
@@ -1046,6 +1046,8 @@ void AppendTensorPropertyContract(Json& mapping, const Json& properties) {
     return found->get<std::string>();
   };
   for (const auto& record : properties) {
+    // A field record bounds only its field's elements, not the whole object.
+    if (record.contains("field")) continue;
     const auto object = record.at("object").get<std::string>(), type = record.at("element_type").get<std::string>();
     const auto bits = record.at("element_bits").get<unsigned>();
     const bool sign = record.at("signed").get<bool>();
