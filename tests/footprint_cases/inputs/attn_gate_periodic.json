@@ -1,0 +1,70 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "k_attn_gate",
+ "launch": {
+  "grid_dim": [
+   32,
+   1,
+   1
+  ],
+  "block_dim": [
+   256,
+   1,
+   1
+  ]
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "fo",
+   "name": "fo"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "qp",
+   "name": "qp"
+  },
+  {
+   "parameter": 2,
+   "type": "pointer",
+   "space": "global",
+   "object": "o",
+   "name": "o"
+  }
+ ],
+ "arguments": [
+  {
+   "parameter": 3,
+   "type": "u32",
+   "value": 8192
+  }
+ ],
+ "footprints": [
+  {
+   "object": "fo",
+   "direction": "read",
+   "extent_bytes": 16384
+  },
+  {
+   "object": "qp",
+   "direction": "read",
+   "extent_bytes": 32768,
+   "periodic": {
+    "stride": 16384,
+    "period": 1024,
+    "count": 16,
+    "offset": 512,
+    "width": 512
+   }
+  },
+  {
+   "object": "o",
+   "direction": "write",
+   "extent_bytes": 16384
+  }
+ ]
+}

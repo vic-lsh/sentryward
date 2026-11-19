@@ -1,0 +1,68 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "k_add_norm",
+ "launch": {
+  "grid_dim": [
+   1024,
+   1,
+   1
+  ],
+  "block_dim": [
+   256,
+   1,
+   1
+  ]
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "x",
+   "name": "x"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "d",
+   "name": "d"
+  },
+  {
+   "parameter": 2,
+   "type": "pointer",
+   "space": "global",
+   "object": "w",
+   "name": "w"
+  },
+  {
+   "parameter": 3,
+   "type": "pointer",
+   "space": "global",
+   "object": "hn",
+   "name": "hn"
+  }
+ ],
+ "footprints": [
+  {
+   "object": "x",
+   "direction": "readwrite",
+   "extent_bytes": 8388608
+  },
+  {
+   "object": "d",
+   "direction": "read",
+   "extent_bytes": 4194304
+  },
+  {
+   "object": "w",
+   "direction": "read",
+   "extent_bytes": 4096
+  },
+  {
+   "object": "hn",
+   "direction": "write",
+   "extent_bytes": 4194304
+  }
+ ]
+}
