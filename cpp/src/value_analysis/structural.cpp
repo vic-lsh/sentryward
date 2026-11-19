@@ -93,7 +93,14 @@ struct Arg {
 };
 // A role signature of an opaque atom's argument: none, or a structural fact that tells
 // equal-shaped operands apart.
-enum class Role { None, ThroughTranscendental, AvoidsTranscendental };
+// (scaled_by / unscaled_by k: the argument reaches the output through, or never through, a
+// multiply whose other operand depends on argument k.)
+enum class RoleKind { None, ThroughTranscendental, AvoidsTranscendental, ScaledBy, UnscaledBy };
+struct Role {
+  RoleKind kind = RoleKind::None;
+  std::size_t arg = 0;
+  bool operator==(const Role&) const = default;
+};
 struct TermNode {
   std::string op;
   bool primitive = false;
@@ -150,9 +157,11 @@ Term parseTerm(const Json& j) {
       x.commutative = atom.at("commutative");
     } else if (atom.at("kind") == "opaque") {
       for (const auto& r : atom.at("roles")) {
-        if (r.is_null()) x.roles.push_back(Role::None);
-        else if (r == Json{{"through", "transcendental"}}) x.roles.push_back(Role::ThroughTranscendental);
-        else if (r == Json{{"avoids", "transcendental"}}) x.roles.push_back(Role::AvoidsTranscendental);
+        if (r.is_null()) x.roles.push_back({});
+        else if (r == Json{{"through", "transcendental"}}) x.roles.push_back({RoleKind::ThroughTranscendental});
+        else if (r == Json{{"avoids", "transcendental"}}) x.roles.push_back({RoleKind::AvoidsTranscendental});
+        else if (r.size() == 1 && r.contains("scaled_by")) x.roles.push_back({RoleKind::ScaledBy, r.at("scaled_by")});
+        else if (r.size() == 1 && r.contains("unscaled_by")) x.roles.push_back({RoleKind::UnscaledBy, r.at("unscaled_by")});
         else throw std::invalid_argument("term: role " + r.dump());
       }
     } else {
@@ -186,6 +195,9 @@ Term parseTerm(const Json& j) {
     }
     if (n.contains("out") && !n.at("out").is_null()) x.out = objectIndex(t, n.at("out"));
     if (!x.primitive && x.roles.size() != x.args.size()) throw std::invalid_argument("term: one role per argument");
+    for (const auto& r : x.roles)
+      if ((r.kind == RoleKind::ScaledBy || r.kind == RoleKind::UnscaledBy) && r.arg >= x.args.size())
+        throw std::invalid_argument("term: a scaling role names no argument");
     t.nodes.push_back(std::move(x));
   }
   return t;
@@ -493,23 +505,71 @@ class Checker {
     return materialize(ps, r, c);
   }
 
+  // The leaves x reaches through a multiply (or an fma's product) whose other operand reaches a
+  // leaf of `k` (memoized per k's set).
+  Set scaledLeaves(v::Value x, const Set& k, std::map<Key, SetRef>& memo, unsigned depth = 0) {
+    if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
+    x = resolve(x);
+    if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
+    if (x.conversion()) return scaledLeaves(x.conversion()->source, k, memo, depth + 1);
+    const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
+    const bool plain = x.indices().empty() && !x.pointer();
+    if (plain)
+      if (auto it = memo.find(key); it != memo.end()) return *it->second;
+    const auto& node = g_.definingNode(x);
+    const auto& op = node.operation();
+    Set s;
+    if (dynamic_cast<const v::LoadOp*>(&op)) {
+      if (const auto* r = m_.readReplacement({x.nodeId(), x.instanceIndex()}))
+        if (const auto* value = std::get_if<v::Value>(r)) s = scaledLeaves(*value, k, memo, depth + 1);
+    } else {
+      const auto operands = g_.instanceOperands(x);
+      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+      const bool product = (b && b->opcode() == v::BinaryOpcode::Multiply) || dynamic_cast<const v::FmaOp*>(&op);
+      if (product && operands.size() >= 2) {
+        const auto l0 = leaves(operands[0], depth + 1), l1 = leaves(operands[1], depth + 1);
+        if (!disjoint(l1, k)) s = unite(s, l0);
+        if (!disjoint(l0, k)) s = unite(s, l1);
+      }
+      for (const auto& a : operands) s = unite(s, scaledLeaves(a, k, memo, depth + 1));
+    }
+    if (plain) memo.emplace(key, std::make_shared<const Set>(s));
+    return s;
+  }
+
   // Role signatures of opaque node m over its value `root` (m at outer pattern `at`).
   void checkRoles(std::size_t m, const v::Value& root, const Pattern& at, std::uint64_t r, std::uint64_t c,
                   const Json& where) {
     const auto& tn = t_.nodes[m];
-    if (tn.primitive || std::all_of(tn.roles.begin(), tn.roles.end(), [](Role x) { return x == Role::None; })) return;
-    const auto through = transLeaves(root);
+    if (tn.primitive || std::all_of(tn.roles.begin(), tn.roles.end(), [](Role x) { return x.kind == RoleKind::None; })) return;
+    std::optional<Set> through;
     for (std::size_t k = 0; k < tn.args.size(); ++k) {
-      if (tn.roles[k] == Role::None) continue;
+      const auto role = tn.roles[k];
+      if (role.kind == RoleKind::None) continue;
       const auto e = argLeaves(m, k, at, r, c);
-      const bool ok = tn.roles[k] == Role::ThroughTranscendental ? unite(through, e) == through
-                                                                  : disjoint(through, e);
+      Set reached;
+      std::string name;
+      bool ok = false;
+      if (role.kind == RoleKind::ThroughTranscendental || role.kind == RoleKind::AvoidsTranscendental) {
+        if (!through) through = transLeaves(root);
+        reached = *through;
+        const bool via = role.kind == RoleKind::ThroughTranscendental;
+        ok = via ? unite(reached, e) == reached : disjoint(reached, e);
+        name = via ? "through transcendental" : "avoids transcendental";
+      } else {
+        const auto by = argLeaves(m, role.arg, at, r, c);
+        std::map<Key, SetRef> memo;  // per (root, k): roles are few
+        reached = scaledLeaves(root, by, memo);
+        const bool scaled = role.kind == RoleKind::ScaledBy;
+        ok = scaled ? unite(reached, e) == reached : disjoint(reached, e);
+        name = std::string(scaled ? "scaled by argument " : "unscaled by argument ") + std::to_string(role.arg);
+      }
       if (!ok) {
         auto d = where;
         d["argument"] = k;
-        d["role"] = tn.roles[k] == Role::ThroughTranscendental ? "through transcendental" : "avoids transcendental";
+        d["role"] = name;
         d["argument_leaves"] = render(e);
-        d["through_transcendental"] = render(through);
+        d["reached"] = render(reached);
         refuse("role", "an argument's role signature does not hold", d);
       }
     }
