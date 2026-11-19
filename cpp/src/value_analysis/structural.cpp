@@ -91,23 +91,24 @@ struct Arg {
   std::string convert;  // the element type a primitive operand is converted to; empty: none
   std::vector<Pattern> reads;
 };
-// A role signature of an opaque atom's argument: none, or a structural fact that tells
-// equal-shaped operands apart.
-// (scaled_by / unscaled_by k: the argument reaches the output through, or never through, a
-// multiply whose other operand depends on argument k.)
-enum class RoleKind { None, ThroughTranscendental, AvoidsTranscendental, ScaledBy, UnscaledBy };
-struct Role {
-  RoleKind kind = RoleKind::None;
-  std::size_t arg = 0;
-  bool operator==(const Role&) const = default;
-};
+// A role of an opaque atom's argument: a structural fact on the dataflow graph that tells
+// equal-shaped operands apart. An argument carries a set of roles (empty: none).
+// through_transcendental: every element reaches the output by some path through ex2, lg2, sin,
+//   cos or tanh. avoids_transcendental: by no such path.
+// addend: every path to the output passes only adds, an fma's addend, conversions, and bit
+//   operations with constant operands (bf16 widening), and no add's other operand also reaches
+//   the element.
+// multiplicand: every element reaches the output as a factor of a multiply (or an fma's
+//   product) whose other factor reaches no element of the argument.
+enum class RoleKind { ThroughTranscendental, AvoidsTranscendental, Addend, Multiplicand };
+using Role = RoleKind;
 struct TermNode {
   std::string op;
   bool primitive = false;
   std::string operation, type;  // type: the format clause's compute element
   std::string store;            // the out port's element the result is converted to; empty: none
   bool commutative = false;
-  std::vector<Role> roles;      // opaque: per argument
+  std::vector<std::vector<Role>> roles;  // opaque: a role set per argument
   std::vector<Arg> args;
   std::optional<std::size_t> out;  // the object holding this node's value
 };
@@ -156,13 +157,17 @@ Term parseTerm(const Json& j) {
       x.operation = atom.at("operation");
       x.commutative = atom.at("commutative");
     } else if (atom.at("kind") == "opaque") {
-      for (const auto& r : atom.at("roles")) {
-        if (r.is_null()) x.roles.push_back({});
-        else if (r == Json{{"through", "transcendental"}}) x.roles.push_back({RoleKind::ThroughTranscendental});
-        else if (r == Json{{"avoids", "transcendental"}}) x.roles.push_back({RoleKind::AvoidsTranscendental});
-        else if (r.size() == 1 && r.contains("scaled_by")) x.roles.push_back({RoleKind::ScaledBy, r.at("scaled_by")});
-        else if (r.size() == 1 && r.contains("unscaled_by")) x.roles.push_back({RoleKind::UnscaledBy, r.at("unscaled_by")});
-        else throw std::invalid_argument("term: role " + r.dump());
+      for (const auto& set : atom.at("roles")) {
+        if (!set.is_array()) throw std::invalid_argument("term: a role set is an array");
+        std::vector<Role> rs;
+        for (const auto& r : set) {
+          if (r == "through_transcendental") rs.push_back(RoleKind::ThroughTranscendental);
+          else if (r == "avoids_transcendental") rs.push_back(RoleKind::AvoidsTranscendental);
+          else if (r == "addend") rs.push_back(RoleKind::Addend);
+          else if (r == "multiplicand") rs.push_back(RoleKind::Multiplicand);
+          else throw std::invalid_argument("term: role " + r.dump());
+        }
+        x.roles.push_back(std::move(rs));
       }
     } else {
       throw std::invalid_argument("term: atom kind");
@@ -195,9 +200,6 @@ Term parseTerm(const Json& j) {
     }
     if (n.contains("out") && !n.at("out").is_null()) x.out = objectIndex(t, n.at("out"));
     if (!x.primitive && x.roles.size() != x.args.size()) throw std::invalid_argument("term: one role per argument");
-    for (const auto& r : x.roles)
-      if ((r.kind == RoleKind::ScaledBy || r.kind == RoleKind::UnscaledBy) && r.arg >= x.args.size())
-        throw std::invalid_argument("term: a scaling role names no argument");
     t.nodes.push_back(std::move(x));
   }
   return t;
@@ -505,74 +507,133 @@ class Checker {
     return materialize(ps, r, c);
   }
 
-  // The leaves x reaches through a multiply (or an fma's product) whose other operand reaches a
-  // leaf of `k` (memoized per k's set).
-  Set scaledLeaves(v::Value x, const Set& k, std::map<Key, SetRef>& memo, unsigned depth = 0) {
+  // Memoized per argument set k (roles are few, so one memo per (root, k)).
+  using Memo = std::map<Key, SetRef>;
+
+  // The leaves of k that x reaches as a factor of a multiply (or an fma's product) whose other
+  // factor reaches no leaf of k.
+  Set factorLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
+    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
+      Set s;
+      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+      const bool product = (b && b->opcode() == v::BinaryOpcode::Multiply) || dynamic_cast<const v::FmaOp*>(&op);
+      if (product && xs.size() >= 2) {
+        const auto l0 = meet(leaves(xs[0], d + 1), k), l1 = meet(leaves(xs[1], d + 1), k);
+        if (l1.empty()) s = unite(s, l0);
+        if (l0.empty()) s = unite(s, l1);
+      }
+      for (const auto& a : xs) s = unite(s, factorLeaves(a, k, memo, d + 1));
+      return s;
+    });
+  }
+
+  // The leaves of k that x reaches by some path other than adds, an fma's addend, conversions and
+  // bit operations with constant operands, or as both operands of one add.
+  Set nonAddendLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
+    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
+      Set s;
+      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+      const auto code = b ? std::optional(b->opcode()) : std::nullopt;
+      using B = v::BinaryOpcode;
+      if (code == B::Add && xs.size() == 2) {
+        s = meet(meet(leaves(xs[0], d + 1), leaves(xs[1], d + 1)), k);
+        for (const auto& a : xs) s = unite(s, nonAddendLeaves(a, k, memo, d + 1));
+      } else if (dynamic_cast<const v::FmaOp*>(&op) && xs.size() == 3) {
+        const auto p = unite(leaves(xs[0], d + 1), leaves(xs[1], d + 1));
+        s = unite(meet(p, k), meet(meet(p, leaves(xs[2], d + 1)), k));
+        s = unite(s, nonAddendLeaves(xs[2], k, memo, d + 1));
+      } else {
+        // A bit operation whose other operands are constants (no leaves) carries its one operand.
+        std::vector<std::size_t> live;
+        for (std::size_t i = 0; i < xs.size(); ++i)
+          if (!leaves(xs[i], d + 1).empty()) live.push_back(i);
+        const bool bits = code == B::ShiftLeft || code == B::ShiftRight || code == B::BitAnd || code == B::BitOr;
+        if (bits && live.size() == 1) return nonAddendLeaves(xs[live[0]], k, memo, d + 1);
+        for (const auto& a : xs) s = unite(s, meet(leaves(a, d + 1), k));
+      }
+      return s;
+    });
+  }
+
+  // A memoized walk of x's defining DAG: through conversions and replaced loads, `f` on any other
+  // operation with its operands; an unreplaced load (a leaf) gives the empty set.
+  template <class F>
+  Set walk(v::Value x, Memo& memo, unsigned depth, const F& f) {
     if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
     x = resolve(x);
     if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
-    if (x.conversion()) return scaledLeaves(x.conversion()->source, k, memo, depth + 1);
+    if (x.conversion()) return walk(x.conversion()->source, memo, depth + 1, f);
     const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
     const bool plain = x.indices().empty() && !x.pointer();
     if (plain)
       if (auto it = memo.find(key); it != memo.end()) return *it->second;
-    const auto& node = g_.definingNode(x);
-    const auto& op = node.operation();
+    const auto& op = g_.definingNode(x).operation();
     Set s;
     if (dynamic_cast<const v::LoadOp*>(&op)) {
       if (const auto* r = m_.readReplacement({x.nodeId(), x.instanceIndex()}))
-        if (const auto* value = std::get_if<v::Value>(r)) s = scaledLeaves(*value, k, memo, depth + 1);
+        if (const auto* value = std::get_if<v::Value>(r)) s = walk(*value, memo, depth + 1, f);
     } else {
-      const auto operands = g_.instanceOperands(x);
-      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
-      const bool product = (b && b->opcode() == v::BinaryOpcode::Multiply) || dynamic_cast<const v::FmaOp*>(&op);
-      if (product && operands.size() >= 2) {
-        const auto l0 = leaves(operands[0], depth + 1), l1 = leaves(operands[1], depth + 1);
-        if (!disjoint(l1, k)) s = unite(s, l0);
-        if (!disjoint(l0, k)) s = unite(s, l1);
-      }
-      for (const auto& a : operands) s = unite(s, scaledLeaves(a, k, memo, depth + 1));
+      s = f(op, g_.instanceOperands(x), depth);
     }
     if (plain) memo.emplace(key, std::make_shared<const Set>(s));
     return s;
   }
 
-  // Role signatures of opaque node m over its value `root` (m at outer pattern `at`).
+  // Role sets of opaque node m over its value `root` (m at outer pattern `at`).
   void checkRoles(std::size_t m, const v::Value& root, const Pattern& at, std::uint64_t r, std::uint64_t c,
                   const Json& where) {
     const auto& tn = t_.nodes[m];
-    if (tn.primitive || std::all_of(tn.roles.begin(), tn.roles.end(), [](Role x) { return x.kind == RoleKind::None; })) return;
+    if (tn.primitive) return;
     std::optional<Set> through;
     for (std::size_t k = 0; k < tn.args.size(); ++k) {
-      const auto role = tn.roles[k];
-      if (role.kind == RoleKind::None) continue;
+      if (tn.roles[k].empty()) continue;
       const auto e = argLeaves(m, k, at, r, c);
-      Set reached;
-      std::string name;
-      bool ok = false;
-      if (role.kind == RoleKind::ThroughTranscendental || role.kind == RoleKind::AvoidsTranscendental) {
-        if (!through) through = transLeaves(root);
-        reached = *through;
-        const bool via = role.kind == RoleKind::ThroughTranscendental;
-        ok = via ? unite(reached, e) == reached : disjoint(reached, e);
-        name = via ? "through transcendental" : "avoids transcendental";
-      } else {
-        const auto by = argLeaves(m, role.arg, at, r, c);
-        std::map<Key, SetRef> memo;  // per (root, k): roles are few
-        reached = scaledLeaves(root, by, memo);
-        const bool scaled = role.kind == RoleKind::ScaledBy;
-        ok = scaled ? unite(reached, e) == reached : disjoint(reached, e);
-        name = std::string(scaled ? "scaled by argument " : "unscaled by argument ") + std::to_string(role.arg);
-      }
-      if (!ok) {
-        auto d = where;
-        d["argument"] = k;
-        d["role"] = name;
-        d["argument_leaves"] = render(e);
-        d["reached"] = render(reached);
-        refuse("role", "an argument's role signature does not hold", d);
+      for (const auto role : tn.roles[k]) {
+        Set reached;
+        bool ok = false;
+        const char* name = "";
+        Memo memo;
+        switch (role) {
+          case RoleKind::ThroughTranscendental:
+          case RoleKind::AvoidsTranscendental:
+            if (!through) through = transLeaves(root);
+            reached = *through;
+            ok = role == RoleKind::ThroughTranscendental ? unite(reached, e) == reached : disjoint(reached, e);
+            name = role == RoleKind::ThroughTranscendental ? "through_transcendental" : "avoids_transcendental";
+            break;
+          case RoleKind::Addend:
+            reached = nonAddendLeaves(root, e, memo);
+            ok = reached.empty();
+            name = "addend";
+            break;
+          case RoleKind::Multiplicand:
+            reached = factorLeaves(root, e, memo);
+            ok = reached == e;
+            name = "multiplicand";
+            break;
+        }
+        if (!ok) {
+          auto d = where;
+          d["argument"] = k;
+          d["role"] = name;
+          d["argument_leaves"] = render(e);
+          d["reached"] = render(reached);
+          refuse("role", "an argument's role signature does not hold", d);
+        }
       }
     }
+  }
+
+  // The intersection of two sorted range sets.
+  static Set meet(const Set& a, const Set& b) {
+    Set s;
+    std::size_t i = 0, j = 0;
+    while (i < a.size() && j < b.size()) {
+      const auto lo = std::max(a[i].begin, b[j].begin), hi = std::min(a[i].end, b[j].end);
+      if (lo < hi) s.push_back({lo, hi});
+      (a[i].end < b[j].end) ? ++i : ++j;
+    }
+    return s;
   }
 
   static bool disjoint(const Set& a, const Set& b) {
