@@ -957,12 +957,23 @@ class Checker {
                 const auto& sv = stored.at(*inner.out).at(e);
                 if (!sv) return false;
                 // The same value: equal conversion chains (the store's rounding, e.g. to bf16) over
-                // the same node result.
-                auto z = resolve(*sv);
+                // the same node result; a bitcast to an integer or bit type keeps the bits and
+                // reinterprets no float, so it is skipped on either side (a bf16 stored through its
+                // u16 image). A bitcast to a float type is not skipped.
+                const auto bits = [&](v::Value v) {
+                  while (v.conversion() && v.conversion()->spec->kind == v::TypeConversionKind::Bitcast) {
+                    const auto e = v.conversion()->spec->target.element().toString();
+                    if (e.empty() || (e[0] != 'u' && e[0] != 's' && e[0] != 'b') || e.rfind("bf", 0) == 0) break;
+                    v = resolve(v.conversion()->source);
+                  }
+                  return v;
+                };
+                auto z = bits(resolve(*sv));
+                y = bits(y);
                 while (y.conversion() && z.conversion()) {
                   if (!(*y.conversion()->spec == *z.conversion()->spec)) return false;
-                  y = resolve(y.conversion()->source);
-                  z = resolve(z.conversion()->source);
+                  y = bits(resolve(y.conversion()->source));
+                  z = bits(resolve(z.conversion()->source));
                 }
                 return !y.conversion() && !z.conversion() && y.nodeId() == z.nodeId() &&
                        y.resultIndex() == z.resultIndex() && y.instanceIndex() == z.instanceIndex();
