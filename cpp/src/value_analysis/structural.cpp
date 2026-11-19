@@ -738,6 +738,38 @@ class Checker {
     for (const auto& o : t_.objects)
       if (o.row_indexed) segmented &= o.cols == cols;
     segmented &= seg.has_value();
+    // Gathered term: row-local, every row-indexed object read either directly (at the output's
+    // column) or only through one gather whose runs (size L) start at s0 + k * P for every k, and
+    // the runs cover the output's row (L * runs == cols). A member moving direct objects by whole
+    // rows plus m runs (m * L columns) moves gathered objects by the same rows plus m * P columns.
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> run;  // L, P
+    std::map<std::uint64_t, int> read_as;                          // space -> 1 direct, 2 gathered
+    bool gathered = row_local;
+    for (std::size_t n = 0; n < t_.nodes.size(); ++n)
+      for (const bool cut : {false, true})
+        for (const auto& p : patterns(t_, n, cut)) {
+          if (!layout(p.space).row_indexed) {
+            gathered &= p.at[0].kind != Index::Out && (p.at[1].kind == Index::Const || p.at[1].kind == Index::All);
+            continue;
+          }
+          const auto& c = p.at[1];
+          int how = 0;
+          if (c.kind == Index::Out && c.value == 1) how = 1;
+          if (c.kind == Index::Gather && c.value == 1 && !c.starts->empty()) {
+            const auto& st = *c.starts;
+            const auto P = st.size() > 1 ? st[1] - st[0] : 0;
+            bool arith = st.size() * c.size == cols;
+            for (std::size_t k = 1; k < st.size(); ++k) arith &= st[k] == st[0] + k * P;
+            gathered &= arith && (!run || *run == std::pair{c.size, P});
+            run = std::pair{c.size, P};
+            how = 2;
+          }
+          gathered &= how != 0 && (!read_as.contains(p.space) || read_as[p.space] == how);
+          read_as[p.space] = how;
+        }
+    gathered &= run.has_value();
+    for (std::size_t i = 0; i < t_.objects.size(); ++i)
+      if (t_.objects[i].row_indexed && (!read_as.contains(i) || read_as[i] == 1)) gathered &= t_.objects[i].cols == cols;
     const auto& L = *lifting_;
     std::vector<bool> covered(rows * per, false);
     std::size_t members = 0, member_elements = 0;
@@ -766,7 +798,8 @@ class Checker {
         }
         std::optional<std::int64_t> krows, kelems;
         std::optional<std::pair<std::int64_t, std::int64_t>> kseg;  // rows, columns
-        bool whole = true, linear = true, segs = segmented;
+        std::optional<std::pair<std::int64_t, std::int64_t>> kgat;  // rows, runs
+        bool whole = true, linear = true, segs = segmented, gats = gathered;
         for (const auto& o : t_.objects) {
           if (!m.delta.contains(o.allocation)) continue;
           const auto d = m.delta.at(o.allocation);
@@ -776,6 +809,20 @@ class Checker {
           }
           const auto k = d / std::int64_t(o.stride), e = d / std::int64_t(o.bytes);
           whole &= d % std::int64_t(o.stride) == 0 && (!krows || *krows == k);
+          if (gats) {
+            // Rows and columns of this object's move; direct objects move by m runs of L, gathered
+            // ones by m periods of P.
+            const auto st = std::int64_t(o.stride);
+            const auto kr = (d >= 0 ? d : d - st + 1) / st, rem = d - kr * st;
+            const auto j = rem / std::int64_t(o.bytes);
+            const auto oi = std::size_t(&o - &t_.objects[0]);
+            const bool via = read_as.contains(oi) && read_as[oi] == 2;
+            const auto unit = std::int64_t(via ? run->second : run->first);
+            gats = rem % std::int64_t(o.bytes) == 0 && unit > 0 && j % unit == 0 && j < std::int64_t(o.cols);
+            const auto m = unit > 0 ? j / unit : 0;
+            gats &= !kgat || *kgat == std::pair{kr, m};
+            kgat = std::pair{kr, m};
+          }
           if (segs) {
             const auto st = std::int64_t(o.stride);
             const auto kr = (d >= 0 ? d : d - st + 1) / st, rem = d - kr * st;
@@ -799,6 +846,9 @@ class Checker {
         } else if (segs && kseg) {
           shift = kseg->first * std::int64_t(per) + kseg->second;
           modes.insert("segments");
+        } else if (gats && kgat) {
+          shift = kgat->first * std::int64_t(per) + kgat->second * std::int64_t(run->first);
+          modes.insert("gathered");
         } else {
           refuse("class_shift", whole ? "whole-row shifts but the term reads other rows"
                                       : "a member's offsets are no common row or (for an elementwise term) element shift");
