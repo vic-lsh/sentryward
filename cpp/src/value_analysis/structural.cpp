@@ -80,9 +80,13 @@ struct Object {
   std::uint64_t bytes = 0, stride = 0, rows = 0, cols = 0, base = 0;
   bool row_indexed = true;  // rows follow the launch's row space (else a fixed table, e.g. a weight)
 };
+// A read coordinate: output coordinate `value` (Out), all of [0, value) (All), `value` (Const), or,
+// for a per-segment read, relative to output coordinate `value` and a segment size: the output's
+// segment [floor(o / size) * size, + size) (Block) or the output's offset in it, o % size (Mod).
 struct Index {
-  enum Kind { Out, All, Const } kind;
+  enum Kind { Out, All, Const, Block, Mod } kind;
   std::uint64_t value;
+  std::uint64_t size = 0;
 };
 using Pattern = std::array<Index, 2>;  // (row, column)
 struct Arg {
@@ -191,8 +195,13 @@ Term parseTerm(const Json& j) {
           if (c.contains("out")) q[d] = {Index::Out, c.at("out")};
           else if (c.contains("all")) q[d] = {Index::All, c.at("all")};
           else if (c.contains("const")) q[d] = {Index::Const, c.at("const")};
+          else if (c.contains("block")) q[d] = {Index::Block, c.at("block").at("out"), c.at("block").at("size")};
+          else if (c.contains("mod")) q[d] = {Index::Mod, c.at("mod").at("out"), c.at("mod").at("size")};
           else throw std::invalid_argument("term: coordinate");
-          if (q[d].kind == Index::Out && q[d].value > 1) throw std::invalid_argument("term: output coordinate");
+          const bool rel = q[d].kind == Index::Out || q[d].kind == Index::Block || q[d].kind == Index::Mod;
+          if (rel && q[d].value > 1) throw std::invalid_argument("term: output coordinate");
+          if ((q[d].kind == Index::Block || q[d].kind == Index::Mod) && q[d].size == 0)
+            throw std::invalid_argument("term: segment size");
         }
         y.reads.push_back(q);
       }
@@ -212,8 +221,16 @@ struct SpacePattern {
 };
 Pattern compose(const Pattern& inner, const Pattern& outer) {
   Pattern r = inner;
-  for (auto& c : r)
-    if (c.kind == Index::Out) c = outer[c.value];
+  for (auto& c : r) {
+    if (c.kind == Index::Out) {
+      c = outer[c.value];
+    } else if (c.kind == Index::Block || c.kind == Index::Mod) {
+      // A segment of a body value read at the output's own coordinate; anything else is not
+      // stated by these coordinates.
+      if (outer[c.value].kind != Index::Out) throw std::invalid_argument("term: a segment read through a non-identity read");
+      c.value = outer[c.value].value;
+    }
+  }
   return r;
 }
 // The patterns of node n's operands; with `cut`, a body operand is that node's cut values.
@@ -282,6 +299,8 @@ class Checker {
         const auto& c = p.at[d];
         if (c.kind == Index::Out) lo[d] = at[c.value], hi[d] = lo[d] + 1;
         else if (c.kind == Index::Const) lo[d] = c.value, hi[d] = c.value + 1;
+        else if (c.kind == Index::Block) lo[d] = at[c.value] / c.size * c.size, hi[d] = lo[d] + c.size;
+        else if (c.kind == Index::Mod) lo[d] = at[c.value] % c.size, hi[d] = lo[d] + 1;
         else lo[d] = 0, hi[d] = c.value;
       }
       const auto per = o.stride / o.bytes;
@@ -687,6 +706,26 @@ class Checker {
         }
     for (const auto& o : t_.objects)
       if (o.row_indexed) elementwise &= o.stride == o.cols * o.bytes && o.cols == cols;
+    // Per-segment term (segments of `seg` columns): row-indexed objects read at the output's row
+    // and at its column or its segment, fixed objects at no output column but the offset in the
+    // segment (mod), every row-indexed object as wide as the output. A shift of whole rows plus
+    // whole segments within the row then moves every leaf with the output.
+    std::optional<std::uint64_t> seg;
+    bool segmented = row_local;
+    for (std::size_t n = 0; n < t_.nodes.size(); ++n)
+      for (const bool cut : {false, true})
+        for (const auto& p : patterns(t_, n, cut)) {
+          const auto& c = p.at[1];
+          if (c.kind == Index::Block || c.kind == Index::Mod) {
+            segmented &= !seg || *seg == c.size;
+            seg = c.size;
+          }
+          if (layout(p.space).row_indexed) segmented &= c.kind == Index::Out || c.kind == Index::Block;
+          else segmented &= p.at[0].kind != Index::Out && (c.kind == Index::Const || c.kind == Index::All || c.kind == Index::Mod);
+        }
+    for (const auto& o : t_.objects)
+      if (o.row_indexed) segmented &= o.cols == cols;
+    segmented &= seg.has_value();
     const auto& L = *lifting_;
     std::vector<bool> covered(rows * per, false);
     std::size_t members = 0, member_elements = 0;
@@ -714,7 +753,8 @@ class Checker {
           if (!known && d) refuse("class_shift", "a member moves an allocation the term does not name", {{"allocation", alloc}});
         }
         std::optional<std::int64_t> krows, kelems;
-        bool whole = true, linear = true;
+        std::optional<std::pair<std::int64_t, std::int64_t>> kseg;  // rows, columns
+        bool whole = true, linear = true, segs = segmented;
         for (const auto& o : t_.objects) {
           if (!m.delta.contains(o.allocation)) continue;
           const auto d = m.delta.at(o.allocation);
@@ -724,6 +764,14 @@ class Checker {
           }
           const auto k = d / std::int64_t(o.stride), e = d / std::int64_t(o.bytes);
           whole &= d % std::int64_t(o.stride) == 0 && (!krows || *krows == k);
+          if (segs) {
+            const auto st = std::int64_t(o.stride);
+            const auto kr = (d >= 0 ? d : d - st + 1) / st, rem = d - kr * st;
+            const auto j = rem / std::int64_t(o.bytes);
+            segs = rem % std::int64_t(o.bytes) == 0 && j % std::int64_t(*seg) == 0 && j < std::int64_t(o.cols) &&
+                   (!kseg || *kseg == std::pair{kr, j});
+            kseg = std::pair{kr, j};
+          }
           linear &= d % std::int64_t(o.bytes) == 0 && (!kelems || *kelems == e);
           krows = k;
           kelems = e;
@@ -736,6 +784,9 @@ class Checker {
         } else if (linear && elementwise) {
           shift = *kelems;
           modes.insert("elements");
+        } else if (segs && kseg) {
+          shift = kseg->first * std::int64_t(per) + kseg->second;
+          modes.insert("segments");
         } else {
           refuse("class_shift", whole ? "whole-row shifts but the term reads other rows"
                                       : "a member's offsets are no common row or (for an elementwise term) element shift");
@@ -885,7 +936,7 @@ class Checker {
             const auto operands = g_.instanceOperands(x);
             const auto matches = [&](const v::Value& operand, std::size_t k) -> bool {
               const auto& a = tn.args[k];
-              if (a.reads.size() != 1 || a.reads[0][0].kind == Index::All || a.reads[0][1].kind == Index::All)
+              if (a.reads.size() != 1 || a.reads[0][0].kind == Index::All || a.reads[0][1].kind == Index::All || a.reads[0][1].kind == Index::Block)
                 unsupported("primitive_operand", "a primitive operand that is not one element", where);
               if (!a.body) {
                 const auto s = materialize({{t_.inputs[a.ref], a.reads[0]}}, r, c);
@@ -905,7 +956,14 @@ class Checker {
                 const auto e = materialize({{t_.objects.size() + a.ref, a.reads[0]}}, r, c).front().begin & kElementMask;
                 const auto& sv = stored.at(*inner.out).at(e);
                 if (!sv) return false;
-                const auto z = resolve(*sv);
+                // The same value: equal conversion chains (the store's rounding, e.g. to bf16) over
+                // the same node result.
+                auto z = resolve(*sv);
+                while (y.conversion() && z.conversion()) {
+                  if (!(*y.conversion()->spec == *z.conversion()->spec)) return false;
+                  y = resolve(y.conversion()->source);
+                  z = resolve(z.conversion()->source);
+                }
                 return !y.conversion() && !z.conversion() && y.nodeId() == z.nodeId() &&
                        y.resultIndex() == z.resultIndex() && y.instanceIndex() == z.instanceIndex();
               }
