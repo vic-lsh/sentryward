@@ -525,83 +525,111 @@ class Checker {
     return true;
   }
 
-  // Class mode: the representatives' written rows, and each member's rows as a representative's
-  // shifted by k, where the member's offset of every row-indexed object is k of its rows and of
-  // every other object zero. Together they must cover every row of every output object once.
-  // The term's leaf patterns must then shift with the rows: a row-indexed object read at the
-  // output's row only. Null without lifting.
+  // Class mode: the representatives' written elements, and each member's as a representative's
+  // shifted by s elements; together they must cover every element of every output object once.
+  // A member's shift, from its per-allocation offsets (fixed objects: zero; an allocation the
+  // kernel does not access constrains nothing):
+  // - whole rows: every accessed row-indexed object moves by the same k rows (s = k rows); the
+  //   term must read row-indexed objects at the output's row only, so its leaves shift with k;
+  // - elements: every accessed row-indexed object moves by the same e elements (s = e); sound only
+  //   for an elementwise term (every read of a row-indexed object at the output's element) over
+  //   contiguous rows of one width, where (row, column) is the linear element index.
+  // Null without lifting.
   Json classMode(const std::map<std::size_t, std::set<std::uint64_t>>& written,
                  const std::map<std::uint64_t, std::set<std::uint64_t>>& by_cta) {
     if (!lifting_) return nullptr;
-    std::optional<std::set<std::uint64_t>> rep_rows;
-    std::uint64_t rows = 0;
+    std::optional<std::set<std::uint64_t>> rep;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> shape;  // rows, elements per row
+    std::uint64_t cols = 0;
     for (const auto& n : t_.nodes) {
       if (!n.out) continue;
+      const auto& o = t_.objects[*n.out];
       const auto it = written.find(*n.out);
       const auto here = it == written.end() ? std::set<std::uint64_t>{} : it->second;
-      if (rep_rows && *rep_rows != here) refuse("class_rows", "output objects' representative rows differ");
-      rep_rows = here;
-      rows = t_.objects[*n.out].rows;
-      for (std::size_t n2 = 0; n2 < t_.nodes.size(); ++n2)
-        for (const bool cut : {false, true})
-          for (const auto& p : patterns(t_, n2, cut))
-            if (layout(p.space).row_indexed && p.at[0].kind != Index::Out)
-              unsupported("class_mode_pattern", "a row-indexed object read at another row than the output's");
+      if (rep && *rep != here) refuse("class_rows", "output objects' representative elements differ");
+      rep = here;
+      const std::pair<std::uint64_t, std::uint64_t> sh{o.rows, o.stride / o.bytes};
+      if ((shape && (*shape != sh || cols != o.cols)) || !o.row_indexed)
+        unsupported("class_mode_rows", "output objects with different row spaces or widths");
+      shape = sh;
+      cols = o.cols;
     }
-    for (const auto& n : t_.nodes)
-      if (n.out && (t_.objects[*n.out].rows != rows || !t_.objects[*n.out].row_indexed))
-        unsupported("class_mode_rows", "output objects with different row spaces");
+    if (!shape) return nullptr;
+    const auto [rows, per] = *shape;
+    bool row_local = true, elementwise = true;
+    for (std::size_t n = 0; n < t_.nodes.size(); ++n)
+      for (const bool cut : {false, true})
+        for (const auto& p : patterns(t_, n, cut)) {
+          if (!layout(p.space).row_indexed) continue;
+          row_local &= p.at[0].kind == Index::Out && p.at[0].value == 0;
+          elementwise &= row_local && p.at[1].kind == Index::Out && p.at[1].value == 1;
+        }
+    for (const auto& o : t_.objects)
+      if (o.row_indexed) elementwise &= o.stride == o.cols * o.bytes && o.cols == cols;
     const auto& L = *lifting_;
-    std::vector<bool> covered(rows, false);
-    std::size_t members = 0, member_rows = 0;
-    const auto cover = [&](std::uint64_t r) {
-      if (r >= rows || covered[r]) refuse("class_coverage", "a row covered twice or outside the launch", {{"row", r}});
-      covered[r] = true;
+    std::vector<bool> covered(rows * per, false);
+    std::size_t members = 0, member_elements = 0;
+    const auto cover = [&](std::int64_t e) {
+      if (e < 0 || std::uint64_t(e) >= rows * per || std::uint64_t(e) % per >= cols || covered[std::size_t(e)])
+        refuse("class_coverage", "an element covered twice or outside the launch", {{"element", e}});
+      covered[std::size_t(e)] = true;
     };
     std::map<UnitLifting::Origin, std::set<std::uint64_t>> by_origin;
-    for (const auto& [cta, rs] : by_cta) {
+    for (const auto& [cta, es] : by_cta) {
       const UnitLifting::Origin c{cta % L.grid[0], cta / L.grid[0] % L.grid[1], cta / (L.grid[0] * L.grid[1])};
       UnitLifting::Origin o;
       for (std::size_t a = 0; a < 3; ++a) o[a] = c[a] / L.unit_shape[a] * L.unit_shape[a];
-      by_origin[o].insert(rs.begin(), rs.end());
+      by_origin[o].insert(es.begin(), es.end());
     }
-    for (const auto& [origin, rs] : by_origin) {
-      for (const auto r : rs) cover(r);
+    std::set<std::string> modes;
+    for (const auto& [origin, es] : by_origin) {
+      for (const auto e : es) cover(std::int64_t(e));
       const auto it = L.members.find(origin);
       if (it == L.members.end()) continue;
       for (const auto& m : it->second) {
-        std::optional<std::int64_t> k;
+        for (const auto& [alloc, d] : m.delta) {
+          bool known = false;
+          for (const auto& o : t_.objects) known |= o.allocation == alloc;
+          if (!known && d) refuse("class_shift", "a member moves an allocation the term does not name", {{"allocation", alloc}});
+        }
+        std::optional<std::int64_t> krows, kelems;
+        bool whole = true, linear = true;
         for (const auto& o : t_.objects) {
-          // An allocation the kernel does not access has no offset and constrains nothing.
           if (!m.delta.contains(o.allocation)) continue;
           const auto d = m.delta.at(o.allocation);
           if (!o.row_indexed) {
             if (d) refuse("class_shift", "a member moves a fixed object", {{"object", o.name}, {"delta", d}});
             continue;
           }
-          if (d % std::int64_t(o.stride)) refuse("class_shift", "a member's offset is not whole rows", {{"object", o.name}, {"delta", d}});
-          const auto ko = d / std::int64_t(o.stride);
-          if (k && *k != ko) refuse("class_shift", "a member shifts objects by different rows", {{"object", o.name}, {"delta", d}});
-          k = ko;
+          const auto k = d / std::int64_t(o.stride), e = d / std::int64_t(o.bytes);
+          whole &= d % std::int64_t(o.stride) == 0 && (!krows || *krows == k);
+          linear &= d % std::int64_t(o.bytes) == 0 && (!kelems || *kelems == e);
+          krows = k;
+          kelems = e;
         }
-        for (const auto& [alloc, d] : m.delta) {
-          bool known = false;
-          for (const auto& o : t_.objects) known |= o.allocation == alloc;
-          if (!known && d) refuse("class_shift", "a member moves an allocation the term does not name", {{"allocation", alloc}});
+        if (!krows) unsupported("class_shift", "no row-indexed object");
+        std::int64_t shift;
+        if (whole && row_local) {
+          shift = *krows * std::int64_t(per);
+          modes.insert("rows");
+        } else if (linear && elementwise) {
+          shift = *kelems;
+          modes.insert("elements");
+        } else {
+          refuse("class_shift", whole ? "whole-row shifts but the term reads other rows"
+                                      : "a member's offsets are no common row or (for an elementwise term) element shift");
         }
-        if (!k) unsupported("class_shift", "no row-indexed object");
         ++members;
-        for (const auto r : rs) {
-          if (std::int64_t(r) + *k < 0) refuse("class_coverage", "a member row below zero");
-          cover(std::uint64_t(std::int64_t(r) + *k));
-          ++member_rows;
+        for (const auto e : es) {
+          cover(std::int64_t(e) + shift);
+          ++member_elements;
         }
       }
     }
-    for (std::uint64_t r = 0; r < rows; ++r)
-      if (!covered[r]) refuse("class_coverage", "a row no representative or member covers", {{"row", r}});
-    return {{"representatives", by_origin.size()}, {"representative_rows", rep_rows ? rep_rows->size() : 0},
-            {"members", members}, {"member_rows", member_rows}};
+    for (std::uint64_t e = 0; e < rows * per; ++e)
+      if (e % per < cols && !covered[e]) refuse("class_coverage", "an element no representative or member covers", {{"element", e}});
+    return {{"representatives", by_origin.size()}, {"representative_elements", rep ? rep->size() : 0},
+            {"members", members}, {"member_elements", member_elements}, {"shifts", modes}};
   }
 
   Json run() {
@@ -610,8 +638,8 @@ class Checker {
     for (const auto& n : t_.nodes)
       if (n.out) stored[*n.out].assign(t_.objects[*n.out].rows * (t_.objects[*n.out].stride / t_.objects[*n.out].bytes), std::nullopt);
     std::size_t writes = 0;
-    std::map<std::size_t, std::set<std::uint64_t>> written_rows;
-    std::map<std::uint64_t, std::set<std::uint64_t>> rows_by_cta;
+    std::map<std::size_t, std::set<std::uint64_t>> written;
+    std::map<std::uint64_t, std::set<std::uint64_t>> by_cta;
     m_.forEachOutput(g_, [&](const OutputWrite& w) {
       ++writes;
       const auto at = elementAt(w.region.allocation, w.region.offset);
@@ -627,16 +655,15 @@ class Checker {
         unsupported("output_granularity", "an output write that is not one element of its object",
                     {{"object", o.name}, {"offset", w.region.offset}, {"bytes", w.region.bytes}});
       const auto e = at->second;
-      const auto per = o.stride / o.bytes;
       auto& slot = stored[obj][e];
       if (slot) refuse("duplicate_output", "two final writes to one element", {{"object", o.name}, {"offset", w.region.offset}});
       slot = w.value;
-      written_rows[obj].insert(e / per);
+      written[obj].insert(e);
       const auto cta = g_.node(w.writer.node).instanceOrigin(w.writer.instance).cta;
       if (lifting_ && !cta) unsupported("writer_cta", "an output write without a writer CTA");
-      rows_by_cta[cta.value_or(0)].insert(e / per);
+      by_cta[cta.value_or(0)].insert(e);
     });
-    const auto class_mode = classMode(written_rows, rows_by_cta);
+    const auto class_mode = classMode(written, by_cta);
     Json nodes = Json::array();
     for (std::size_t n = 0; n < t_.nodes.size(); ++n) {
       const auto& tn = t_.nodes[n];
@@ -675,9 +702,9 @@ class Checker {
       cutter.stop_ = std::move(stop);
       std::size_t checked = 0;
       for (std::uint64_t r = 0; r < o.rows; ++r) {
-        if (lifting_ && !written_rows[*tn.out].contains(r)) continue;  // a member row: by its shift
         for (std::uint64_t c = 0; c < o.cols; ++c) {
           const auto& slot = stored.at(*tn.out)[r * per + c];
+          if (lifting_ && !slot) continue;  // a member's element: covered by its shift (classMode)
           const Json where = {{"node", n}, {"op", tn.op}, {"object", o.name}, {"element", {r, c}}};
           if (!slot) refuse("missing_output", "an element of the node's object is not written", where);
           // 1. Leaves.
