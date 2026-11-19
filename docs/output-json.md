@@ -13,8 +13,13 @@ carries the footprint evidence. Like a race, a violation is relative to the stat
 means some valuation of the table elements that the properties allow leaves the declared extent,
 not that a given execution does.
 
-`evidence.footprint`: `status` (`contained`, `violated`, `inconclusive`), `checked_accesses`,
-`violation_count`, `undecided_count`, `objects` and `violations` / `undecided` samples.
+`evidence.footprint`: `status` (`contained`, `violated`, `inconclusive`), the two halves `writes`
+(`contained`, `violated`, `inconclusive`) and `reads` (the same, or `not_contained` under
+`footprint_reads: noninterference`), `read_rule`, `reads_outside_declared` and `outside_reads`
+samples, `checked_accesses` (accesses analysed; in class mode each stands for its class),
+`violation_count`, `undecided_count` (weighted by class size), `objects` and `violations` /
+`undecided` samples. In class mode a sample's block and thread are the representative's and its
+witness names the member's delta.
 Each object lists the reads and writes, the declared and inferred direction, the declared extent
 and the inferred touched interval `[inferred_min_byte, inferred_max_byte_exclusive)`
 (`unused_declared_bytes_outside_hull` is the declared bytes outside that interval). Each

@@ -212,7 +212,8 @@ declaration). Without `footprints`, no containment check runs and the report is 
 | `direction` | `read` (no store), `write` (no load) or `readwrite` |
 | `extent_bytes` | Allocation size in bytes; every access must lie in `[0, extent_bytes)` |
 | `extent_elements`, `element_type` | Alternative to `extent_bytes`: element count and a scalar type (`bf16`, `f32`, `s32`, ...) |
-| `periodic` | Optional `{stride, period, count, offset, width}`: piece `c` of row `k` is bytes `k*stride + offset + c*period + [0, width)`; each constant-offset access must lie in one piece |
+| `periodic` | Optional `{stride, period, count, offset, width}`: piece `c` of row `k` is bytes `k*stride + offset + c*period + [0, width)`; each access must lie in one piece |
+| `pieces` | Optional array of piece sets `{base, rows, stride, period, count, width, direction}`: run `c < count` of row `r < rows` is bytes `[base + r*stride + c*period, + width)` (defaults: `base` 0, `rows` 1, `count` 1); `direction` (default the object's, and within it) says whether the set may be read or written. Each access must lie in one run of one row of a set that allows it. One set per declared port of the object: a field offset, a row stride wider than the row, interleaved runs, several ports through one pointer |
 
 ```json
 {"footprints": [
@@ -220,13 +221,24 @@ declaration). Without `footprints`, no containment check runs and the report is 
   {"object": "hn", "direction": "write", "extent_elements": 8192, "element_type": "bf16"}]}
 ```
 
+`footprint_reads` (top level, optional): `containment` (default) or `noninterference`. Under
+`containment` a read outside its object's declared bytes is a violation. Under `noninterference` it
+is reported (`evidence.footprint.reads` is `not_contained`, samples in `outside_reads`) but is not a
+violation: a contract that only says the outputs do not depend on bytes outside the footprint admits
+a tiling that loads past it and masks the values. Writes are always checked by containment, so a
+passed write half also means every byte outside the declared pieces is unchanged.
+
 Once any record is present, a global access to an object without a record is a violation
-(`undeclared_object`), and CTA class mode is off so every CTA is enumerated. Constant offsets are
-decided by arithmetic. A symbolic offset (a loaded `tensor_properties` element) is decided by the
-address solver under the stated properties; with no property bounding the loaded value, containment
-fails with a witness. Extents and directions are the declared contract; the premises in
-`tensor_properties` stay trusted. Results go under `evidence.footprint`
-([output](output-json.md#footprint-check)).
+(`undeclared_object`). Every CTA is covered: with CTA class mode on, each class representative's
+access is checked once for every member unit, moved by that unit's offset (delta) of the object;
+an object whose delta is piecewise, or a symbolic offset whose atoms have no per-object bounds in a
+shared class, falls back to the per-unit run. Constant offsets are decided by arithmetic. A symbolic
+offset (a loaded `tensor_properties` element) is decided by the address solver under the stated
+properties; with no property bounding the loaded value, containment fails with a witness. Against
+declared pieces, a symbolic offset is decided when its atoms bound a hull and their coefficients are
+multiples of the piece set's row stride (a row index read from a table); otherwise it is undecided.
+Extents, pieces and directions are the declared contract; the premises in `tensor_properties` stay
+trusted. Results go under `evidence.footprint` ([output](output-json.md#footprint-check)).
 
 ## Tensor-map descriptors
 
