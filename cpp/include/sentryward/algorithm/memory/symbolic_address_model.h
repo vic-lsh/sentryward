@@ -78,6 +78,10 @@ struct ContainmentVerdict final {
   // exact for a constant offset, the interval hull over the atom bounds for a symbolic one.
   std::optional<std::int64_t> min_byte, max_byte_exclusive;
   bool constant_offset = false;
+  // The offset's constant part and the gcd of its atom coefficients (0 for a constant offset):
+  // with the gcd a multiple of a row stride, the offset's column within a row is the constant's.
+  std::optional<std::int64_t> constant;
+  std::uint64_t coefficient_gcd = 0;
   // kViolated: which side ("below_zero" or "past_extent") and the offset (constant) or the
   // solver's candidate valuation (symbolic); kUnknown: why.
   std::string side, witness, reason;
@@ -136,10 +140,11 @@ class SymbolicAddressModel final : public MemoryModel {
   // Footprint containment. `extent_bytes` null: only the touched interval is computed. Shapes the
   // address model cannot express (unresolved allocation, TMA regions, non-affine offsets) are
   // kUnknown, never kContained. Symbolic offsets are decided by the address solver over the
-  // tensor-property and address-invariant environment, with `timeout_ms` per query.
+  // tensor-property and address-invariant environment, with `timeout_ms` per query. `lower`: the
+  // range is [lower, extent_bytes) (a CTA-class representative's range narrowed by its members' δ).
   [[nodiscard]] ContainmentVerdict containment(const MemoryAccess& access,
                                                 std::optional<std::uint64_t> extent_bytes,
-                                                unsigned timeout_ms = 2000);
+                                                unsigned timeout_ms = 2000, std::int64_t lower = 0);
   [[nodiscard]] SymbolicAddressStats stats() const noexcept;
   // Whether this build links an SMT backend, and its name ("z3" or "unavailable").
   [[nodiscard]] static bool SolverAvailable() noexcept;

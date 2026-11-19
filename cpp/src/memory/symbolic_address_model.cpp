@@ -804,7 +804,7 @@ struct SymbolicAddressModel::Impl {
   }
 
   ContainmentVerdict Contain(const MemoryAccess& access, std::optional<std::uint64_t> extent,
-                             unsigned timeout_ms) {
+                             unsigned timeout_ms, std::int64_t lower = 0) {
     ContainmentVerdict verdict;
     const auto unknown = [&](std::string reason) { verdict.status = ContainmentVerdict::Status::kUnknown;
                                                    verdict.reason = std::move(reason); return verdict; };
@@ -829,10 +829,22 @@ struct SymbolicAddressModel::Impl {
       verdict.max_byte_exclusive = Clamp(hull->second + width);
     }
     verdict.constant_offset = offset.terms.empty();
+    if (offset.constant >= Int(std::numeric_limits<std::int64_t>::min()) &&
+        offset.constant <= Int(std::numeric_limits<std::int64_t>::max())) {
+      verdict.constant = static_cast<std::int64_t>(offset.constant);
+      Int g = 0;
+      for (const auto& [atom, coefficient] : offset.terms) {
+        (void)atom;
+        Int a = coefficient < 0 ? -coefficient : coefficient, b = g;
+        while (b != 0) { const Int t = a % b; a = b; b = t; }
+        g = a;
+      }
+      verdict.coefficient_gcd = g <= Int(std::numeric_limits<std::uint64_t>::max()) ? static_cast<std::uint64_t>(g) : 0;
+    }
     if (!extent && !verdict.constant_offset) return verdict;
     if (verdict.constant_offset) {
       const Int low = offset.constant;
-      const bool below = low < 0, past = extent && low + width > Int(*extent);
+      const bool below = low < Int(lower), past = extent && low + width > Int(*extent);
       if (below || past) {
         verdict.status = ContainmentVerdict::Status::kViolated;
         verdict.side = below ? "below_zero" : "past_extent";
@@ -844,7 +856,7 @@ struct SymbolicAddressModel::Impl {
     }
     if (!solver) return unknown("symbolic offset needs the SMT layer, which this build lacks");
     // Interval arithmetic first: a hull inside [0, extent) needs no solver.
-    if (hull && hull->first >= 0 && hull->second + width <= Int(*extent)) {
+    if (hull && hull->first >= Int(lower) && hull->second + width <= Int(*extent)) {
       verdict.status = ContainmentVerdict::Status::kContained;
       return verdict;
     }
@@ -863,7 +875,7 @@ struct SymbolicAddressModel::Impl {
       verdict.witness = valuation + (total ? ", offset=" + ToString(*total) : std::string{});
       return verdict;
     };
-    if (extremes.inf_unbounded || (extremes.inf && offset.constant + *extremes.inf < 0))
+    if (extremes.inf_unbounded || (extremes.inf && offset.constant + *extremes.inf < Int(lower)))
       return violated("below_zero", extremes.inf_witness,
                       extremes.inf ? std::optional<Int>(offset.constant + *extremes.inf) : std::nullopt);
     if (extremes.sup_unbounded || (extremes.sup && offset.constant + *extremes.sup + width > Int(*extent)))
@@ -1156,8 +1168,8 @@ std::unique_ptr<MemoryConflictCandidates> SymbolicAddressModel::conflictCandidat
 
 ContainmentVerdict SymbolicAddressModel::containment(const MemoryAccess& access,
                                                      std::optional<std::uint64_t> extent_bytes,
-                                                     unsigned timeout_ms) {
-  return impl_->Contain(access, extent_bytes, timeout_ms);
+                                                     unsigned timeout_ms, std::int64_t lower) {
+  return impl_->Contain(access, extent_bytes, timeout_ms, lower);
 }
 
 SymbolicAddressStats SymbolicAddressModel::stats() const noexcept { return impl_->stats; }
