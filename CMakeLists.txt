@@ -253,6 +253,7 @@ add_library(sentryward_ptx STATIC
   cpp/src/frontend/ptx/query_log.cpp
   cpp/src/frontend/ptx/tensor_maps.cpp
   cpp/src/frontend/ptx/layouts.cpp
+  cpp/src/frontend/ptx/choice_facts.cpp
   cpp/src/frontend/ptx/known_bits.cpp
   cpp/src/frontend/ptx/tmem_lifetime.cpp
   cpp/src/frontend/ptx/resources.cpp

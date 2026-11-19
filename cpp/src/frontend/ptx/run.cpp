@@ -19,6 +19,7 @@
 #include "sentryward/frontend/ptx/layouts.h"
 #include "sentryward/frontend/ptx/value_ir.h"
 #include "sentryward/frontend/ptx/branch_scope_capture.h"
+#include "sentryward/frontend/ptx/choice_facts.h"
 #include "sentryward/frontend/ptx/semantic_program.h"
 #include "sentryward/frontend/ptx/serialization.h"
 #include "sentryward/frontend/ptx/unit_facts.h"
@@ -1959,6 +1960,13 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         // Choices that a statically known predicate overrode on some visit (listed only when any).
         if (!static_choice_lines.empty())
           input_metadata["frontend_assumptions"]["branch_choices_with_static_visits"] = static_choice_lines;
+        // Explicit choices: the static facts that make them a case split (choice_facts.h).
+        if (const auto choices = config.raw.value("user_branch_decisions", Json::array());
+            choices.is_array() && !choices.empty()) {
+          std::set<std::uint32_t> lines;
+          for (const auto &c : choices) lines.insert(c.at("line").get<std::uint32_t>());
+          input_metadata["frontend_assumptions"]["branch_choice_facts"] = ptx::ChoiceFacts(*function, lines);
+        }
         auto &decisions = input_metadata["frontend_assumptions"]["data_branch_decisions"];
         for (const auto &[line, decision] : data_branch_decisions)
           decisions.push_back({{"line", line}, {"assumption", decision.assumption}, {"rule", decision.rule},
