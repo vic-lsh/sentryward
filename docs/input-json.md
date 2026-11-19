@@ -200,6 +200,15 @@ is a function of that one element: it is a symbol of its own, bounded by its
 range and never injective, and an affine offset in such symbols places the
 access the same way.
 
+### Field properties
+
+A `lower_bound` or `upper_bound` record may carry `field: {offset, stride, count}` (bytes): the bound
+then holds only for the elements at `offset + k*stride`, `k < count` (one field of a table of
+records), and says nothing of the object's other elements. An object may have one whole-object
+property set and any number of field properties (one element type per object). A load is bounded by
+the field whose elements include every byte it may read, else by the whole-object property, else it
+is unbounded. In a CTA class, a symbolic address over a field-bounded element is decided per unit.
+
 ## Footprints
 
 Each record declares what a kernel may touch in one global input object: its byte extent and

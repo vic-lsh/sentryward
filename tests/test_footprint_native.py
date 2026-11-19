@@ -90,6 +90,25 @@ class FootprintNativeTest(unittest.TestCase):
         self.assertEqual(fp["writes"], "violated")
         self.assertIn("write_to_read_only", {v["kind"] for v in fp["violations"]})
 
+    def test_field_premise_bounds_one_record_field(self):
+        # Word 3 of each 16-byte record (after a 32-byte header) in [0, 4): the gathered row is
+        # inside hs; the header words stay unconstrained.
+        r = run("gather", "gather_field_premise")
+        fp = self.footprint(r)
+        self.assertEqual((fp["writes"], fp["reads"]), ("contained", "contained"))
+
+    def test_field_premise_widened_refused(self):
+        fp = self.footprint(run("gather", "gather_field_premise_widened"))
+        self.assertEqual(fp["writes"], "violated")
+        self.assertIn("meta:s32(44)=4", fp["violations"][0]["witness"])
+
+    def test_field_premise_on_another_word_is_no_premise(self):
+        # Bounding word 2 instead of word 3 leaves the sample unbounded: the branch on it is not
+        # decided, never a pass.
+        r = run("gather", "gather_field_premise_wrong_word")
+        self.assertEqual(r["result"], "unsupported")
+        self.assertNotEqual(r["checks"].get("footprint"), "passed")
+
 
 if __name__ == "__main__":
     unittest.main()
