@@ -37,6 +37,14 @@ def _positive(value, name, *, zero=False):
         raise ValueError(f'{name} must be finite and {"nonnegative" if zero else "positive"}')
 
 
+def _declares_footprints(config) -> bool:
+    try:
+        with open(config, encoding='utf-8') as f:
+            return bool(json.load(f).get('footprints'))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def _run_ptx(ptx: str | Path, config: str | Path, *,
             executable: str | Path | None = None,
             report_path: str | Path | None = None,
@@ -95,8 +103,10 @@ def _run_ptx(ptx: str | Path, config: str | Path, *,
         command += ['--assume' if enabled else '--no-assume', name]
     if reference is None and reference_failure is None:
         # Without a reference the equivalence check is skipped, but memory elimination still runs: it
-        # proves the same-value write obligations of the synchronization check.
-        command.append('--analyze-values')
+        # proves the same-value write obligations of the synchronization check. With footprints the
+        # scalar fold runs too: it lets CTA class mode lift values, so the containment check visits
+        # class representatives (moved by each member's delta) instead of every CTA.
+        command.append('--analyze-scalar-fold' if _declares_footprints(config) else '--analyze-values')
     if reference_failure is not None:
         command += ['--analyze-scalar-fold', '--require-equivalence',
                     '--reference-failure-json', json.dumps(reference_failure)]

@@ -1566,7 +1566,6 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
       unit_gates.scalar_fold_dump = !options.dump_scalar_fold.empty();
       unit_gates.exhaustive_search = options.exhaustive_memory_search;
       unit_gates.continue_search = options.continue_memory_search;
-      unit_gates.footprints = !config.raw.value("footprints", Json::array()).empty();
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
       unit_gates.development_exports = true;
 #endif
@@ -1994,7 +1993,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         if (const auto footprints = config.raw.value("footprints", Json::array()); !footprints.empty())
           lowered.artifact.footprints_json =
               Json{{"grid_dim", config.fixed_input.at("grid_dim")}, {"block_dim", config.raw.at("cta").at("block_dim")},
-                   {"objects", footprints}}.dump();
+                   {"objects", footprints}, {"reads", config.raw.value("footprint_reads", Json("containment"))}}.dump();
         tensor_property_inputs = config.fixed_input.value("tensor_property_inputs", Json::array());
         lowered.artifact.tensor_properties_json = tensor_property_inputs.dump();
         metadata["executed_records"] = records;

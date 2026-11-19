@@ -152,7 +152,7 @@ UnitPlan PlanUnits(const FrontendConfig &config, const Function &function,
   // scalar fold; without it nothing lifts them.
   plan.class_mode = plan.active && !gates.trusted_reference && !gates.value_dump &&
                     !gates.branch_scope && !gates.scalar_fold_dump && !gates.exhaustive_search &&
-                    !gates.continue_search && !gates.footprints && !gates.development_exports && plan.precondition.holds &&
+                    !gates.continue_search && !gates.development_exports && plan.precondition.holds &&
                     !(gates.value_analysis && !gates.scalar_fold);
   // Class mode with value analysis implies the scalar fold.
   plan.lift_values = plan.class_mode && gates.value_analysis;

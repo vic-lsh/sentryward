@@ -142,7 +142,7 @@ void TensorMaps(Json &root) {
 } // namespace
 
 KernelInput ParseKernelInput(const Json &value) {
-  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints"}, "$");
+  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints", "footprint_reads"}, "$");
   if (value.value("schema", Json()) != "spverify.kernel-input/v1")
     Fail("invalid_schema", "$.schema", "expected spverify.kernel-input/v1");
   Json root = value;
@@ -354,7 +354,7 @@ KernelInput ParseKernelInput(const Json &value) {
     for (std::size_t i = 0; i < root["footprints"].size(); ++i) {
       auto &f = root["footprints"][i];
       const auto path = ItemPath("footprints", i);
-      Object(f, {"object", "direction", "extent_bytes", "extent_elements", "element_type", "periodic"}, path);
+      Object(f, {"object", "direction", "extent_bytes", "extent_elements", "element_type", "periodic", "pieces"}, path);
       String(f.value("object", Json()), path + ".object");
       if (!objects.insert(f["object"].get<std::string>()).second)
         Fail("duplicate_footprint", path + ".object", "object already has a footprint");
@@ -388,7 +388,43 @@ KernelInput ParseKernelInput(const Json &value) {
         if (width > period || offset + (count - 1) * period + width > stride)
           Fail("invalid_footprint", path + ".periodic", "pieces must fit the period and the row stride");
       }
+      // Optional piece sets: rows r < rows of count runs, run c of row r being bytes
+      // [base + r*stride + c*period, + width), each with an optional direction narrowing the object's.
+      if (f.contains("pieces")) {
+        Array(f["pieces"], path + ".pieces");
+        for (std::size_t k = 0; k < f["pieces"].size(); ++k) {
+          auto &q = f["pieces"][k];
+          const auto qpath = path + ".pieces[" + std::to_string(k) + "]";
+          Object(q, {"base", "rows", "stride", "period", "count", "width", "direction"}, qpath);
+          const auto base = q.contains("base") ? Natural(q["base"], qpath + ".base") : 0;
+          const auto rows = q.contains("rows") ? Natural(q["rows"], qpath + ".rows") : 1;
+          const auto count = q.contains("count") ? Natural(q["count"], qpath + ".count", 1) : 1;
+          const auto width = Natural(q.value("width", Json()), qpath + ".width", 1);
+          const auto period = q.contains("period") ? Natural(q["period"], qpath + ".period") : 0;
+          const auto stride = q.contains("stride") ? Natural(q["stride"], qpath + ".stride") : 0;
+          if (count > 1 && period < width) Fail("invalid_footprint", qpath + ".period", "runs must not overlap (period >= width)");
+          const auto row_bytes = (count - 1) * period + width;
+          if (rows > 1 && stride < row_bytes) Fail("invalid_footprint", qpath + ".stride", "rows must not overlap (stride >= row bytes)");
+          if (q.contains("direction")) {
+            const auto pd = q["direction"];
+            if (pd != "read" && pd != "write" && pd != "readwrite")
+              Fail("invalid_footprint", qpath + ".direction", "expected read, write or readwrite");
+            if (direction != "readwrite" && pd != direction)
+              Fail("invalid_footprint", qpath + ".direction", "a piece's direction must be within its object's");
+          }
+          if (rows == 0) continue;
+          q["base"] = base; q["rows"] = rows; q["count"] = count; q["period"] = period; q["stride"] = stride;
+        }
+      }
     }
+  }
+  // How reads are judged against the footprints: "containment" (default, every read inside its
+  // object's declared bytes) or "noninterference" (reads outside are reported, not refused).
+  if (root.contains("footprint_reads")) {
+    const auto rule = root["footprint_reads"];
+    if (rule != "containment" && rule != "noninterference")
+      Fail("invalid_footprint", "$.footprint_reads", "expected containment or noninterference");
+    if (!root.contains("footprints")) Fail("invalid_footprint", "$.footprint_reads", "footprint_reads requires footprints");
   }
   TensorMaps(root);
   std::set<std::uint64_t> lines;

@@ -1853,10 +1853,9 @@ std::string Analyze(Input&& source, bool verify, MemoryRaceOptions memory_option
       else result.memory_error = memory.error();
       // Footprint containment over the same accesses and address model (all CTAs of this program).
       if (!input.footprints_json.empty()) {
-        if (memory_options.units)
-          throw std::logic_error("footprint check requires the per-unit path (CTA class mode is disabled by a footprint declaration)");
         auto footprint = ProfileCall("memory.footprint", [&] {
-          return CheckFootprints(*compute_accesses, input.program.actors, memory_model, input.footprints_json);
+          return CheckFootprints(*compute_accesses, input.program.actors, memory_model, input.footprints_json,
+                                 memory_options.units);
         });
         report["footprint"] = Json::parse(footprint.json);
         report["checks"]["footprint"] = footprint.status == FootprintStatus::kContained ? "passed"

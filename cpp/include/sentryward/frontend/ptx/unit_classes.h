@@ -50,8 +50,6 @@ struct UnitGates {
   bool value_thread_range = false, trusted_reference = false, value_dump = false;
   bool branch_scope = false, scalar_fold_dump = false;
   bool exhaustive_search = false, continue_search = false, development_exports = false;
-  // Footprint declarations: containment is checked per access of every CTA, not per class representative.
-  bool footprints = false;
 };
 
 struct UnitPlan {

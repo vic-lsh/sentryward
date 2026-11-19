@@ -417,7 +417,7 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
       {"opaque_tensor_maps", opaque}, {"parameter_field_types", types}, {"input_objects", objects},
       {"null_pointer_fields", null_fields}, {"semantic_assumptions", supplied.fields.value("assumptions", Json::object())},
       {"address_invariants", supplied.fields.value("address_invariants", Json::array())},
-      {"footprints", footprints},
+      {"footprints", footprints}, {"footprint_reads", input.value("footprint_reads", Json("containment"))},
       {"data_branch_loop_iterations", supplied.fields.value("data_branch_loop_iterations", Json(4))},
       {"elect_lane", options.elect_lane}, {"max_steps_per_lane", options.max_steps_per_thread},
       {"compress_compute", options.compress_compute},
