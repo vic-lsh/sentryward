@@ -281,9 +281,15 @@ target_include_directories(sentryward_ptx SYSTEM PUBLIC
   ${SENTRYWARD_BOOST_INCLUDE_DIR})
 target_link_libraries(sentryward_ptx PUBLIC sentryward_io sentryward::value_ir OpenSSL::Crypto)
 target_link_libraries(sentryward_value_analysis PUBLIC sentryward_ptx)
+# Structural mode (docs/structural-mode.md): a binding term's wiring over the value IR.
+add_library(sentryward_structural STATIC cpp/src/value_analysis/structural.cpp)
+target_include_directories(sentryward_structural SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann_json/single_include)
+target_link_libraries(sentryward_structural PUBLIC sentryward::value_analysis)
+target_compile_options(sentryward_structural PRIVATE $<TARGET_PROPERTY:sentryward_algorithm,COMPILE_OPTIONS>)
+
 add_executable(sentryward-ptx cpp/src/frontend/ptx/run.cpp)
 target_include_directories(sentryward-ptx PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
-target_link_libraries(sentryward-ptx PRIVATE sentryward_ptx sentryward::value_analysis sentryward_reference_guided)
+target_link_libraries(sentryward-ptx PRIVATE sentryward_ptx sentryward::value_analysis sentryward_reference_guided sentryward_structural)
 
 # Python wheels (scikit-build-core) carry the verifier and configuration
 # inside the package; sentryward/_paths.py resolves them there.

@@ -28,6 +28,7 @@
 #include "sentryward/frontend/ptx/look_ahead.h"
 #include "sentryward/value_ir/operations.h"
 #include "sentryward/value_analysis/passes.h"
+#include "sentryward/value_analysis/structural.h"
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
 #include "sentryward/development/runner/checkpoint_headers.inc"
 #endif
@@ -69,6 +70,8 @@ using Clock = std::chrono::steady_clock;
 namespace {
 struct Options {
   std::string ptx, config, report, dump_source, dump_value_ir, dump_output_expressions, dump_scalar_fold;
+  // Structural mode (docs/structural-mode.md): the binding term's file and the report's path.
+  std::string structural_term, structural_report;
   std::string cache_correctness, resume_correctness;
   std::string dump_branch_scope;
   std::string equivalence_mapping;
@@ -164,6 +167,8 @@ Options Arguments(int argc, char **argv) {
     else if (a == "--equivalence-timeout-seconds") o.equivalence_timeout = std::stod(value());
     else if (a == "--analyze-values")
       o.analyze_values = true;
+    else if (a == "--structural-term") { o.structural_term = value(); o.analyze_values = true; }
+    else if (a == "--structural-report") o.structural_report = value();
 
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
 #include "sentryward/development/runner/expression_options.inc"
@@ -1356,6 +1361,14 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
       }
       const auto packing = pipeline.packing, exp2 = pipeline.ideal_exp2;
       eliminated = std::move(pipeline.memory);
+      if (!options.structural_term.empty()) {
+        std::ifstream term_file(options.structural_term);
+        std::stringstream term_text;
+        term_text << term_file.rdbuf();
+        const auto structural = sentryward::value_analysis::checkStructuralTerm(
+            semantic_program->values, *eliminated, term_text.str(), class_lifting());
+        if (!options.structural_report.empty()) std::ofstream(options.structural_report) << structural;
+      }
       value_analysis = {{"status", eliminated->complete ? "expressions_ready" : "unsupported"},
           {"passes", Json::array({
               {{"name", "packing"}, {"semantics", "exact_fixed_width"},
