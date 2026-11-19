@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -405,6 +406,8 @@ struct DataBranchDecision {
 // after the run (consumers reading records, on several threads at once) add decisions.
 // Defined in execution.cpp; read through TensorPropertyDecisionSnapshot.
 class TensorPropertyDecisions;
+// A field property's identity: object, then the field's offset, stride and count in bytes.
+using FieldReadKey = std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t>;
 struct LaneTrace {
   std::uint32_t warp_id{}, lane_id{};
   InstructionSequence instructions;
@@ -451,6 +454,9 @@ struct ExecutionProgram {
 // Thread-safe; O(decisions).
 [[nodiscard]] std::map<std::string, std::set<std::uint32_t>> TensorPropertyDecisionSnapshot(
     const ExecutionProgram &program);
+// Per field property, the number of distinct elements of the field whose loads its bounds
+// decided in this program's run (one CTA, or one rank of a cluster). Thread-safe.
+[[nodiscard]] std::map<FieldReadKey, std::size_t> TensorPropertyFieldReads(const ExecutionProgram &program);
 namespace detail { struct TemplateOverlay; }
 // While alive, the template arenas' value caches and evaluation scratch state are private to the
 // constructing thread: the arenas' own caches are only read, by every thread holding one, so

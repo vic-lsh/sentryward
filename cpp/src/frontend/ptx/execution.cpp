@@ -45,14 +45,30 @@ public:
     const std::lock_guard lock(mutex_);
     return sites_;
   }
+  // A load whose value a field property bounded read the element at byte `element`.
+  void InsertFieldRead(const FieldReadKey &field, std::string element) {
+    const std::lock_guard lock(mutex_);
+    fields_[field].insert(std::move(element));
+  }
+  std::map<FieldReadKey, std::size_t> FieldCounts() const {
+    const std::lock_guard lock(mutex_);
+    std::map<FieldReadKey, std::size_t> out;
+    for (const auto &[field, elements] : fields_) out[field] = elements.size();
+    return out;
+  }
 
 private:
   mutable std::mutex mutex_;
   std::map<std::string, std::set<std::uint32_t>> sites_;
+  std::map<FieldReadKey, std::set<std::string>> fields_;
 };
 std::map<std::string, std::set<std::uint32_t>> TensorPropertyDecisionSnapshot(const ExecutionProgram &program) {
   const auto &decisions = program.tensor_property_decisions;
   return decisions ? decisions->Snapshot() : std::map<std::string, std::set<std::uint32_t>>{};
+}
+std::map<FieldReadKey, std::size_t> TensorPropertyFieldReads(const ExecutionProgram &program) {
+  const auto &decisions = program.tensor_property_decisions;
+  return decisions ? decisions->FieldCounts() : std::map<FieldReadKey, std::size_t>{};
 }
 std::vector<LocalMemoryDeclaration> LocalMemoryDeclarations(const Module& module, const Function& function) {
   static const std::regex pattern(R"(\.(?:b|u|s|f)(8|16|32|64)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\[\s*([0-9]+)\s*\]\s*;?\s*$)");
@@ -1421,6 +1437,13 @@ private:
     }
     return whole;
   }
+  // A field property bounded the load of the element at byte `element` (whole-object
+  // properties are not recorded: their premise is one interval, with no case split).
+  void RecordFieldRead(const TensorProperty &p, const Integer &element) const {
+    if (!p.field) return;
+    const auto [offset, stride, count] = *p.field;
+    property_decisions_->InsertFieldRead({p.object, offset, stride, count}, element.convert_to<std::string>());
+  }
   std::shared_ptr<TensorPropertyDecisions> property_decisions_ = std::make_shared<TensorPropertyDecisions>();
   // An element whose bounds coincide is that value: appends it to `values` and records
   // `instruction` as decided by the bound.
@@ -2576,6 +2599,8 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
           const auto *chosen = PropertyFor(pointer.resource, elements);
           if (!chosen) { values.push_back(Scalar{}); continue; }
           const auto &property = *chosen;
+          // Every candidate counts: the load may read any of them.
+          for (const auto &e : elements) RecordFieldRead(property, e);
           if (ExactElement(property, i.id, values)) continue;
           const auto type = property.Type();
           auto sources = pointer.sources;
@@ -2626,6 +2651,7 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
         const auto *chosen = PropertyFor(pointer->resource, {offset});
         if (!chosen) { values.push_back(Scalar{}); continue; }
         const auto &property = *chosen;
+        RecordFieldRead(property, offset);
         if (ExactElement(property, i.id, values)) continue;
         if (narrow) property_decisions_->Insert(property.object, i.id);
         const auto type = property.Type();

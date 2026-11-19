@@ -812,6 +812,10 @@ public:
   [[nodiscard]] std::map<std::string, std::set<std::uint32_t>> PropertyDecisionsSnapshot() const {
     return TensorPropertyDecisionSnapshot(*program_);
   }
+  // Per field property, the distinct elements of the field this CTA's bounded loads read.
+  [[nodiscard]] std::map<FieldReadKey, std::size_t> FieldReadsSnapshot() const {
+    return TensorPropertyFieldReads(*program_);
+  }
 
   // The only consumer path to records(): expands the whole lane when called
   // and returns its records in order (each Meta({lane, pos}): the same

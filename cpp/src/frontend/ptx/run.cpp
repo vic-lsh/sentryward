@@ -1611,6 +1611,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         std::map<std::uint64_t, ptx::DataBranchDecision> data_branch_decisions;
         std::map<std::uint64_t, std::uint64_t> opaque_regions;
         std::map<std::string, std::set<std::uint64_t>> property_lines;
+        // Per field property, the most distinct elements of the field one CTA's bounded loads read.
+        std::map<ptx::FieldReadKey, std::size_t> field_reads;
         std::set<std::uint64_t> static_choice_lines;
         // The driver's accounting of one executed CTA (every CTA, members included), applied in
         // launch order: its SummarizeCta.
@@ -1667,6 +1669,9 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           for (const auto &[object, sites] : decisions)
             for (const auto id : sites) property_lines[object].insert(function->instructions[id].line);
         };
+        const auto account_field_reads = [&](const std::map<ptx::FieldReadKey, std::size_t> &reads) {
+          for (const auto &[field, n] : reads) field_reads[field] = std::max(field_reads[field], n);
+        };
         const auto linear_id = [&](const ptx::Coordinates &c) {
           return static_cast<std::uint32_t>((std::uint64_t(c[2]) * grid[1] + c[1]) * grid[0] + c[0]);
         };
@@ -1688,6 +1693,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
             std::vector<CtaAccount> accounts;
             // Per rank: the CTA's tensor_properties decisions, read when its program is released.
             std::vector<std::map<std::string, std::set<std::uint32_t>>> property_sites;
+            std::vector<std::map<ptx::FieldReadKey, std::size_t>> field_sites;
             // Admission against the classes founded before this unit ran (look-ahead).
             ptx::UnitClasses::PreAdmission pre;
             // Every rank's program released: only the accounting, the decisions and the admission remain.
@@ -1699,6 +1705,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           [[maybe_unused]] std::atomic<std::size_t> released_units = 0;
           const auto release_rank = [&](ExecutedUnit &executed, std::size_t rank) {
             executed.property_sites[rank] = executed.facts[rank]->PropertyDecisionsSnapshot();
+            executed.field_sites[rank] = executed.facts[rank]->FieldReadsSnapshot();
             executed.facts[rank].reset();
             alg::ProfileCall("frontend.release_execution", [&] { executed.programs[rank] = ptx::ExecutionProgram{}; });
             if (rank + 1 == executed.programs.size()) executed.released = true;
@@ -1758,6 +1765,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
                                                       [&] { return ptx::ComputeStructureKey(*result->facts.back()); }));
             }
             result->property_sites.resize(size);
+            result->field_sites.resize(size);
             pre_admit(*result);
             return result;
           };
@@ -1793,6 +1801,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
             }
             const auto account_released = [&] {
               for (const auto &sites : executed_unit->property_sites) account_properties(sites);
+              for (const auto &sites : executed_unit->field_sites) account_field_reads(sites);
             };
             if (executed_unit->released) {
               account_released();
@@ -1834,6 +1843,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               classes->Recorded(unit.index, static_cast<std::uint32_t>(rank));
               release_rank(*executed_unit, rank);
               account_properties(executed_unit->property_sites[rank]);
+              account_field_reads(executed_unit->field_sites[rank]);
             }
             // The units executed while this one was consumed were pre-admitted without its class:
             // try it on them now, in parallel (Admit would replay it here, one unit at a time).
@@ -1906,6 +1916,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
                 semantic_builder->AddCta(cta_facts);
               }
               account_properties(cta_facts.PropertyDecisionsSnapshot());
+              account_field_reads(cta_facts.FieldReadsSnapshot());
               }
               alg::ProfileCall("frontend.release_execution",
                                [&] { program = ptx::ExecutionProgram{}; });
@@ -1918,6 +1929,17 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         for (const auto &[object, lines] : property_lines)
           input_metadata["frontend_assumptions"]["tensor_property_decisions"].push_back(
               {{"object", object}, {"lines", lines}});
+        // Field properties: the most distinct elements one CTA's bounded loads read (a case
+        // split over a field's values covers a launch only when this is at most 1).
+        if (!field_reads.empty()) {
+          auto &reads = input_metadata["frontend_assumptions"]["field_reads"] = Json::array();
+          for (const auto &[field, n] : field_reads) {
+            const auto &[object, offset, stride, count] = field;
+            reads.push_back({{"object", object},
+                             {"field", {{"offset", offset}, {"stride", stride}, {"count", count}}},
+                             {"max_elements_per_cta", n}});
+          }
+        }
         // Choices that a statically known predicate overrode on some visit (listed only when any).
         if (!static_choice_lines.empty())
           input_metadata["frontend_assumptions"]["branch_choices_with_static_visits"] = static_choice_lines;

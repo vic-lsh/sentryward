@@ -209,6 +209,13 @@ property set and any number of field properties (one element type per object). A
 the field whose elements include every byte it may read, else by the whole-object property, else it
 is unbounded. In a CTA class, a symbolic address over a field-bounded element is decided per unit.
 
+The result lists, per field property, the most distinct elements of the field whose loads it
+bounded in one CTA (`frontend_assumptions.field_reads`: `object`, `field`, `max_elements_per_cta`).
+A load over several candidate elements counts each. A caller that splits a field's values into cases
+(one input per case, every element in that case) covers a launch whose elements mix the cases only
+when this is at most 1: each CTA then reads one element, so its accesses are those of the case that
+element is in.
+
 ## Footprints
 
 Each record declares what a kernel may touch in one global input object: its byte extent and

@@ -109,6 +109,19 @@ class FootprintNativeTest(unittest.TestCase):
         self.assertEqual(r["result"], "unsupported")
         self.assertNotEqual(r["checks"].get("footprint"), "passed")
 
+    def test_field_reads_one_element_per_cta(self):
+        # k_gather's block r reads record r's sample word and no other element of the field.
+        r = run("gather", "gather_field_premise")
+        self.assertEqual(r["frontend_assumptions"]["field_reads"],
+                         [{"object": "meta", "field": {"offset": 44, "stride": 16, "count": 4},
+                           "max_elements_per_cta": 1}])
+
+    def test_field_reads_two_elements_reported(self):
+        # Planted mutant: block r also loads record r+1's sample word.
+        r = run("gather_two_reads", "gather_field_premise")
+        (reads,) = r["frontend_assumptions"]["field_reads"]
+        self.assertEqual(reads["max_elements_per_cta"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()
