@@ -1394,10 +1394,33 @@ private:
   // current run (Run starts a new one).
   struct TensorProperty {
     std::string object; unsigned bits; bool sign; Integer lower, upper;
+    // A record field (offset, stride, count in bytes): the bounds hold only for the elements at
+    // offset + k*stride, k < count. None: every element of the object.
+    std::optional<std::array<std::uint64_t, 3>> field;
+    bool Covers(const Integer &byte) const {
+      if (!field) return true;
+      const auto [offset, stride, count] = *field;
+      if (byte < Integer(offset)) return false;
+      const Integer rel = byte - Integer(offset);
+      return rel % Integer(stride) == 0 && rel / Integer(stride) < Integer(count);
+    }
     // The element type: s or u, then the width in bits.
     std::string Type() const { return std::string(sign ? "s" : "u") + std::to_string(bits); }
   };
-  std::map<std::string, TensorProperty> tensor_properties_;
+  // Per resource: its whole-object property (no field, at most one) and its field properties.
+  std::map<std::string, std::vector<TensorProperty>> tensor_properties_;
+  // The property whose elements include every byte offset in `bytes`: a field's, else the
+  // whole object's; null when none covers them all (the load is then unbounded).
+  const TensorProperty *PropertyFor(const std::string &resource, const std::vector<Integer> &bytes) const {
+    const auto found = tensor_properties_.find(resource);
+    if (found == tensor_properties_.end()) return nullptr;
+    const TensorProperty *whole = nullptr;
+    for (const auto &p : found->second) {
+      if (!p.field) { whole = &p; continue; }
+      if (std::all_of(bytes.begin(), bytes.end(), [&](const Integer &b) { return p.Covers(b); })) return &p;
+    }
+    return whole;
+  }
   std::shared_ptr<TensorPropertyDecisions> property_decisions_ = std::make_shared<TensorPropertyDecisions>();
   // An element whose bounds coincide is that value: appends it to `values` and records
   // `instruction` as decided by the bound.
@@ -1603,10 +1626,15 @@ void Executor::Prepare() {
                                  entry.contains("extent_bytes") ? std::optional(entry.at("extent_bytes").get<std::uint64_t>())
                                                                 : std::nullopt};
     }
-  for (const auto &entry : c_.fixed_input.value("tensor_property_inputs", Json::array()))
-    tensor_properties_[entry.at("resource").get<std::string>()] = {entry.at("object").get<std::string>(),
-        entry.at("element_bits").get<unsigned>(), entry.at("signed").get<bool>(),
-        JsonInteger(entry.at("lower_bound")), JsonInteger(entry.at("upper_bound"))};
+  for (const auto &entry : c_.fixed_input.value("tensor_property_inputs", Json::array())) {
+    TensorProperty p{entry.at("object").get<std::string>(), entry.at("element_bits").get<unsigned>(),
+        entry.at("signed").get<bool>(), JsonInteger(entry.at("lower_bound")), JsonInteger(entry.at("upper_bound")),
+        std::nullopt};
+    if (entry.contains("field"))
+      p.field = std::array<std::uint64_t, 3>{entry["field"].at("offset").get<std::uint64_t>(),
+          entry["field"].at("stride").get<std::uint64_t>(), entry["field"].at("count").get<std::uint64_t>()};
+    tensor_properties_[entry.at("resource").get<std::string>()].push_back(std::move(p));
+  }
   if (!f_.has_body || f_.instructions.empty())
     throw std::runtime_error("PTX entry has no executable body");
   ProfileScope registers("frontend.execute.prepare.registers");
@@ -2534,8 +2562,8 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
               pointer.sources));
         }
       } else {
-        const auto &property = tensor_properties_.at(pointer.resource);
-        const auto bytes = property.bits / 8;
+        // Every property of one object has one element type (normalized input).
+        const auto bytes = tensor_properties_.at(pointer.resource).front().bits / 8;
         if (*i.memory_width != count * bytes) { Invalidate(d, s); return; }
         for (std::size_t index = 0; index < count; ++index) {
           const Integer shift = displacement + Integer(index * bytes);
@@ -2543,6 +2571,11 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
             return v + shift >= 0 && (v + shift) % bytes == 0;
           });
           if (!aligned) { values.push_back(Scalar{}); continue; }
+          std::vector<Integer> elements;
+          for (const auto &v : offsets.values) elements.push_back(v + shift);
+          const auto *chosen = PropertyFor(pointer.resource, elements);
+          if (!chosen) { values.push_back(Scalar{}); continue; }
+          const auto &property = *chosen;
           if (ExactElement(property, i.id, values)) continue;
           const auto type = property.Type();
           auto sources = pointer.sources;
@@ -2578,17 +2611,21 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
     // load of an element's low-order bytes (at the element's address, little-endian) is
     // that element when every value within the bounds fits the load's type.
     if (auto pointer = std::get_if<AllocationPointer>(&pointer_value);
-        pointer && tensor_properties_.contains(pointer->resource)) {
-      const auto &property = tensor_properties_.at(pointer->resource);
-      const auto bytes = property.bits / 8;
+        pointer && tensor_properties_.contains(pointer->resource) &&
+        PropertyFor(pointer->resource, {pointer->offset + displacement})) {
+      const auto &first = *PropertyFor(pointer->resource, {pointer->offset + displacement});
+      const auto bytes = first.bits / 8;
       const auto count = d.destination_slots.size();
       const bool narrow = count == 1 && *i.memory_width < bytes &&
-                          NarrowElementFits(property, *i.memory_width, SignedModifier(i));
+                          NarrowElementFits(first, *i.memory_width, SignedModifier(i));
       if (*i.memory_width != count * bytes && !narrow) { Invalidate(d, s); return; }
       std::vector<Scalar> values;
       for (std::size_t index = 0; index < count; ++index) {
         const Integer offset = pointer->offset + displacement + Integer(index * bytes);
         if (offset < 0 || offset % bytes != 0) { values.push_back(Scalar{}); continue; }
+        const auto *chosen = PropertyFor(pointer->resource, {offset});
+        if (!chosen) { values.push_back(Scalar{}); continue; }
+        const auto &property = *chosen;
         if (ExactElement(property, i.id, values)) continue;
         if (narrow) property_decisions_->Insert(property.object, i.id);
         const auto type = property.Type();

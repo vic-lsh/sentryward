@@ -252,7 +252,7 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     const std::uint64_t upper = shift.high > 0 ? (decl.extent > std::uint64_t(shift.high) ? decl.extent - shift.high : 0)
                                                : decl.extent;
     const auto verdict = model.containment(access, upper, 2000, lower);
-    if (shift.units > 1 && !verdict.constant_offset && !verdict.min_byte)
+    if (shift.units > 1 && !verdict.constant_offset && (!verdict.min_byte || verdict.field_bounded))
       throw UnitClassRestart{"footprint_symbolic_member:" + object};
     if (!verdict.constant_offset) st.symbolic += shift.units;
     if (verdict.min_byte && verdict.max_byte_exclusive) {

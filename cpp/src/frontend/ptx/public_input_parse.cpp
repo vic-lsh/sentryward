@@ -304,7 +304,7 @@ KernelInput ParseKernelInput(const Json &value) {
   for (std::size_t i = 0; i < root["tensor_properties"].size(); ++i) {
     auto &t = root["tensor_properties"][i];
     auto path = ItemPath("tensor_properties", i);
-    Object(t, {"object", "element_type", "property", "value", "field_bits", "values"}, path);
+    Object(t, {"object", "element_type", "property", "value", "field_bits", "values", "field"}, path);
     String(t.value("object", Json()), path + ".object");
     const auto type = t.value("element_type", Json());
     if (type != "s32" && type != "u32" && type != "s64" && type != "u64")
@@ -339,6 +339,20 @@ KernelInput ParseKernelInput(const Json &value) {
     }
     if (t.contains("field_bits") || t.contains("values"))
       Fail("invalid_tensor_property", path, "field_bits and values belong to field_values");
+    // A record field (optional, bounds only): the property holds for the elements at byte
+    // offset + k*stride, k < count, and says nothing of the object's other elements.
+    if (t.contains("field")) {
+      if (property != "lower_bound" && property != "upper_bound")
+        Fail("invalid_tensor_property", path + ".field", "a field selects elements for a bound only");
+      auto &f = t["field"];
+      Object(f, {"offset", "stride", "count"}, path + ".field");
+      const std::uint64_t bytes = type.get<std::string>().ends_with("64") ? 8 : 4;
+      const auto offset = Natural(f.value("offset", Json()), path + ".field.offset");
+      const auto stride = Natural(f.value("stride", Json()), path + ".field.stride", 1);
+      Natural(f.value("count", Json()), path + ".field.count", 1);
+      if (offset % bytes || stride % bytes)
+        Fail("invalid_tensor_property", path + ".field", "offset and stride must be multiples of the element size");
+    }
     if ((property == "injective") == t.contains("value"))
       Fail("invalid_tensor_property", path + ".value", property == "injective" ? "injective takes no value" : "a bound requires a value");
     if (t.contains("value")) Scalar(t["value"], type.get<std::string>(), path + ".value");

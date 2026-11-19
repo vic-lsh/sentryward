@@ -369,11 +369,14 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
     const auto type = t["element_type"].get<std::string>();
     const unsigned bits = type.ends_with("64") ? 64 : 32;
     const bool sign = type.starts_with('s');
-    auto [entry, inserted] = tensor_properties.try_emplace(object, Json{{"resource", object_resources.at(object)},
+    // Properties combine per (object, field): a field's bounds are a separate record.
+    const auto key = t.contains("field") ? object + "#" + t["field"].dump() : object;
+    auto [entry, inserted] = tensor_properties.try_emplace(key, Json{{"resource", object_resources.at(object)},
         {"object", object}, {"element_type", type}, {"element_bits", bits}, {"signed", sign}, {"injective", false},
         {"lower_bound", json_integer(sign ? Integer(-(Integer(1) << (bits - 1))) : Integer(0))},
         {"upper_bound", json_integer((Integer(1) << (bits - unsigned(sign))) - 1)}});
     auto &record = entry->second;
+    if (t.contains("field")) record["field"] = t["field"];
     if (!inserted && record["element_type"] != type)
       Fail("inconsistent_tensor_property", path + ".element_type", "an object's properties must use one element type");
     const auto property = t["property"].get<std::string>();
@@ -454,13 +457,13 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
   if (!tensor_properties.empty()) {
     Json inputs = Json::array(), regions_out = Json::array();
     // An object's element facts hold for loads through every pointer that names it.
-    for (const auto &[object, record] : tensor_properties)
-      for (const auto &resource : object_all_resources.at(object)) {
+    for (const auto &[key, record] : tensor_properties)
+      for (const auto &resource : object_all_resources.at(record["object"].get<std::string>())) {
         auto entry = record;
         entry["resource"] = resource;
         inputs.push_back(std::move(entry));
-        regions_out.push_back({{"resource", resource}, {"allocation", object}, {"byte_offset", 0},
-            {"bytes", "whole_object"}});
+        regions_out.push_back({{"resource", resource}, {"allocation", record["object"]}, {"byte_offset", 0},
+            {"bytes", record.contains("field") ? Json(record["field"]) : Json("whole_object")}});
       }
     raw["fixed_input"]["tensor_property_inputs"] = inputs;
     const bool fields = std::any_of(tensor_properties.begin(), tensor_properties.end(),

@@ -181,6 +181,36 @@ struct SymbolicAddressModel::Impl {
 
   std::vector<TermBound> term_bounds;
   std::map<std::string, GatherPolicy> gather_policies;
+  // Field bounds (tensor_properties with a `field`): per symbol, the bounds of the elements at
+  // byte offset + k*stride, k < count. They tighten the symbol's whole-object policy for an
+  // atom whose element offset (its only argument) is in the field.
+  struct FieldPolicy final {
+    std::uint64_t offset, stride, count;
+    std::optional<Int> lower, upper;
+  };
+  std::map<std::string, std::vector<FieldPolicy>> field_policies;
+  // The bounds of atom `atom`: its symbol's whole-object bounds, tightened by every field
+  // policy whose elements include the atom's offset.
+  std::pair<std::optional<Int>, std::optional<Int>> BoundsOf(AtomId atom) const {
+    std::optional<Int> lower, upper;
+    const auto& a = atoms[atom];
+    if (a.gather.empty()) return {lower, upper};
+    if (const auto p = gather_policies.find(a.gather); p != gather_policies.end()) {
+      lower = p->second.lower;
+      upper = p->second.upper;
+    }
+    if (const auto f = field_policies.find(a.gather); f != field_policies.end() && a.args.size() == 1) {
+      const Int byte = a.args[0];
+      for (const auto& field : f->second) {
+        if (byte < Int(field.offset)) continue;
+        const Int rel = byte - Int(field.offset);
+        if (rel % Int(field.stride) != 0 || rel / Int(field.stride) >= Int(field.count)) continue;
+        if (field.lower) lower = lower ? std::max(*lower, *field.lower) : *field.lower;
+        if (field.upper) upper = upper ? std::min(*upper, *field.upper) : *field.upper;
+      }
+    }
+    return {lower, upper};
+  }
   // The input object of each tensor-property lookup symbol.
   std::map<std::string, std::string> gather_objects;
   // Lookup symbols an address invariant names element by element (term bounds, joint injectivity).
@@ -209,8 +239,16 @@ struct SymbolicAddressModel::Impl {
       for (const auto& property : Json::parse(tensor_properties)) {
         const auto object = property.at("object").get<std::string>();
         const auto symbol = TensorPropertySymbol(object, property.at("element_type").get<std::string>());
-        auto& policy = gather_policies[symbol];
         gather_objects[symbol] = object;
+        if (property.contains("field")) {
+          FieldPolicy field{property["field"].at("offset").get<std::uint64_t>(),
+                            property["field"].at("stride").get<std::uint64_t>(),
+                            property["field"].at("count").get<std::uint64_t>(), std::nullopt, std::nullopt};
+          Tighten(field.lower, field.upper, property);
+          field_policies[symbol].push_back(std::move(field));
+          continue;
+        }
+        auto& policy = gather_policies[symbol];
         policy.injective = policy.injective || property.value("injective", false);
         Tighten(policy.lower, policy.upper, property);
       }
@@ -599,13 +637,12 @@ struct SymbolicAddressModel::Impl {
     for (const auto atom : selected)
       if (!atoms[atom].gather.empty()) applications[atoms[atom].gather].push_back(atom);
     for (const auto& [symbol, members] : applications) {
-      const auto policy = gather_policies.find(symbol);
-      if (policy == gather_policies.end()) continue;
       for (const auto atom : members) {
-        if (policy->second.lower || policy->second.upper)
-          query.bounds.push_back({linear(Single(atom)), policy->second.lower, policy->second.upper});
+        const auto [lower, upper] = BoundsOf(atom);
+        if (lower || upper) query.bounds.push_back({linear(Single(atom)), lower, upper});
       }
-      if (!policy->second.injective) continue;
+      const auto policy = gather_policies.find(symbol);
+      if (policy == gather_policies.end() || !policy->second.injective) continue;
       for (std::size_t i = 0; i < members.size(); ++i)
         for (std::size_t j = i + 1; j < members.size(); ++j)
           if (atoms[members[i]].args.size() == atoms[members[j]].args.size())
@@ -787,11 +824,9 @@ struct SymbolicAddressModel::Impl {
   std::optional<std::pair<Int, Int>> Hull(const Affine& offset) const {
     Int low = offset.constant, high = offset.constant;
     for (const auto& [atom, coefficient] : offset.terms) {
-      const auto policy = gather_policies.find(atoms[atom].gather);
-      if (atoms[atom].gather.empty() || policy == gather_policies.end() || !policy->second.lower ||
-          !policy->second.upper)
-        return std::nullopt;
-      const Int a = coefficient * *policy->second.lower, b = coefficient * *policy->second.upper;
+      const auto [lower, upper] = BoundsOf(atom);
+      if (!lower || !upper) return std::nullopt;
+      const Int a = coefficient * *lower, b = coefficient * *upper;
       low += std::min(a, b);
       high += std::max(a, b);
     }
@@ -829,6 +864,10 @@ struct SymbolicAddressModel::Impl {
       verdict.max_byte_exclusive = Clamp(hull->second + width);
     }
     verdict.constant_offset = offset.terms.empty();
+    for (const auto& [atom, coefficient] : offset.terms) {
+      (void)coefficient;
+      if (!atoms[atom].gather.empty() && field_policies.contains(atoms[atom].gather)) verdict.field_bounded = true;
+    }
     if (offset.constant >= Int(std::numeric_limits<std::int64_t>::min()) &&
         offset.constant <= Int(std::numeric_limits<std::int64_t>::max())) {
       verdict.constant = static_cast<std::int64_t>(offset.constant);
@@ -903,7 +942,9 @@ struct SymbolicAddressModel::Impl {
     // is unbounded both ways, with no solver call (one per atom would dominate large launches).
     const auto constrained = [&](AtomId atom) {
       const auto& a = atoms[atom];
-      if (!a.gather.empty() && (gather_policies.contains(a.gather) || pinned_gathers.contains(a.gather))) return true;
+      if (!a.gather.empty() && (gather_policies.contains(a.gather) || field_policies.contains(a.gather) ||
+                                pinned_gathers.contains(a.gather)))
+        return true;
       for (const auto& bound : term_bounds)
         for (const auto& [member, ignored] : bound.term.terms) { (void)ignored; if (member == atom) return true; }
       return false;

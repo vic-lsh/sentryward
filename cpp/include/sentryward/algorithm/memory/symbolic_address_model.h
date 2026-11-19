@@ -82,6 +82,9 @@ struct ContainmentVerdict final {
   // with the gcd a multiple of a row stride, the offset's column within a row is the constant's.
   std::optional<std::int64_t> constant;
   std::uint64_t coefficient_gcd = 0;
+  // Some atom's bounds come from a field property: they hold for this element, not necessarily
+  // for the element a CTA-class member reads in its place.
+  bool field_bounded = false;
   // kViolated: which side ("below_zero" or "past_extent") and the offset (constant) or the
   // solver's candidate valuation (symbolic); kUnknown: why.
   std::string side, witness, reason;
