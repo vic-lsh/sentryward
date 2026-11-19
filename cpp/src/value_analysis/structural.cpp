@@ -82,11 +82,13 @@ struct Object {
 };
 // A read coordinate: output coordinate `value` (Out), all of [0, value) (All), `value` (Const), or,
 // for a per-segment read, relative to output coordinate `value` and a segment size: the output's
-// segment [floor(o / size) * size, + size) (Block) or the output's offset in it, o % size (Mod).
+// segment [floor(o / size) * size, + size) (Block) or the output's offset in it, o % size (Mod);
+// for an index-map gather of equal runs, starts[o / size] + o % size (Gather).
 struct Index {
-  enum Kind { Out, All, Const, Block, Mod } kind;
+  enum Kind { Out, All, Const, Block, Mod, Gather } kind;
   std::uint64_t value;
   std::uint64_t size = 0;
+  std::shared_ptr<const std::vector<std::uint64_t>> starts = nullptr;
 };
 using Pattern = std::array<Index, 2>;  // (row, column)
 struct Arg {
@@ -197,10 +199,15 @@ Term parseTerm(const Json& j) {
           else if (c.contains("const")) q[d] = {Index::Const, c.at("const")};
           else if (c.contains("block")) q[d] = {Index::Block, c.at("block").at("out"), c.at("block").at("size")};
           else if (c.contains("mod")) q[d] = {Index::Mod, c.at("mod").at("out"), c.at("mod").at("size")};
+          else if (c.contains("gather"))
+            q[d] = {Index::Gather, c.at("gather").at("out"), c.at("gather").at("size"),
+                    std::make_shared<const std::vector<std::uint64_t>>(
+                        c.at("gather").at("starts").get<std::vector<std::uint64_t>>())};
           else throw std::invalid_argument("term: coordinate");
-          const bool rel = q[d].kind == Index::Out || q[d].kind == Index::Block || q[d].kind == Index::Mod;
+          const bool rel = q[d].kind == Index::Out || q[d].kind == Index::Block || q[d].kind == Index::Mod ||
+                           q[d].kind == Index::Gather;
           if (rel && q[d].value > 1) throw std::invalid_argument("term: output coordinate");
-          if ((q[d].kind == Index::Block || q[d].kind == Index::Mod) && q[d].size == 0)
+          if ((q[d].kind == Index::Block || q[d].kind == Index::Mod || q[d].kind == Index::Gather) && q[d].size == 0)
             throw std::invalid_argument("term: segment size");
         }
         y.reads.push_back(q);
@@ -224,7 +231,7 @@ Pattern compose(const Pattern& inner, const Pattern& outer) {
   for (auto& c : r) {
     if (c.kind == Index::Out) {
       c = outer[c.value];
-    } else if (c.kind == Index::Block || c.kind == Index::Mod) {
+    } else if (c.kind == Index::Block || c.kind == Index::Mod || c.kind == Index::Gather) {
       // A segment of a body value read at the output's own coordinate; anything else is not
       // stated by these coordinates.
       if (outer[c.value].kind != Index::Out) throw std::invalid_argument("term: a segment read through a non-identity read");
@@ -300,6 +307,11 @@ class Checker {
         if (c.kind == Index::Out) lo[d] = at[c.value], hi[d] = lo[d] + 1;
         else if (c.kind == Index::Const) lo[d] = c.value, hi[d] = c.value + 1;
         else if (c.kind == Index::Block) lo[d] = at[c.value] / c.size * c.size, hi[d] = lo[d] + c.size;
+        else if (c.kind == Index::Gather) {
+          const auto k = at[c.value] / c.size;
+          if (k >= c.starts->size()) refuse("leaves", "an output coordinate past the gather's runs", {{"coordinate", at[c.value]}});
+          lo[d] = (*c.starts)[k] + at[c.value] % c.size, hi[d] = lo[d] + 1;
+        }
         else if (c.kind == Index::Mod) lo[d] = at[c.value] % c.size, hi[d] = lo[d] + 1;
         else lo[d] = 0, hi[d] = c.value;
       }
