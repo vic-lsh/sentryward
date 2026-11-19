@@ -17,15 +17,18 @@
 #include <string>
 
 #include "sentryward/value_analysis/memory_elimination.h"
+#include "sentryward/value_analysis/unit_lifting.h"
 #include "sentryward/value_ir/graph.h"
 
 namespace sentryward::value_analysis {
 
 // The JSON report of the structural check of `term_json` (the term's text) over `graph` after
-// `memory` (complete). `lift_block_index`: the graph is a CTA class quotient (unit lifting), whose
-// BlockIndex reads are not literals. Never throws on a term or graph mismatch: those are refusals
+// `memory` (complete). `lifting`: the graph holds only CTA class representatives (class mode, unit
+// lifting): the check covers the representatives' elements, and each member by its per-allocation
+// offset, which must be one whole row shift of every row-indexed object and zero for the others
+// (the term's leaf patterns then shift with it). Null: every CTA is in the graph. Never throws on a term or graph mismatch: those are refusals
 // in the report ("result": "matched" | "refused" | "unsupported").
 std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryEliminationResult& memory,
-                                const std::string& term_json, bool lift_block_index);
+                                const std::string& term_json, const UnitLifting* lifting);
 
 }  // namespace sentryward::value_analysis

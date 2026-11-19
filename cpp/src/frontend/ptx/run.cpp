@@ -1293,6 +1293,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
     }
     auto effective_assumptions = alg::DefaultPtxAssumptions();
     std::function<void(ptx::CheckedMemoryActions)> run_values;
+    // The structural report of the latest value analysis attempt (written with the result).
+    std::optional<std::string> structural_text;
     // Value lifting: a value stage of the class-mode quotient whose result
     // cannot stand for the members refuses lifting (RefuseLifting); the launch
     // re-runs per unit before the later (more expensive) stages, or, above the
@@ -1305,6 +1307,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
     };
     const auto class_lifting = [&] { return unit_lifting.has_value(); };
     run_values = [&](ptx::CheckedMemoryActions actions) {
+      structural_text.reset();
       monitor.Stage("value_analysis.prepare");
       if (!semantic_program->valuesComplete()) {
         const auto& diagnostic = semantic_program->value_diagnostics.front();
@@ -1365,9 +1368,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         std::ifstream term_file(options.structural_term);
         std::stringstream term_text;
         term_text << term_file.rdbuf();
-        const auto structural = sentryward::value_analysis::checkStructuralTerm(
-            semantic_program->values, *eliminated, term_text.str(), class_lifting());
-        if (!options.structural_report.empty()) std::ofstream(options.structural_report) << structural;
+        structural_text = sentryward::value_analysis::checkStructuralTerm(
+            semantic_program->values, *eliminated, term_text.str(), class_lifting() ? &*unit_lifting : nullptr);
       }
       value_analysis = {{"status", eliminated->complete ? "expressions_ready" : "unsupported"},
           {"passes", Json::array({
@@ -2487,6 +2489,9 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
     result["wellsync_timeout_seconds"] = options.sync_timeout;
     result["whole_pipeline_timeout_seconds"] = options.timeout;
     monitor.RecordUnitRestart(result);
+    if (!options.structural_report.empty())
+      std::ofstream(options.structural_report) << structural_text.value_or(
+          R"({"schema":"sentryward.structural-report/v1","result":"unsupported","reason":"value_analysis_not_reached"})");
     const auto exit_status = result.value("status", "");
     result = sentryward::results::PublicReport(
         std::move(result), options.extract ? "extraction" : options.semantic ? "semantic_analysis" : "kernel_verification");
