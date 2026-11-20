@@ -2447,6 +2447,11 @@ class Reference {
       const auto c = b->opcode();
       bitwise = c == B::BitAnd || c == B::BitOr;
       const bool integer = g_.type(x).element().isInteger();
+      if (integer && c == B::Multiply && !word(xs[1 - q])) {
+        const auto mode = b->attributes().multiply_mode;
+        return factorFull(xs[q], xs[1 - q], mode == v::IntegerMultiplyMode::Wide, mode == v::IntegerMultiplyMode::High);
+      }
+      if (integer && (c == B::Divide || c == B::Remainder) && !word(xs[1 - q])) return false;  // not decided
       bits = bitwise || c == B::BitXor || c == B::ShiftLeft || c == B::ShiftRight ||
              (integer && (c == B::Multiply || c == B::Divide || c == B::Remainder) && word(xs[1 - q]));
     } else if (const auto* u = dynamic_cast<const v::UnaryOp*>(&op)) {
@@ -2459,6 +2464,11 @@ class Reference {
       using O = v::PtxScalarOpcode;
       const auto c = p->opcode();
       bitwise = c == O::Logic3;
+      if ((c == O::MultiplyAdd || c == O::MultiplyAddCarry) && q < 2 && g_.type(x).element().isInteger() && !word(xs[1 - q])) {
+        bool wide = false, high = false;
+        for (const auto& mo : p->attributes().modifiers) wide |= mo == "wide", high |= mo == "hi";
+        return factorFull(xs[q], xs[1 - q], wide, high);
+      }
       bits = c == O::BitExtract || c == O::BitInsert || c == O::BytePermute || c == O::Logic3 || c == O::FunnelShift ||
              c == O::CopySign || (c == O::SelectSign && q == 2 && g_.type(xs[2]).element().isInteger()) ||
              ((c == O::MultiplyAdd || c == O::MultiplyAddCarry) && q < 2 && g_.type(x).element().isInteger() && word(xs[1 - q]));
@@ -2520,6 +2530,26 @@ class Reference {
     unsigned kept = 0;  // the high bits no flip ignores
     while (kept < ow && !(ignored >> (ow - 1 - kept) & 1)) ++kept;
     return ignored == wmask(ow - kept) && kept >= 1 + exponent;
+  }
+  // Whether an integer product reads every varying bit of factor f, the other factor o not being a
+  // word. Low half: f's bit i reaches the product exactly when o has fewer than w - i trailing
+  // zeros, for each value o takes; so o's lowest bits up to its first one must not vary (else
+  // undecided), and f may vary only below w - t (t: o's trailing zeros at its fixed low bits).
+  // Wide: o must have a bit fixed at one (never zero). High half: not decided.
+  bool factorFull(const v::Value& f, const v::Value& o, bool wide, bool high) {
+    if (high) return false;
+    const auto wo = widthOf(o), wf = widthOf(f);
+    if (!wo || !wf) return false;
+    const auto vo = varying(o);
+    std::vector<v::Value> fs;
+    frees(o, fs);
+    const auto at = eval(o, fs, std::vector<std::uint64_t>(fs.size(), 0));  // o's fixed bits
+    if (wide) return (at & ~vo & wmask(wo)) != 0;
+    for (unsigned t = 0; t < wo; ++t) {
+      if (bit(vo, t)) return false;
+      if (bit(at, t)) return t == 0 || (varying(f) & ~wmask(t >= wf ? 0 : wf - t)) == 0;
+    }
+    return false;
   }
   // Whether the conversion step of x reads all of its source.
   bool convertsAll(const v::Value& x) {
