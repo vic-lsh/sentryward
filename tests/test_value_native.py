@@ -77,7 +77,16 @@ class ValueNativeTest(unittest.TestCase):
         # sm_121a: nvcc folds the negation into both literals (-L_hi, -L_lo), no neg.f32.
         r = run("sact", "k_sact_split_sm121a")
         self.assertEqual(r["result"], "verified")
-        self.assertEqual([i["rule"] for i in r["internal"]["equivalence"]["idealizations"]], ["split_log2e_exp"])
+        # The replaced constants are the negated literals: reported with their sign.
+        self.assertEqual(r["internal"]["equivalence"]["idealizations"],
+                         [{"assumption": "compiler_constant_transcendentals", "rule": "split_log2e_exp",
+                           "replaced": "-12102203/8388608 - 338819/17592186044416 = -25380159564675/17592186044416",
+                           "denotes": "-log2(e)", "uses": 1}])
+
+    def test_approximate_instructions_listed(self):
+        # ex2.approx (read as exp2) is named in the report, apart from the idealizations.
+        r = run("sact", "k_sact_split")
+        self.assertEqual(r["internal"]["equivalence"]["approximate_instructions"], {"Exp2": 1})
 
     def test_mixed_literal_signs_not_proven(self):
         r = run("sact", "k_sact_split_sm121a_mixed_sign")

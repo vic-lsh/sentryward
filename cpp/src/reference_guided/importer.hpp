@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 #include "core.hpp"
 #include "alpha_identity.hpp"
 #include "input.hpp"
@@ -183,6 +184,13 @@ struct Importer {
   // transcendental. An approximation, not real equality; set by the comparison, reported per rule.
   bool idealize_constants = true;
   bool idealize() const { return ideal && idealize_constants; }
+  // Count one use of an exp idealization rule by the sign of the constant it replaced (the PTX literal's,
+  // or the canonical coefficient's where no literal is witnessed): `<counter>_positive` or `_negative`, and
+  // the rule's total `<counter>` once per sequence (`sequence` false for a second sign in one sequence).
+  void idealized(const std::string &counter, int sign, bool sequence = true) {
+    ++a.stats[counter + (sign < 0 ? "_negative" : "_positive")];
+    if (sequence) ++a.stats[counter];
+  }
   // The floating range premise of in_range (assumption floating_values_in_range); set by the comparison.
   bool range_premise = true;
   // The hardware value rule applies to this side (hardware_value); set by the comparison for the PTX
@@ -1494,11 +1502,12 @@ struct Importer {
   // L_hi = 0f3FB8AA3B and L_lo = 0f32A57060 (the binary32 split of log2 e) as literals and the same raw v in
   // both; or with both literals negated (-L_hi, -L_lo: nvcc folds expf(-x)'s negation into them on sm_121a).
   // A different literal, a mixed sign, another rounding mode or operand fails it, and no idealization applies.
-  bool split_log2e_exp2(const RawNode &n) const {
+  // Returns the literals' sign (1: L_hi, L_lo; -1: both negated) or 0 when `n` is not the sequence.
+  int split_log2e_exp2(const RawNode &n) const {
     namespace im = sentryward::scalar_fold::instruction_mode;
     static const Q hi(12102203, 8388608), lo(338819, Z("17592186044416"));
     if (n.kind != "Operation" || n.name != "Exp2" || n.type != "f32" || n.operands.size() != 1 ||
-        !n.operands[0].conversion.empty()) return false;
+        !n.operands[0].conversion.empty()) return 0;
     const auto fma = [&](Id id, const Q &c, const Edge *&v, Id &addend, int &sign) {
       const auto &f = ns.at(id);
       const auto m = f.instruction;
@@ -1524,26 +1533,29 @@ struct Importer {
     const Edge *v_lo = nullptr, *v_hi = nullptr;
     Id inner = 0, rest = 0;
     int s_lo = 0, s_hi = 0;
-    return fma(n.operands[0].node, lo, v_lo, inner, s_lo) && fma(inner, hi, v_hi, rest, s_hi) &&
-           v_lo->node == v_hi->node && v_lo->conversion == v_hi->conversion && s_lo == s_hi;
+    const bool match = fma(n.operands[0].node, lo, v_lo, inner, s_lo) && fma(inner, hi, v_hi, rest, s_hi) &&
+                       v_lo->node == v_hi->node && v_lo->conversion == v_hi->conversion && s_lo == s_hi;
+    return match ? s_lo : 0;
   }
   // Whether raw product `n` (a Multiply, or an Fma's multiplicands) multiplies, occurrence by occurrence,
   // the power of the checked fma.rm/bit idiom (that raw node, read through its b32 -> f32 bitcast) by the
   // ex2.approx of nvcc's split log2(e) sequence (split_log2e_exp2 on that raw Exp2). Checked on these raw
   // operand edges, not on canonical ids: another occurrence with the same canonical term inherits nothing.
-  bool split_exp_product(const RawNode &n) const {
-    if (n.operands.size() < 2) return false;
+  // Returns the split literals' sign (split_log2e_exp2), or 0 when `n` is not such a product.
+  int split_exp_product(const RawNode &n) const {
+    if (n.operands.size() < 2) return 0;
     for (unsigned side = 0; side != 2; ++side) {
       const Edge &power = n.operands[side], &ex2 = n.operands[1 - side];
       if (fp_idioms.is_power(power.node) && power.conversion == "Bitcast(b32 -> f32)" &&
-          ex2.conversion.empty() && split_log2e_exp2(ns.at(ex2.node)))
-        return true;
+          ex2.conversion.empty())
+        if (int sign = split_log2e_exp2(ns.at(ex2.node))) return sign;
     }
-    return false;
+    return 0;
   }
   Id numerical_product(const RawNode &raw, Id x, Id y) {
     Id product = a.mul({x, y});
-    if (!idealize() || a.nodes[x].op != "exp2" || a.nodes[y].op != "exp2" || !split_exp_product(raw))
+    const int literal_sign = idealize() ? split_exp_product(raw) : 0;
+    if (!literal_sign || a.nodes[x].op != "exp2" || a.nodes[y].op != "exp2")
       return product;
     // Ideal exp contract for the recognized split-log2(e) exponent encoding.
     // This is intentionally NOT a global approximate-constant equality rule.
@@ -1565,7 +1577,7 @@ struct Importer {
       argument = a.sub(positive, negative);
     }
     if (argument == invalid) return product;
-    ++a.stats["ideal_compiler_exp_sequences"];
+    idealized("ideal_compiler_exp_sequences", literal_sign);
     return a.exp(argument);
   }
   Id word(Id x, unsigned w) {
@@ -2559,6 +2571,7 @@ struct Importer {
     std::vector<Term> todo{{n.operands[0],1}};
     std::vector<Id> natural, binary;
     size_t work = 0;
+    bool positive_literal = false, negative_literal = false;
     auto imported = [&](const Edge &e) -> std::optional<Id> {
       const Id *found = cache.find(key(e.node,ctx));
       if (!found) return {};
@@ -2593,6 +2606,7 @@ struct Importer {
           auto value = imported(ve);
           if (!value || !a.nodes[*value].facts.finite) return {};
           natural.push_back(term.sign*(coefficient == log2e ? 1 : -1) == 1 ? *value : a.neg(*value));
+          (coefficient == log2e ? positive_literal : negative_literal) = true;
           matched = true; break;
         }
       }
@@ -2604,7 +2618,8 @@ struct Importer {
     }
     if (natural.empty()) return {};
     Id argument = a.add(std::move(natural)), residual = a.add(std::move(binary));
-    ++a.stats["ideal_additive_compiler_exp_sequences"];
+    if (positive_literal) idealized("ideal_additive_compiler_exp_sequences", 1);
+    if (negative_literal) idealized("ideal_additive_compiler_exp_sequences", -1, !positive_literal);
     return a.mul({a.exp(argument),a.exp2(residual)});
   }
 
@@ -3335,10 +3350,24 @@ struct Importer {
     const Id result = a.add(std::move(terms));
     return t.starts_with("s") ? cast(result, "u" + std::to_string(w), t) : result;
   }
+  // PTX operations that have only approximate f32 forms (ex2, lg2, sin, cos, rsqrt, tanh), and sqrt or
+  // reciprocal in their .approx forms.
+  static bool approximate_instruction(const RawNode &n) {
+    static const std::set<std::string> approximate_only{"Exp2", "PtxLog2", "PtxSin", "PtxCos",
+                                                        "PtxReciprocalSqrt", "Rsqrt", "Tanh"};
+    if (approximate_only.contains(n.name)) return true;
+    return (n.name == "PtxSqrt" || n.name == "Reciprocal" || n.name == "Divide") &&
+           n.attributes.find(".approx") != std::string::npos;
+  }
   Id make(const RawNode &n, const std::vector<Id> &x, const Env &ctx,
           const Env &body) {
     const std::string &k = n.kind, &t = n.type, &attr = n.attributes;
     std::string name = n.name;
+    // A PTX approximate instruction is read as the exact function it approximates (ex2.approx as exp2,
+    // lg2.approx as log2, ...): its error is that instruction's rounding, not a different real function.
+    // Each import is counted (comparison report `approximate_instructions`) so a verdict names them.
+    if (hardware_values && k == "Operation" && approximate_instruction(n))
+      ++a.stats["approximate_instruction:" + name];
     if (k == "Constant")
       return literal(name, t);
     if (k == "Index") {
@@ -3642,7 +3671,7 @@ struct Importer {
           }
         }
         if(sign) {
-          ++a.stats["ideal_single_constant_exp_sequences"];
+          idealized("ideal_single_constant_exp_sequences", sign);
           // A scalar Multiply can distribute log2(e) into an Add before a
           // later Multiply introduces other factors. Cancel that exact common
           // scalar locally, under the same explicit raw compiler witness.
@@ -3674,7 +3703,8 @@ struct Importer {
         bool negative = exponent.data[0] < 0;
         Id argument = a.mul(factors);
         if (negative) argument = a.neg(argument);
-        ++a.stats["ideal_single_constant_exp_sequences"];
+        // No raw literal witnessed here: the sign is the canonical coefficient's.
+        idealized("ideal_single_constant_exp_sequences", negative ? -1 : 1);
         return a.exp(argument);
       }
       return a.exp2(x[0]);

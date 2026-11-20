@@ -592,12 +592,18 @@ ComparisonResult rg::compare(Document left, Document right, J mapping, const Com
       return out;
     };
     struct Rule { const char *counter, *rule; std::string replaced; const char *denotes; };
+    // Exp rules are listed per sign of the replaced constant (`<counter>_positive`/`_negative`: the PTX
+    // literal's sign, or the canonical coefficient's where the literal's sign folded into it).
+    const std::string split = "12102203/8388608 + 338819/17592186044416 = 25380159564675/17592186044416";
     const Rule rules[] = {
-      {"ideal_compiler_exp_sequences", "split_log2e_exp",
-       "12102203/8388608 + 338819/17592186044416 = 25380159564675/17592186044416", "log2(e)"},
-      {"ideal_single_constant_exp_sequences", "binary32_log2e_exp", "12102203/8388608", "log2(e)"},
-      {"ideal_additive_compiler_exp_sequences", "additive_binary32_log2e_exp", "12102203/8388608", "log2(e)"},
-      {"ideal_compiler_lse_sequences", "lg2_lse_tail", "1453635/2097152; lg2.approx.ftz.f32", "ln(2); log2"},
+      {"ideal_compiler_exp_sequences_positive", "split_log2e_exp", split, "log2(e)"},
+      {"ideal_compiler_exp_sequences_negative", "split_log2e_exp",
+       "-12102203/8388608 - 338819/17592186044416 = -25380159564675/17592186044416", "-log2(e)"},
+      {"ideal_single_constant_exp_sequences_positive", "binary32_log2e_exp", "12102203/8388608", "log2(e)"},
+      {"ideal_single_constant_exp_sequences_negative", "binary32_log2e_exp", "-12102203/8388608", "-log2(e)"},
+      {"ideal_additive_compiler_exp_sequences_positive", "additive_binary32_log2e_exp", "12102203/8388608", "log2(e)"},
+      {"ideal_additive_compiler_exp_sequences_negative", "additive_binary32_log2e_exp", "-12102203/8388608", "-log2(e)"},
+      {"ideal_compiler_lse_sequences", "lg2_lse_tail", "1453635/2097152", "ln(2)"},
       {"ideal_compiler_log2_polynomials", "log2_polynomial",
        "log2f Horner coefficients c0..c9 = " + join(log2f_coefficients), "log2"},
       {"ideal_compiler_log1p_polynomials", "log1p_polynomial",
@@ -611,6 +617,12 @@ ComparisonResult rg::compare(Document left, Document right, J mapping, const Com
                                       {"replaced", rule.replaced}, {"denotes", rule.denotes}, {"uses", it->second}});
     }
   }
+  // Approximate PTX instructions read as their exact function (Importer::approximate_instruction): not a
+  // replaced constant but the instruction's own rounding; listed so a verdict names every one it read.
+  r["approximate_instructions"] = J::object();
+  for (const auto &[counter, uses] : a.stats)
+    if (counter.starts_with("approximate_instruction:") && uses)
+      r["approximate_instructions"][counter.substr(std::string("approximate_instruction:").size())] = uses;
   r["input_contract_applied_reads"] = J::array();
   for(const auto &[side,object,type]:(prepared ? prepared->contract.applied : contract.applied))
     r["input_contract_applied_reads"].push_back(J{{"side",side},{"object",object},{"element_type",type}});

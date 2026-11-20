@@ -298,13 +298,23 @@ operand edges (the power idiom node read through its `b32 -> f32` bitcast, and t
 canonicalizes to the same term but whose raw sequence differs is not rewritten.
 
 - **Enabled:** each use is listed in `equivalence.idealizations` (`rule`, the
-  exact `replaced` constant or approximation, the transcendental it `denotes`,
-  `uses`). In the result's `assumptions` entry, `triggered` is `true` when the
+  exact `replaced` value with its sign (the PTX literals', or the canonical
+  coefficient's where the literal's sign folded into it), what it `denotes`
+  (e.g. `-log2(e)`), `uses`). In the result's `assumptions` entry, `triggered` is `true` when the
   list is nonempty, `false` when the comparison imported every output family
   without one, and `null` when it did not run or stopped early. A verdict that
   rests on it holds modulo the listed idealizations.
 - **Disabled:** no rounded constant is read as a transcendental; an equality
   that depends on one is not proven.
+
+Not part of this premise: a PTX approximate instruction (`ex2.approx`,
+`lg2.approx`, `sin`/`cos.approx`, `rsqrt.approx`, `tanh.approx`, and the
+`.approx` forms of `sqrt`, `rcp` and `div`) is read as the exact function it
+approximates. Its error is that instruction's own rounding of the same real
+function, not a different function, so it belongs with rounding in the
+hardware value model. The comparison still names each one it read:
+`equivalence.approximate_instructions` maps the instruction's node name to its
+number of imports.
 
 ## Duplicate TMA stores
 
