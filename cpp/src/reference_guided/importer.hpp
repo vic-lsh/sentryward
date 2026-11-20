@@ -1500,8 +1500,9 @@ struct Importer {
     const auto &e = a.nodes[node.args[0]];
     static const Q log2e_split(Z("25380159564675"), Z("17592186044416"));
     Id argument = invalid;
-    if (e.op == "mul" && e.args.size() == 1 && e.data[0] == log2e_split)
-      argument = e.args[0];
+    // exp(x) = exp2(x * log2(e)); expf(-y) folds the negation into the coefficient.
+    if (e.op == "mul" && e.args.size() == 1 && (e.data[0] == log2e_split || e.data[0] == -log2e_split))
+      argument = e.data[0] > 0 ? e.args[0] : a.neg(e.args[0]);
     else if (e.op == "add" && e.args.size() == 2 &&
              ((e.data[0] == log2e_split && e.data[1] == -log2e_split) ||
               (e.data[1] == log2e_split && e.data[0] == -log2e_split))) {
