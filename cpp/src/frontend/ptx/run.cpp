@@ -438,6 +438,7 @@ struct Monitor {
   bool finished = false;
   std::string stage = "startup";
   Json frontend_checkpoint = Json::object();
+  Json approximate_instructions = Json::object();
   std::atomic<std::uint64_t> peak = 0;
   std::atomic<std::uint64_t> peak_footprint = 0;
   // The per-unit attempt's internal.frontend.unit_restart record, else null.
@@ -476,6 +477,12 @@ struct Monitor {
     std::lock_guard lock(mutex);
     // Merged: a per-unit attempt's checkpoint already holds the kept verdict (MemoryVerified).
     frontend_checkpoint.update(checkpoint);
+  }
+  // The approximate instructions the analyzed CTAs executed (ApproximateInstruction): a whole-pipeline
+  // timeout during the object comparison still names them in its equivalence report.
+  void ApproximateInstructions(const Json &counts) {
+    std::lock_guard lock(mutex);
+    approximate_instructions = counts;
   }
   void MemoryStrategy(const std::string &strategy, bool fallback) {
     std::lock_guard lock(mutex);
@@ -574,7 +581,8 @@ struct Monitor {
       if(options.require_equivalence || options.reference_stdin) {
         if(stage=="equivalence.object_comparison")
           result["equivalence"]={{"status",limit?"memory_limit_exceeded":"timeout"},
-            {"reason",limit?"rss_limit":"time_budget"},{"stage",stage}};
+            {"reason",limit?"rss_limit":"time_budget"},{"stage",stage},
+            {"approximate_instructions",approximate_instructions}};
         else result["equivalence"]={{"status","blocked"},{"reason","verification_prerequisite_not_satisfied"},
           {"prerequisite_status",result.value("status","timeout")},{"stage",stage}};
       }
@@ -1155,7 +1163,9 @@ struct CtaAccount {
   bool executes_atomic_site = false;
 };
 // The full mnemonic of a PTX approximate floating instruction: ex2, lg2, sin, cos, rsqrt and tanh (no
-// exactly rounded form), and rcp, sqrt or div in their .approx (and div's .full) forms. The reference
+// exactly rounded form); rcp, sqrt or div in their .approx (and div's .full) forms; and f32 rcp, sqrt or
+// div with no rounding modifier, which PTX ISA before 1.4 defines as approximate (later ISAs require a
+// modifier, so the form occurs only there). The reference
 // comparison reads each as the exact function it approximates: the instruction's rounding of the same
 // real function (reported per verdict, equivalence.approximate_instructions). None otherwise.
 std::optional<std::string> ApproximateInstruction(const ptx::Instruction &instruction) {
@@ -1163,8 +1173,11 @@ std::optional<std::string> ApproximateInstruction(const ptx::Instruction &instru
   const auto &op = instruction.opcode;
   const auto &m = instruction.modifiers;
   const auto has = [&](const char *modifier) { return std::find(m.begin(), m.end(), modifier) != m.end(); };
-  if (!approximate_only.contains(op) &&
-      !((op == "rcp" || op == "sqrt" || op == "div") && has("approx")) && !(op == "div" && has("full")))
+  const bool reciprocal_family = op == "rcp" || op == "sqrt" || op == "div";
+  const bool implicit = reciprocal_family && has("f32") && !has("rn") && !has("rz") && !has("rm") &&
+                        !has("rp") && !has("approx") && !has("full");
+  if (!approximate_only.contains(op) && !(reciprocal_family && has("approx")) &&
+      !(op == "div" && has("full")) && !implicit)
     return std::nullopt;
   std::string mnemonic = op;
   for (const auto &modifier : m) mnemonic += "." + modifier;
@@ -2395,6 +2408,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         eliminated.reset();
         semantic_builder.reset();
         semantic_program.reset();
+        monitor.ApproximateInstructions(input_metadata.value("frontend_assumptions", Json::object())
+            .value("approximate_instructions", Json::object()));
         monitor.Stage("equivalence.object_comparison");
         const auto started = Clock::now();
         rg::ContextBuilder context;

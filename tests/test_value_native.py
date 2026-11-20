@@ -73,6 +73,13 @@ class ValueNativeTest(unittest.TestCase):
         self.assertEqual([(i["rule"], i["uses"]) for i in r["internal"]["equivalence"]["idealizations"]],
                          [("split_log2e_exp", 1)])
 
+    def test_implicit_approximate_division_listed(self):
+        # PTX ISA 1.3: div.f32 with no rounding modifier is approximate, so it is named too.
+        r = run("sact", "k_sact_split_implicit_div")
+        self.assertEqual(r["result"], "verified")
+        self.assertEqual(sorted(r["internal"]["equivalence"]["approximate_instructions"]),
+                         ["div.f32", "ex2.approx.ftz.f32"])
+
     def test_sm121a_folded_negation_verified(self):
         # sm_121a: nvcc folds the negation into both literals (-L_hi, -L_lo), no neg.f32.
         r = run("sact", "k_sact_split_sm121a")
