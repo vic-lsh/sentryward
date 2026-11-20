@@ -584,14 +584,24 @@ ComparisonResult rg::compare(Document left, Document right, J mapping, const Com
   // rational the PTX computes with and the transcendental it is read as. Not an equality over the reals.
   r["idealizations"] = J::array();
   {
-    struct Rule { const char *counter, *rule, *replaced, *denotes; };
-    static const Rule rules[] = {
-      {"ideal_compiler_exp_sequences", "split_log2e_exp", "25380159564675/17592186044416", "log2(e)"},
+    // `replaced`: every exact binary32 value (or approximate PTX instruction) the rule reads as the
+    // transcendental in `denotes`; the auditor needs the exact replacement, not a description.
+    const auto join = [](const auto &values) {
+      std::string out;
+      for (const char *v : values) out += (out.empty() ? "" : ", ") + std::string(v);
+      return out;
+    };
+    struct Rule { const char *counter, *rule; std::string replaced; const char *denotes; };
+    const Rule rules[] = {
+      {"ideal_compiler_exp_sequences", "split_log2e_exp",
+       "12102203/8388608 + 338819/17592186044416 = 25380159564675/17592186044416", "log2(e)"},
       {"ideal_single_constant_exp_sequences", "binary32_log2e_exp", "12102203/8388608", "log2(e)"},
       {"ideal_additive_compiler_exp_sequences", "additive_binary32_log2e_exp", "12102203/8388608", "log2(e)"},
-      {"ideal_compiler_lse_sequences", "lg2_lse_tail", "approx lg2 (ex2/lg2.approx) and binary32 log2(e)", "log"},
-      {"ideal_compiler_log2_polynomials", "log2_polynomial", "binary32 minimax polynomial", "log2"},
-      {"ideal_compiler_log1p_polynomials", "log1p_polynomial", "binary32 minimax polynomial", "log1p"},
+      {"ideal_compiler_lse_sequences", "lg2_lse_tail", "1453635/2097152; lg2.approx.ftz.f32", "ln(2); log2"},
+      {"ideal_compiler_log2_polynomials", "log2_polynomial",
+       "log2f Horner coefficients c0..c9 = " + join(log2f_coefficients), "log2"},
+      {"ideal_compiler_log1p_polynomials", "log1p_polynomial",
+       "log1pf Horner coefficients c0..c8 = " + join(log1pf_coefficients), "log1p"},
       {"ideal_compiler_log_sequences", "binary32_ln2_log", "1453635/2097152", "ln(2)"},
     };
     for (const auto &rule : rules) {

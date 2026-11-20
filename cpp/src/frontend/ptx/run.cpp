@@ -2511,10 +2511,12 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
             {"enabled",effective_assumptions.at(entry.key)},
             {"triggered",triggered}});
       }
-    } else if (floating_range_used && result["assumptions"].is_array()) {
-      // The verification report's list (source_json.cpp RenderReport) saw no comparison.
+    } else if ((floating_range_used || constants_used) && result["assumptions"].is_array()) {
+      // The verification report's list (source_json.cpp RenderReport) saw no comparison. Each
+      // comparison-derived assumption is updated on its own (either may be disabled).
       for (auto& entry : result["assumptions"]) {
-        if (entry.value("key", "") == "floating_values_in_range") entry["triggered"] = *floating_range_used;
+        if (entry.value("key", "") == "floating_values_in_range" && floating_range_used)
+          entry["triggered"] = *floating_range_used;
         if (entry.value("key", "") == "compiler_constant_transcendentals" && constants_used)
           entry["triggered"] = *constants_used;
       }

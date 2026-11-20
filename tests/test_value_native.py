@@ -8,7 +8,8 @@ equality): the verdict lists it with the constant it replaced, and without it th
 proven. The matcher checks the raw PTX (both split literals, round-to-nearest fmas, one operand; on
 sm_121a nvcc negates both literals instead of the operand): a kernel without the negation, with an
 fma.rz, with either literal changed or with mixed literal signs is not proven, as are
-a kernel whose product is an add and a wrong op term (silu(g) + u). The reference is Coral's
+a kernel whose product is an add and a wrong op term (silu(g) + u). Provenance is per raw occurrence:
+a second sequence with the same canonical exponent but swapped literals inherits nothing. The reference is Coral's
 generated term of the canonical op silu_mul. Skipped unless SENTRYWARD_PTX_NATIVE names a built
 sentryward-ptx and PyTorch is installed.
 """
@@ -45,9 +46,32 @@ class ValueNativeTest(unittest.TestCase):
         self.assertEqual(r["result"], "verified")
         self.assertEqual(r["internal"]["equivalence"]["idealizations"],
                          [{"assumption": "compiler_constant_transcendentals", "rule": "split_log2e_exp",
-                           "replaced": "25380159564675/17592186044416", "denotes": "log2(e)", "uses": 1}])
+                           "replaced": "12102203/8388608 + 338819/17592186044416 = 25380159564675/17592186044416",
+                           "denotes": "log2(e)", "uses": 1}])
         a = self.idealization(r)
         self.assertEqual((a["enabled"], a["triggered"]), (True, True))
+
+    def test_assumption_triggered_with_range_premise_disabled(self):
+        # The two comparison-derived assumptions are reported independently.
+        r = run("sact", "k_sact_split", "--no-assume", "floating_values_in_range")
+        if r["result"] == "verified":
+            a = self.idealization(r)
+            self.assertEqual((a["enabled"], a["triggered"]), (True, True))
+        else:
+            self.assertTrue(r["internal"]["equivalence"]["idealizations"])
+
+    def test_two_checked_occurrences_verified(self):
+        # Positive control for the shadow shape: a second, checked split sequence on the same operand and
+        # a cancelling add/sub of the first one's product.
+        self.assertEqual(run("sact", "k_sact_split_shadow_ok")["result"], "verified")
+
+    def test_witness_does_not_transfer_between_occurrences(self):
+        # The second sequence swaps the literals (L_hi outer): its canonical exponent equals the checked
+        # first sequence's, but provenance is per raw occurrence, so only the first product is rewritten.
+        r = run("sact", "k_sact_split_shadow")
+        self.assertEqual(r["result"], "equivalence_not_proven")
+        self.assertEqual([(i["rule"], i["uses"]) for i in r["internal"]["equivalence"]["idealizations"]],
+                         [("split_log2e_exp", 1)])
 
     def test_sm121a_folded_negation_verified(self):
         # sm_121a: nvcc folds the negation into both literals (-L_hi, -L_lo), no neg.f32.

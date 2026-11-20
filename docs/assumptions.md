@@ -291,8 +291,11 @@ an approximation of the same kind as rounding, not an equality over the reals.
 The split-log2(e) exponential is recognized only on the raw PTX: an `ex2.approx`
 whose operand is two round-to-nearest `fma` instruction images (no other
 rounding mode, not contracted or synthesized) of the same value with the literals
-`0f3FB8AA3B` and `0f32A57060`, multiplied by the power of the checked `fma.rm`
-exponent encoding.
+`0f3FB8AA3B` and `0f32A57060` (L_lo outer), multiplied by the power of the checked
+`fma.rm` exponent encoding. Both factors are checked on the product's own raw
+operand edges (the power idiom node read through its `b32 -> f32` bitcast, and the
+`ex2.approx` node), not on canonical terms: another occurrence whose exponent
+canonicalizes to the same term but whose raw sequence differs is not rewritten.
 
 - **Enabled:** each use is listed in `equivalence.idealizations` (`rule`, the
   exact `replaced` constant or approximation, the transcendental it `denotes`,

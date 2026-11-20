@@ -1,6 +1,17 @@
 #pragma once
 #include "input.hpp"
 namespace rg {
+// Horner coefficients c0..c9 of the CUDA math library log2f polynomial (binary32 values).
+inline constexpr const char* log2f_coefficients[]={
+      "0.097020141780376434326171875","-0.1684539318084716796875","0.1716887056827545166015625",
+      "-0.17900948226451873779296875","0.205123722553253173828125","-0.24046532809734344482421875",
+      "0.2885711491107940673828125","-0.3606741726398468017578125","0.480898201465606689453125",
+      "-0.721347510814666748046875"};
+// Horner coefficients c0..c8 of the CUDA math library log1pf polynomial (binary32 values).
+inline constexpr const char* log1pf_coefficients[]={
+      "-0.0453486144542694091796875","0.10546888411045074462890625","-0.132297039031982421875",
+      "0.14491446316242218017578125","-0.16641564667224884033203125","0.1998886764049530029296875",
+      "-0.250001966953277587890625","0.333335101604461669921875","-0.5"};
 // Structural analysis before import; no kernel-name or magic-constant-only rules.
 // The producer must retain explicit fma.rm semantics and a saturating input edge.
 struct FloatingIdiomPlan {
@@ -127,11 +138,7 @@ struct FloatingIdiomPlan {
     if(!plain(square[0],delta) || !child(square[1],"Multiply","f32",2))return invalid;
     const auto& product=nodes[square[1].node].operands;
     if(!plain(product[0],delta) || !product[1].conversion.empty())return invalid;
-    static constexpr const char* coefficients[]={
-      "0.097020141780376434326171875","-0.1684539318084716796875","0.1716887056827545166015625",
-      "-0.17900948226451873779296875","0.205123722553253173828125","-0.24046532809734344482421875",
-      "0.2885711491107940673828125","-0.3606741726398468017578125","0.480898201465606689453125",
-      "-0.721347510814666748046875"};
+    const auto& coefficients=log2f_coefficients;
     Id horner=product[1].node;
     for(unsigned i=9;i>1;--i) {
       if(!fma(horner))return invalid;const auto& step=nodes[horner].operands;
@@ -205,10 +212,7 @@ struct FloatingIdiomPlan {
        !plain(tail[2],reduced) || !arithmetic(reduced,"Add"))return invalid;
     const auto& product=nodes[tail[0].node].operands;
     if(!plain(product[0],reduced) || !product[1].conversion.empty())return invalid;
-    static constexpr const char* coefficients[]={
-      "-0.0453486144542694091796875","0.10546888411045074462890625","-0.132297039031982421875",
-      "0.14491446316242218017578125","-0.16641564667224884033203125","0.1998886764049530029296875",
-      "-0.250001966953277587890625","0.333335101604461669921875","-0.5"};
+    const auto& coefficients=log1pf_coefficients;
     Id horner=product[1].node;
     for(unsigned i=8;i>1;--i) {
       if(!fma(horner))return invalid;const auto& step=nodes[horner].operands;

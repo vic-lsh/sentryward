@@ -177,15 +177,12 @@ struct Importer {
   std::unordered_set<std::string> packed_dense_layouts;
   std::unordered_set<std::string> packed_identity_layouts;
   std::unordered_map<Id,Id> power_bit_values;
-  std::unordered_set<Id> encoded_powers;
   bool ideal;
   // Compiler-constant idealizations (assumption compiler_constant_transcendentals, docs/assumptions.md): a
   // recognized compiler expansion of exp, log or log2 through a rounded binary32 constant reads as the exact
   // transcendental. An approximation, not real equality; set by the comparison, reported per rule.
   bool idealize_constants = true;
   bool idealize() const { return ideal && idealize_constants; }
-  // Results of ex2.approx whose operand is nvcc's split-log2(e) expf sequence (split_log2e_exp2).
-  std::unordered_set<Id> split_exp2;
   // The floating range premise of in_range (assumption floating_values_in_range); set by the comparison.
   bool range_premise = true;
   // The hardware value rule applies to this side (hardware_value); set by the comparison for the PTX
@@ -1354,7 +1351,6 @@ struct Importer {
         result=a.mul({a.constant(Q(pow2(23))),biased});
         Id power = a.exp2(exponent);
         power_bit_values.emplace(result,power);
-        encoded_powers.insert(power);
         ++a.stats["fp_idiom_power_instances"];
       } else if (auto exact = hardware_value(f.i, xs, tainted, f.env)) {
         result = *exact;
@@ -1531,13 +1527,23 @@ struct Importer {
     return fma(n.operands[0].node, lo, v_lo, inner, s_lo) && fma(inner, hi, v_hi, rest, s_hi) &&
            v_lo->node == v_hi->node && v_lo->conversion == v_hi->conversion && s_lo == s_hi;
   }
-  Id numerical_product(Id x, Id y) {
+  // Whether raw product `n` (a Multiply, or an Fma's multiplicands) multiplies, occurrence by occurrence,
+  // the power of the checked fma.rm/bit idiom (that raw node, read through its b32 -> f32 bitcast) by the
+  // ex2.approx of nvcc's split log2(e) sequence (split_log2e_exp2 on that raw Exp2). Checked on these raw
+  // operand edges, not on canonical ids: another occurrence with the same canonical term inherits nothing.
+  bool split_exp_product(const RawNode &n) const {
+    if (n.operands.size() < 2) return false;
+    for (unsigned side = 0; side != 2; ++side) {
+      const Edge &power = n.operands[side], &ex2 = n.operands[1 - side];
+      if (fp_idioms.is_power(power.node) && power.conversion == "Bitcast(b32 -> f32)" &&
+          ex2.conversion.empty() && split_log2e_exp2(ns.at(ex2.node)))
+        return true;
+    }
+    return false;
+  }
+  Id numerical_product(const RawNode &raw, Id x, Id y) {
     Id product = a.mul({x, y});
-    // One factor is the power of the checked fma.rm/bit idiom, the other the ex2.approx of nvcc's split
-    // log2(e) sequence, checked on the raw PTX (split_log2e_exp2: literals and RN provenance).
-    if (!idealize() || a.nodes[x].op != "exp2" || a.nodes[y].op != "exp2" ||
-        !((encoded_powers.contains(x) && split_exp2.contains(y)) ||
-          (encoded_powers.contains(y) && split_exp2.contains(x))))
+    if (!idealize() || a.nodes[x].op != "exp2" || a.nodes[y].op != "exp2" || !split_exp_product(raw))
       return product;
     // Ideal exp contract for the recognized split-log2(e) exponent encoding.
     // This is intentionally NOT a global approximate-constant equality rule.
@@ -2598,7 +2604,6 @@ struct Importer {
     }
     if (natural.empty()) return {};
     Id argument = a.add(std::move(natural)), residual = a.add(std::move(binary));
-    ++a.stats["ideal_single_constant_exp_sequences"];
     ++a.stats["ideal_additive_compiler_exp_sequences"];
     return a.mul({a.exp(argument),a.exp2(residual)});
   }
@@ -3604,10 +3609,10 @@ struct Importer {
     if (name == "Multiply") {
       if (auto lse = compiler_lse(n, ctx)) return *lse;
       if (auto log = compiler_log(n, x, ctx)) return *log;
-      return x.size() == 2 ? numerical_product(x[0], x[1]) : a.mul(x);
+      return x.size() == 2 ? numerical_product(n, x[0], x[1]) : a.mul(x);
     }
     if (name == "Fma")
-      return a.add({numerical_product(x.at(0), x.at(1)), x.at(2)});
+      return a.add({numerical_product(n, x.at(0), x.at(1)), x.at(2)});
     if (name == "Negate")
       return a.neg(x.at(0));
     if (name == "Exp")
@@ -3672,9 +3677,7 @@ struct Importer {
         ++a.stats["ideal_single_constant_exp_sequences"];
         return a.exp(argument);
       }
-      Id power = a.exp2(x[0]);
-      if (idealize() && split_log2e_exp2(n)) split_exp2.insert(power);
-      return power;
+      return a.exp2(x[0]);
     }
     if (name == "Reciprocal")
       return a.recip(x.at(0));
