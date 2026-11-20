@@ -1,0 +1,1 @@
+{"schema": "spverify.kernel-input/v1", "entry": "k_table_scatter", "launch": {"grid_dim": [2, 1, 1], "block_dim": [64, 1, 1]}, "declarations": [{"parameter": 0, "type": "pointer", "space": "global", "object": "tab"}, {"parameter": 1, "type": "pointer", "space": "global", "object": "in"}, {"parameter": 2, "type": "pointer", "space": "global", "object": "out"}]}
