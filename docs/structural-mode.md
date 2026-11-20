@@ -52,15 +52,27 @@ of a body argument, the values its producer's stored output elements hold, by va
   every bit. Partial, by the bits each reads: and/or/xor/lop3 per bit (for every value of the other
   operands' varying bits, so a mask that is itself data is undecided), shl/shr (shr.s past the
   width reads the sign), bfe, bfi, prmt (default mode), shf, integer truncation (cvt, a mov.b32
-  unpack), integer products, quotients and remainders with a fixed operand, float abs (no sign),
+  unpack), integer products (below), quotients and remainders (full only for `x / 1`; any other,
+  including by a data value, is undecided), float abs (no sign),
   copysign (one operand's sign, the other's magnitude), slct's integer selector (its sign), a
   component of an operation's matrix result; a control the launch does not fix (mask, amount,
-  position, selector, table) makes the use undecided, so partial. Exception, decided exactly: a
-  use of a float's own bits (a same-width bitcast of an f16, bf16, f32 or f64 value) that ignores
-  only a contiguous run of its low bits and keeps the sign and every exponent bit is a rounding
-  toward zero to a narrower float (`__float_as_uint(v) >> 16` storing a bf16), numerics inside
-  the atom like `cvt.rz.bf16.f32`, so full. A reload of the value from memory under an integer
-  type is not recognized as a float's bits (partial). A partial edge counts for claims
+  position, selector, table) makes the use undecided, so partial. Integer products (mul.lo,
+  mad.lo; fixed or data factors): flipping factor bit i changes the low half by `o * 2^i`, zero mod
+  2^w exactly when the other factor o has at least w - i trailing zeros, so with t = o's trailing
+  zeros the product reads the factor's low w - t bits; t is decided only when o's low bits are
+  fixed zero up to a fixed one, else the use is undecided (`x * (x << 1)` = 2x^2 ignores x's bit
+  31). Wide products read every bit when some bit of o is fixed one; high halves are undecided.
+  Roundings, decided exactly (numerics inside the atom): (1) `and` with a fixed mask on a float's
+  own bits (a chain of same-width bitcasts of an f16, bf16, f32 or f64 value) that clears only a
+  contiguous run of its low bits and keeps the sign and every exponent bit: an and keeps each bit
+  in place, so the result is that float rounded toward zero in its own format; (2) a narrowing
+  store: an opaque node's element in a bf16 field (2 bytes, store format bf16 or none) whose stored
+  value, less same-width bitcasts and one integer truncation to 16 bits, is a shift right by 16 of
+  an f32's own bits (`__float_as_uint(v) >> 16` stored as u16, k_combine_pos_store_trunc); its 16
+  stored bits are the f32's bf16 encoding rounded toward zero, as `cvt.rz.bf16.f32` stores, so the
+  element's checks (leaves, factorization, roles) start from the f32. A shift whose kept bits are
+  used any other way (as an f32, `>> 17`, into an f16 field) is partial. A reload of the value from
+  memory under an integer type is not recognized as a float's bits (partial). A partial edge counts for claims
   that no path exists (avoids_transcendental, a multiplicand's bypass, an addend's non-addend
   paths) and never for claims that one does: an output's leaves must all be reached by full paths
   (`fullLeaves`), so must a factorization's cut elements and an unstored producer's operands, and
@@ -68,7 +80,11 @@ of a body argument, the values its producer's stored output elements hold, by va
   path, as a factor of a multiplicand or along addend edges. `reload(p) & 0xffff` is refused; nvcc's
   `expf` (`shl.b32` of the low 9 bits of a rounding result, whose source also reaches the output in
   full) is not. A full-width reassembly of partial uses (`{lo, hi}` unpacked and repacked) is
-  refused too: each use is partial.
+  refused too: each use is partial. Counting partial edges for absence claims is sound because those
+  traversals follow every edge (full or partial) of the complete dataflow: a dead operand (a
+  product with a literal zero, a mask or shift that clears every bit) is refused, not dropped; a
+  select whose condition the launch fixes has only its chosen operand as an edge; a narrowing
+  store skips only its shift and truncation, whose one other operand is the fixed amount 16.
 - **Undecided steps** (`unsupported`): reads at data-dependent positions, unresolved loads,
   undetermined values, thread selectors the launch does not decide, operation kinds not listed.
 
