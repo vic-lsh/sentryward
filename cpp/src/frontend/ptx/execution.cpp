@@ -1235,6 +1235,8 @@ struct State {
   // The tightest bounds this lane's facts give each atom, by atom function identity (lane atoms
   // and path atoms are per lane visit, so the identity names one value).
   std::map<std::string, ElementAtom> tight_atoms;
+  // Global facts made by compute instructions (mask definitions), moved into the trace at the end.
+  std::vector<std::string> facts;
   std::vector<std::optional<DynamicKey>> origins;
   std::vector<std::uint64_t> occurrences, branch_visits;
   std::map<std::string, std::uint64_t> backedges;
@@ -3255,6 +3257,49 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
       Set(d, s, {IntegerProduct(i, val(1), val(2))});
     return;
   }
+  // Stage A masks: x & -2^m and x & (2^m - 1) of an exact value that fits the unsigned width are
+  // 2^m q and r for fresh lane atoms q, r with the definitional fact x = 2^m q + r, 0 <= r < 2^m.
+  if (op == "and" && path_facts_ && n > 2 && !Floating(i))
+    if (const auto width = Width(i); width && *width <= 64) {
+      const auto a = val(1), b = val(2);
+      const auto ca = ScalarInteger(a), cb = ScalarInteger(b);
+      const Scalar &x = cb ? a : b;
+      const auto c = cb ? cb : ca;
+      const auto *bx = std::get_if<BoundedInteger>(&x);
+      const Integer modulus = Integer(1) << *width;
+      if (c && bx && (*bx)->affine && FitsType(*bx, *width, false)) {
+        const Integer mask = ((*c % modulus) + modulus) % modulus;  // the unsigned bit pattern
+        const Integer low_bits = modulus - mask;                    // 2^m for a high mask
+        std::optional<unsigned> m;
+        bool high = false;
+        for (unsigned k = 1; k < *width; ++k) {
+          const Integer p = Integer(1) << k;
+          if (mask == p - 1) { m = k; high = false; }
+          if (low_bits == p) { m = k; high = true; }
+        }
+        if (m) {
+          const Integer p = Integer(1) << *m;
+          const auto ident = std::to_string(i.id) + ":" + CtaText(s) + std::to_string(warp) + ":" +
+                             std::to_string(lane) + ":" + std::to_string(occurrence);
+          const auto fdiv = [](const Integer &u, const Integer &v) {
+            Integer q = u / v;
+            if (u % v != 0 && ((u < 0) != (v < 0))) --q;
+            return q;
+          };
+          const auto type = "u" + std::to_string(*width);
+          ElementAtom q{"mask_quotient", type, Integer(0), "mask_q:" + ident, fdiv((*bx)->lower, p), fdiv((*bx)->upper, p)};
+          ElementAtom r{"mask_remainder", type, Integer(0), "mask_r:" + ident, Integer(0), p - 1};
+          // x - p q - r == 0 (a fact over two or more atoms: an address invariant).
+          AffineForm definition = AffineSum(*(*bx)->affine, AffineForm{Integer(0), {{q, p}, {r, Integer(1)}}}, Integer(-1));
+          if (const auto json = FactTermJson(definition)) {
+            s.facts.push_back(Json{{"term", *json}, {"lower_bound", 0}, {"upper_bound", 0}}.dump());
+            Set(d, s, {high ? MakeBounded(q.lower * p, q.upper * p, q.function + "*", {}, AffineForm{Integer(0), {{q, p}}})
+                            : MakeBounded(Integer(0), p - 1, r.function, {}, AffineForm{Integer(0), {{r, Integer(1)}}})});
+            return;
+          }
+        }
+      }
+    }
   if (In(op, {"add", "sub", "shl", "shr", "and", "or", "xor", "min", "max",
               "rem", "div"}) &&
       n > 2) {
@@ -4319,6 +4364,7 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
       trace.branch_visits[index] = state.branch_visits[index];
   trace.loop_backedges = std::move(state.backedges);
   if (convergence_) context.Diverge(lane);
+  trace.path_facts.insert(trace.path_facts.end(), state.facts.begin(), state.facts.end());
   co_return trace;
 }
 

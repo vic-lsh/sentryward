@@ -37,6 +37,13 @@ struct Piece {
     return column - start + bytes <= width;
   }
   [[nodiscard]] std::uint64_t RowBytes() const { return (count - 1) * (count > 1 ? period : width) + width; }
+  // Whether the piece's bytes are exactly the contiguous range [0, n) for some n >= extent: one run
+  // per row and rows back to back (or one row). Then an access contained in [0, extent) is in it.
+  [[nodiscard]] bool CoversExtent(std::uint64_t extent) const {
+    if (base != 0 || count != 1 || rows == 0) return false;
+    if (rows == 1) return width >= extent;
+    return stride == width && rows * stride >= extent;
+  }
   // [low, low + bytes) inside one run of one row. Rows may overlap (a window such as an indptr's
   // [r, r + 2) at a one-entry stride): every row whose bytes reach `low` is tried.
   [[nodiscard]] bool Contains(std::int64_t low, std::uint64_t bytes) const {
@@ -293,7 +300,9 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
         bool allowed = false, held = false, decided = true;
         for (const auto& piece : decl.pieces) {
           bool in = false;
-          if (verdict.constant_offset) {
+          if (d == 0 && piece.CoversExtent(decl.extent)) {
+            in = true;  // the verdict is contained in [0, extent), which the piece covers
+          } else if (verdict.constant_offset) {
             in = piece.Contains(*verdict.min_byte + d, *access.bytes);
           } else if (verdict.constant && verdict.min_byte && verdict.max_byte_exclusive) {
             const auto r = piece.ContainsRows(*verdict.constant + d, verdict.coefficient_gcd, *verdict.min_byte + d,
