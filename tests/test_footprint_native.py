@@ -149,6 +149,15 @@ class FootprintNativeTest(unittest.TestCase):
         self.assertNotIn("shared_control_collective_variant", [c for c, _ in codes])
         self.assertIn(("control_predicate_not_static", 1492), codes)
 
+    # The guard's predicate as the complement destination (`setp.ge.u32 _|%p4, w - 1, slots`):
+    # %p4 is w - 1 < slots, so the not-taken path reads next_tok[w - 1] with w - 1 >= slots.
+    # The comparison must not be read with the first destination's polarity.
+    def test_path_condition_complement_destination_reads_outside(self):
+        r = run("feed_guard_complement", "feed_guarded_read")
+        fp = self.footprint(r)
+        self.assertEqual(fp["reads"], "not_contained")
+        self.assertEqual(fp["outside_reads"][0]["object"], "next_tok")
+
 
 if __name__ == "__main__":
     unittest.main()
