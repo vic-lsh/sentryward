@@ -8,7 +8,9 @@ Two seeded generators, each with an oracle independent of the checker:
    producer under primitive adds; a warp-shuffle reduction (shfl.sync.bfly butterfly) read as a
    whole row, sometimes with a step missing. Expressions: f16 round trips, packed-pair components,
    selects on data-dependent conditions, ex2/lg2, products, fmas, adds, and masked operands (a
-   value's bits through and/shr/shl/prmt/bfe that keep part of them, or xor/prmt that keep all).
+   value's bits through and/shr/shl/prmt/bfe or an integer product with an even factor that keep
+   part of them, a shift right by 16 used as an f32 (a fake narrowing), or xor/prmt, an in-place
+   and 0xffff0000 or a product with an odd factor that keep all).
 2. IR cases (sentryward-structural-ir-controls random): value IR built directly, with indexed
    selections (input elements are components of matrix loads), stored and unstored producers and
    mutations whose outcome the generator knows (an index, a recomputed cut, a second binding, a
@@ -22,7 +24,8 @@ must be refused, and which sources it reaches only through partial masks (a stor
 role that needs one in full must be refused). Asserted: whenever the checker matches, the reference finds no failing or
 undecided verdict and the generator's model does not say the case is wrong. Not vacuous: floors
 on matches, refusals per kind and shape, and (IR) on matches among the cases the model says are
-right.
+right. A refusal is classed by the reference as refuted, undecided (the reference reports
+undecided outside its exact class; never counted as agreement) or held.
 
 Skipped unless SENTRYWARD_PTX_NATIVE names a built sentryward-ptx (the IR test: also
 sentryward-structural-ir-controls, SENTRYWARD_STRUCTURAL_IR or next to the native).
@@ -127,11 +130,11 @@ def expression(rng, k, leaves, depth):
     def gen(d):
         if d == 0 or rng.random() < 0.25:
             return rng.choice(leaves)
-        if rng.random() < 0.08:  # a masked operand: x's bits through one bit operation
+        if rng.random() < 0.1:  # a masked operand: x's bits through one bit operation
             x = gen(d - 1)
             text, keeps = rng.choice(MASKS)
-            i, o = k.rreg(), k.rreg()
-            k.body += [f"mov.b32 {i}, {x};", text.format(o=o, i=i)]
+            i, o, t = k.rreg(), k.rreg(), k.rreg()
+            k.body += [f"mov.b32 {i}, {x};"] + text.format(o=o, i=i, t=t).split("\n")
             r = k.op(f"mov.b32 {{0}}, {o};")
             alls, thr, full, thr_full = k.info[x]
             k.info[r] = (alls, thr, full, thr_full) if keeps else (alls, thr, set(), set())
@@ -196,12 +199,17 @@ def src(tag):
     return ({tag}, set(), {tag}, set())
 
 
-# Masks of an f32's bits: (instruction, whether every bit is kept).
-# A use of an f32's own top 16 bits (shr 16, and 0xffff0000) is a rounding toward zero to bf16: full.
+# Masks of an f32's bits: (instructions, whether every bit is kept); {t} is a scratch register.
+# and 0xffff0000 on an f32's own bits clears its low mantissa in place: a rounding toward zero, full.
+# shr 16 used as an f32 is a fake narrowing (the kept bits move; 1.0f gives 0x00003f80): partial.
+# An integer product reads every bit only when the other factor is odd: x * (x << 1) drops x's bit
+# 31 (round-6 reproducer), x * (x | 1) and x * 3 keep every bit.
 MASKS = [("and.b32 {o}, {i}, 65535;", False), ("shl.b32 {o}, {i}, 16;", False), ("shr.u32 {o}, {i}, 24;", False),
          ("prmt.b32 {o}, {i}, 0, 4112;", False), ("bfe.u32 {o}, {i}, 8, 16;", False),
          ("and.b32 {o}, {i}, 2147483647;", False), ("xor.b32 {o}, {i}, 2147483648;", True),
-         ("prmt.b32 {o}, {i}, 0, 12816;", True), ("shr.u32 {o}, {i}, 16;", True), ("and.b32 {o}, {i}, 4294901760;", True)]
+         ("prmt.b32 {o}, {i}, 0, 12816;", True), ("shr.u32 {o}, {i}, 16;", False), ("and.b32 {o}, {i}, 4294901760;", True),
+         ("shl.b32 {t}, {i}, 1;\nmul.lo.u32 {o}, {i}, {t};", False), ("mul.lo.u32 {o}, {i}, 3;", True),
+         ("or.b32 {t}, {i}, 1;\nmul.lo.u32 {o}, {i}, {t};", True)]
 
 
 def roles(rng, k, reg, tag, wrong=True):
@@ -357,6 +365,21 @@ def reference_refutes(ref):
     return "checks" in ref and bool(ref["fails"] or any(ref[s]["fails"] for s in SECTIONS))
 
 
+def reference_undecided(ref):
+    """The number of the reference's undecided verdicts (roles and each section)."""
+    if "checks" not in ref:
+        return 0
+    return len(ref["undecided"]) + sum(len(ref[s]["undecided"]) for s in SECTIONS)
+
+
+def refusal_agreement(ref):
+    """How the reference reads a case the checker refused: it refutes it, cannot decide some check
+    (undecided: neither agreement nor disagreement), or holds everywhere."""
+    if reference_refutes(ref):
+        return "refusal: reference refutes"
+    return "refusal: reference undecided" if reference_undecided(ref) else "refusal: reference holds"
+
+
 def outcome(r):
     return r["result"] if r["result"] == "matched" else f'{r["result"]}:{r.get("reason")}'
 
@@ -381,11 +404,12 @@ class StructuralDifferentialTest(unittest.TestCase):
                 shapes[(shape + ("/class" if r.get("class_mode") else ""), "matched" if o == "matched" else "refused")] += 1
                 ref = r.get("reference", {})
                 if o != "matched":
-                    agree["refusal: reference refutes" if reference_refutes(ref) else "refusal: reference holds"] += 1
+                    agree[refusal_agreement(ref)] += 1
                     continue
                 checks["roles"] += ref.get("checks", 0)
                 for s in SECTIONS:
                     checks[s] += ref.get(s, {}).get("checks", 0)
+                checks["undecided"] += reference_undecided(ref)
                 problems = reference_problems(ref)
                 if problems or not truth:
                     violations.append({"case": i, "shape": shape, "reference": problems, "model": truth})
@@ -418,7 +442,7 @@ class StructuralDifferentialTest(unittest.TestCase):
             o = outcome(r)
             kinds[(row["shape"], row["mutation"], o)] += 1
             if o != "matched":
-                agree["refusal: reference refutes" if reference_refutes(r.get("reference", {})) else "refusal: reference holds"] += 1
+                agree[refusal_agreement(r.get("reference", {}))] += 1
                 continue
             problems = reference_problems(r.get("reference", {}))
             if problems or not row["truth"]:
