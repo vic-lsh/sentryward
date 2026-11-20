@@ -304,9 +304,11 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
           // or a symbolic offset whose step is a multiple of the row stride and whose bytes fit in
           // the rest of the row from its column (the declared contract is one run of one row).
           const auto stride = piece.stride ? std::int64_t(piece.stride) : std::int64_t(1);
+          // (A zero gcd means the real gcd did not fit: never treated as a multiple of the stride.)
           const bool one_row_access =
               piece.rows == 1 ||
-              (!verdict.constant_offset && verdict.constant && verdict.coefficient_gcd % piece.stride == 0 &&
+              (piece.rows > 1 && piece.stride > 0 && !verdict.constant_offset && verdict.constant &&
+               verdict.coefficient_gcd != 0 && verdict.coefficient_gcd % piece.stride == 0 &&
                std::uint64_t((*verdict.constant % stride + stride) % stride) + *access.bytes <= piece.stride);
           if (d == 0 && piece.CoversExtent(decl.extent) && one_row_access) {
             in = true;  // contained in [0, extent), which the piece covers, within one row
