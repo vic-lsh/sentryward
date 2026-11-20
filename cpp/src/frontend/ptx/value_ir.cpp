@@ -3584,6 +3584,9 @@ class AddressDagWriter {
   std::unordered_map<std::string, std::size_t> canonical_ids;
   std::size_t slice_visits = 0;
   std::uint64_t pool_id = 0;
+  // Canonical mode: the global allocations some Store of the launch writes, when the graph is
+  // known to hold every write of the launch (KeyReadOnlyLoads); unset otherwise.
+  std::optional<std::set<std::string>> written_allocations;
 public:
   explicit AddressDagWriter(const v::Graph& graph, bool canonical = false)
       : graph(graph), canonical_terms(canonical) {
@@ -3738,7 +3741,7 @@ public:
           node["binding"] = instance.origin.cta_coordinates->at(axis);
         else throw std::invalid_argument("unbound cluster coordinate");
       }
-      if (definition.operation().name() == "Load")
+      if (definition.operation().name() == "Load" && !ReadOnlyLoad(instance))
         node["occurrence"] = {instance.origin.source_file->str(), instance.origin.function->str(),
             instance.origin.cta_coordinates.value(), instance.origin.thread.value(),
             instance.origin.instruction_index.value(), instance.origin.occurrence.value(), instance.origin.lowering_index};
@@ -3751,6 +3754,38 @@ public:
     const auto id = nodes.size();
     nodes.push_back(std::move(node)); ids.emplace(key, id);
     return id;
+  }
+  // A Load from a global allocation that no write of the launch can reach reads the word's
+  // initial contents, whichever thread issues it and whenever: every load of the same address
+  // value (same canonical address DAG, type and attributes) is one value. Its canonical key then
+  // omits the per-thread occurrence, so threads whose bases come from the same read-only word
+  // share that atom. Enabled only when the graph holds every write of the launch: the value view
+  // is complete over every CTA (no value diagnostic, no deferred CTA), no OpaqueValue stands for
+  // an unmodeled effect, and every Store instance's address names its global allocation. Objects
+  // with distinct identities are distinct memory (the binding's premise for every allocation).
+  void KeyReadOnlyLoads(bool every_write_modeled) {
+    if (!canonical_terms || !every_write_modeled) return;
+    std::set<std::string> written;
+    for (const auto& node : graph.nodes()) {
+      if (dynamic_cast<const v::OpaqueValueOp*>(&node.operation())) return;
+      if (!dynamic_cast<const v::StoreOp*>(&node.operation())) continue;
+      for (std::size_t i = 0; i < node.instanceCount(); ++i) {
+        const auto operands = node.instanceOperands(i);
+        if (operands.empty()) return;
+        std::optional<std::string> allocation;
+        try { allocation = Allocation(operands[0]); } catch (const std::invalid_argument&) { return; }
+        if (!allocation) return;
+        written.insert(std::move(*allocation));
+      }
+    }
+    written_allocations = std::move(written);
+  }
+  bool ReadOnlyLoad(const v::Instance& instance) const {
+    if (!written_allocations || instance.operands.empty()) return false;
+    try {
+      const auto allocation = Allocation(instance.operands[0]);
+      return allocation && !written_allocations->contains(*allocation);
+    } catch (const std::invalid_argument&) { return false; }
   }
   Json Write(v::Value value) {
     slice_visits = 0;
@@ -3879,9 +3914,10 @@ std::optional<nlohmann::json> ValueAddressIndex::Extract(LaneRef lane,
 }
 
 void MaterializeValueAddresses(std::vector<algorithm::ConstantAddressBinding>& bindings,
-                               const v::Graph& graph, bool canonical_terms) {
+                               const v::Graph& graph, bool canonical_terms, bool every_write_modeled) {
   using Json = nlohmann::json;
   AddressDagWriter canonical(graph, true);
+  if (canonical_terms) canonical.KeyReadOnlyLoads(every_write_modeled);
   const auto resolve = [&](auto&& self, Json& expression) -> void {
     if (expression.is_object() && expression.value("operator", "") == "value_dag_ref") {
       try {

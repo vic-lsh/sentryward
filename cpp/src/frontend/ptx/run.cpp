@@ -2159,14 +2159,20 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
                       {"execution_order_basis", "trusted_reference"}};
           } else {
             const bool canonical_addresses = Json::parse(lowered.artifact.address_invariants_json).empty();
+            // The bridge's value view covers every CTA and every instruction's value effect.
+            const bool every_write_modeled = semantic_program && semantic_program->valuesComplete() &&
+                metadata.contains("address_value_bridge") &&
+                metadata["address_value_bridge"].value("value_view_complete", false);
             auto memory_addresses = std::move(lowered.artifact.addresses);
             result = Json::parse(alg::AnalyzeSourceArtifact(
                 std::move(lowered.artifact), true, memory, {}, reachability,
                 options.sync_timeout, on_verified,
-                [addresses = std::move(memory_addresses), &semantic_program, canonical_addresses]() mutable {
+                [addresses = std::move(memory_addresses), &semantic_program, canonical_addresses,
+                 every_write_modeled]() mutable {
                   if (semantic_program)
                     alg::ProfileCall("memory.value_addresses", [&] {
-                      ptx::MaterializeValueAddresses(addresses, semantic_program->values, canonical_addresses);
+                      ptx::MaterializeValueAddresses(addresses, semantic_program->values, canonical_addresses,
+                                                     every_write_modeled);
                     });
                   return std::move(addresses);
                 }, kept_verdict ? std::string_view(unit_restart->verdict) : std::string_view()));

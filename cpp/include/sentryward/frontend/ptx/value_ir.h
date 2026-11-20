@@ -31,8 +31,11 @@ private:
 };
 
 // Resolve compute-DAG references at the memory-analysis boundary or for export.
+// `every_write_modeled`: the graph holds every write of the launch (complete value view over
+// every CTA); canonical terms may then key loads of unwritten allocations by address alone.
 void MaterializeValueAddresses(std::vector<algorithm::ConstantAddressBinding>&,
-                               const value_ir::Graph&, bool canonical_terms = false);
+                               const value_ir::Graph&, bool canonical_terms = false,
+                               bool every_write_modeled = false);
 
 // Demand-driven scalar address slice using the numerical PTX lowering rules.
 class AddressValueExtractor {
