@@ -14,6 +14,9 @@
 //  3. factorization: with the stored values of n's inner term nodes as cut leaves, o's DAG
 //     reaches exactly those cut values (at the term's coordinates) and n's direct operands, and no
 //     original input element by a path that avoids the cut.
+// A match is never evidence of op identity: which op an opaque atom computes rests on the caller's
+// trusted kernel row. Roles are syntactic path facts that tell equal-shaped operands of that op
+// apart (docs/structural-mode.md).
 #include <string>
 
 #include "sentryward/value_analysis/memory_elimination.h"
