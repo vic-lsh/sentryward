@@ -1,183 +1,230 @@
-# Loop summaries for footprint containment
+# Relational path conditions and loop summaries for footprint containment
 
-Status: design, revision 2 (after Codex review 1: 6 P0, 3 P1, 1 P2, all addressed below; the
-review's numbering is cited as R1..R10). For review before implementation (Coral D253 follow-up 3).
-Fork branch `claude/sw-loop-summaries`, based on `claude/sw-path-conds` (bfcdd5a).
+Status: design, revision 3, for review before implementation (Coral D253 follow-up 3). Fork branch
+`claude/sw-loop-summaries`, based on `claude/sw-path-conds` (bfcdd5a). Revision 1 drew R1..R10
+(Codex review 1); revision 2 drew S1..S6 (Codex re-check). Each is cited where it is addressed.
+
+Footprint containment only: every load and store of a launch stays inside its object's declared
+bytes. Race freedom is never claimed from anything here.
 
 ## Problem
 
-The PTX frontend runs each lane as a concrete interpreter over partly symbolic values. A loop whose
-exit test depends on loaded data stops it with `control_predicate_not_static`. Choice trees
-(`branch_decisions`) cannot decide such a test: one choice forces every visit of the line, so
-"taken" loops until `execution_step_budget_exceeded` and "not taken" runs exactly one iteration.
+The PTX frontend runs each lane as a concrete interpreter over partly symbolic values. Two gaps
+block Coral rows:
 
-Coral row blocked by this: `k_conv` (sm121 `conv.cu`), `for (i = 0; i < ends[s] - ends[s-1]; i++)`
-reading `qkv` row `ends[s-1] + i` and writing `outp` at the same row. nvcc -O3 emits a main loop
-unrolled by 4 (counter stepping toward zero, exit `setp.ne c, 0`) and a remainder loop.
+1. **Data branches lose their condition.** A choice tree (`branch_decisions`) decides a branch on
+   loaded data, but the decided predicate only constrains later values in the narrow form of
+   `RefineGuard` (one `setp` of an unknown register against a known integer, lt/le/gt/ge). An
+   `eq`/`ne` test, a comparison of two unknowns, a mask (`n & 15`) or a combined predicate (`or.pred`)
+   is dropped. Example: `k_sample` (sm121 `sample.cu`) branches on `or.pred (s >= slots, !last)`;
+   forced not taken, `s` stays unbounded and the `next_tok[s]` store is reported outside (false alarm).
+2. **Loops with a data trip count stop.** A choice on a loop test forces every visit. nvcc -O3 turns
+   `for (i = 0; i < n; i++)` into a main loop unrolled by 16 with counter `-(n & -16)` and exit
+   `setp.ne c, 0`, then tails of 8, 4 and a remainder loop on `-(n & 3)`, gated by data branches on
+   `n & 15`, `n & 7`, `n & 3` (`tests/footprint_cases/src/loop.cu`). `k_conv` has this shape.
 
-Footprint containment only. Race freedom is never claimed from a summarized loop.
+Stage A closes gap 1 and is a prerequisite of stage B (loops), whose trip counts and tails are
+relations between masked values.
 
-## Scope (version 1)
+## Shared mechanism: constrained accesses (R7)
 
-A loop is summarized only when every condition below holds; any other loop keeps today's behavior
-(the stop). Each condition is checked, never assumed; a failed check is a refusal with a named
-diagnostic (`loop_summary_refused:<reason>` in the frontend facts), so a refusal can never pass.
+- Each lane carries a path constraint set: formulas over atoms (exact integers). Each recorded
+  access stores a handle to the set current at the access (sets are persistent, so a prefix is
+  shared, and are normalized for hashing).
+- Containment query: Z3 searches for atom values within their bounds, satisfying the access's
+  constraints, with the address outside every declared piece of the access's direction. Unsat is
+  contained; sat is a violation with a witness satisfying the constraints; unknown is undecided
+  (never a pass). Before using a set, its satisfiability is checked on its own; an unsat set (an
+  infeasible path) marks the leaf `infeasible_path`, which a consumer treats as no evidence (never a
+  pass) (S2).
+- `Instantiate` includes atoms that occur only in constraints. The extrema cache is keyed by
+  (offset, constraint set). `BoxOnly`, the free-atom and constant-offset shortcuts may pass a
+  constrained access only when the unconstrained hull is inside; they never report a violation for
+  it. Accesses with different constraint sets never share a family; constrained accesses are not
+  aggregated into representative CTA classes (`footprint_checker.cpp`). Each of these gets a native
+  control.
 
-## Mechanism
+## Stage A: relational path conditions
 
-### 1. Eligible loops (static, per loop `L`)
+### A1. Symbolic integer terms
 
-- `L` is a natural loop (`control_loops_`) with one latch, classified by `ClassifyControl` as a
-  computation loop, pre-test or post-test, whose only exit is that test (no `ret`, `exit`, `trap`,
-  or other edge leaving `L`).
-- No nested loop, call, barrier (`bar.*`, `barrier.*`), atomic or reduction (`atom`, `red`), async
-  copy (`cp.async*`, `cp.async.bulk*`, TMA), warp or CTA collective (`shfl`, `vote`, `match`,
-  `redux`, `bar.red`), `membar`/`fence`, or `mbarrier` operation in `L`.
-- No store of any state space in `L` except global stores to objects whose footprint is
-  write-only (direction `write`, read by no load of the launch) (R5, R6: a store the loop or another
-  lane could read back would make a tracked value stale). No `.local` store and no shared load or
-  store in `L` (R5, R6).
-- Every global load in `L` reads an object declared read-only for the launch (footprint direction
-  `read`, under the input's `distinct_objects_noalias` pointer contract) and checked so by the
-  existing read-only validation (`public_input_memory.cpp`), run whether or not the race analysis
-  runs (R6). Tensor-property atoms and pointer-table values over such objects are then stable for
-  the whole launch.
-- No data-dependent branch inside `L` other than the exit test (R8: a choice tree cannot cover
-  every iteration's internal path). Branches whose predicates are known per lane are fine.
-- Register discovery covers every destination of every instruction in `L`, including vector and
-  packed destinations (`{a, b}`, `mov.b64 {lo, hi}`) and predicate destinations; any register name
-  declared in more than one lexical scope, or written through a form the decoder does not list as a
-  destination, refuses the loop (R4). The carried set `C` is every register written in `L`,
-  predicates included.
+An integer register's value, when not a known integer, is an exact term: the atoms the frontend
+already makes (tensor-property elements, path atoms, CTA/thread coordinates as integers), combined
+by `add`, `sub`, `mul` by a constant, `shl` by a constant, `neg`, `cvt` between integer types, and
+masks. Every term is evaluated with its machine width: the term denotes `v mod 2^w` (with the
+signed reading where an instruction reads it signed), encoded exactly with Z3 integer `mod`, so no
+wrap assumption is needed for constraints (S4 for stage A). A mask `x & -2^m` or `x & (2^m - 1)`
+introduces a quotient atom `q` with `x' = 2^m q + r`, `0 <= r < 2^m` (`x'` the `w`-bit value of `x`),
+and denotes `2^m q` or `r`. Any other operation (other bit ops, division, min/max, select on an
+unknown predicate) yields an unknown, as today.
 
-### 2. Induction variables (R4)
+### A2. Recording decided branches
 
-`r` in `C` is an induction variable (IV) when it has exactly one definition in `L`, that definition
-is an unpredicated `add|sub.{s,u}{32,64} r, r, c` with one scalar destination, `c` an integer known
-at loop entry and nonzero, and its block lies on every path from the header to the latch (it
-dominates the latch; with no nested loop and no internal data branch it then runs exactly once per
-iteration). Its value at the start of iteration `k` is `r0 + s*k` as a mathematical integer, with
-`s = ±c`, provided no wrap (3). Every other register of `C` (predicates included) is havocked.
+When a lane takes a branch whose predicate is unknown, by a user choice (`branch_decisions`), the
+predicate's defining expression is recorded with the taken polarity: `setp.<cmp>.<int type>` of two
+terms (all integer comparisons, `eq`/`ne` included, signedness from the type), and `and/or/xor/not`
+`.pred` of such predicates, followed through registers within the lane's trace (the definition the
+branch reads, found by the trace's origins, not by name: no scope ambiguity). A predicate with any
+unknown leaf records nothing (sound: fewer constraints). Predicated non-branch instructions whose
+predicate is unknown keep today's handling.
 
-### 3. Trip count and wrap (R1, R2, R3)
+`RefineGuard` becomes a special case and is deleted when stage A lands (no old rule beside the
+general one); its tests stay and must pass on stage A.
 
-The exit test is `setp.<cmp>.<type> p, a, b` in the test block with `@p` or `@!p` on the branch.
-Exactly one operand is an IV read at a fixed phase (before or after its update in that iteration;
-the phase fixes the IV value the test sees as `r0 + s*k` or `r0 + s*(k + 1)`); the other is
-loop-invariant (`n`: known, a premise atom, or an affine form over entry atoms). The stay predicate
-`P(k)` is the comparison read with the branch polarity and the stay edge, interpreted in the
-setp's signedness and width.
+### A3. Soundness
 
-Supported comparisons: `lt, le, gt, ge` (and `lo, ls, hi, hs`) and `ne`. `eq` and any float or
-predicate-combining form refuse. The summary computes, as mathematical integers under the input's
-premises, a trip count `T >= 0` (pre-test: iterations whose test stays; post-test: body executions,
-at least 1) with:
+A choice tree's leaf fixes one outcome per branch line for every lane (unchanged consumer condition
+in Coral's `check_verdicts.py`). A concrete execution that follows the leaf's outcomes satisfies, at
+each access, every recorded formula, because each formula is the exact machine meaning of the
+predicate the lane branched on. So it is an instance of the access under its constraints.
 
-- relational test: `T` is the least `k >= 0` with `!P(k)` (pre-test) or `1 +` that over the
-  post-update values (post-test), expressed in closed form (`ceil((n - r0) / s)` clamped at 0, by
-  case on the comparison and the sign of `s`); the IV moves toward the bound or the loop refuses;
-- `ne`: the solver proves `s != 0`, `(n - r0)` is a multiple of `s` with `(n - r0) / s >= 0`, and
-  then `T = (n - r0) / s` (pre-test, test reading the pre-update value; the other phase/position
-  combinations shift by one as above). Monotone, non-wrapping progress (next item) makes `T` the
-  first hit, so no earlier modular hit exists.
+## Stage B: loop summaries
 
-No wrap: the solver proves that for every `k` in `[0, T]` (the values the test and body can see),
-every IV used by an address, a comparison, or the exit test stays inside its type's range in the
-interpretation each use reads (unsigned `[0, 2^w)`, signed `[-2^(w-1), 2^(w-1))`), and that the
-`w`-bit operations computing addresses from IVs inside `L` do not wrap either. If any check is
-unknown or fails, the loop refuses. With this, the mathematical and machine values agree on every
-reachable iteration, and `T` covers all of them: no fixed bound on `k` (R2).
+### B1. Eligible loops (checked; a failed check refuses with `loop_summary_refused:<reason>`)
 
-### 4. Summary execution (per lane)
+- `L` is a natural loop with one latch, classified as a computation loop by `ClassifyControl`
+  (pre-test or post-test), whose only exit is its test; no `ret`, `exit`, `trap`, nested loop or call.
+- The iteration CFG (`L` without the backedge) is acyclic and has no conditional branch other than
+  the exit test (S6). A predicated instruction in `L` is allowed only if its predicate is defined
+  outside `L` (loop-invariant), except memory instructions, which are recorded as executed
+  (conservative: an access that may not happen is still checked).
+- No barrier, atomic or reduction, async copy or TMA, warp or CTA collective, `membar`/`fence`,
+  `mbarrier`, shared load or store, or `.local` store in `L` (R5, R6).
+- Global stores in `L` only through pointers whose provenance is an object whose footprint is
+  write-only and that no load of the launch reads (by provenance) (R6).
+- Register discovery covers every destination, including vector, packed and predicate
+  destinations; a register name declared in more than one lexical scope, or a write the decoder
+  does not list as a destination, refuses (R4).
 
-On reaching `L`'s header with an unknown test:
+### B2. Induction variables (R4, S3)
 
-1. Make an iteration atom `k` (identity: header line, CTA, warp, lane, visit), an unbounded integer
-   with constraints. Set each IV to its affine form in `k`, havoc every other register of `C`.
-2. Execute the header prefix (instructions of the test block before the exit branch, which
-   `ClassifyControl` allows to read memory) under constraint `0 <= k <= T` for a pre-test loop (it
-   also runs on the final, failing test) and `0 <= k < T` for a post-test loop; execute the body
-   and latch under `0 <= k < T` (R8). Each access records the constraint of its program point.
-3. Leave by the exit edge with each IV set to its exit value `r0 + s*T` (exact, by 3) and every
-   other carried register havocked (R9: the remainder loop starts from the main loop's exit
-   counter). `T` itself is a symbolic integer over entry atoms, carried as an affine form only when
-   it is one (division results are kept as a fresh atom `q` with the defining constraint
-   `s*q = n - r0`); otherwise the IVs are havocked too.
+`r` is an IV when it has exactly one definition in `L`, an unpredicated
+`add|sub.{s,u}{32,64} r, r, imm` with a nonzero immediate literal `imm` (S3: no register step). Its
+block dominates the latch, which in an acyclic iteration CFG with no internal branch means it runs
+exactly once per iteration. Every other register written in `L` (predicates included) is havocked.
 
-The template executor falls back to per-lane execution before grouping any instruction of `L`
-(R8), as it does for `RefineGuard`.
+Update position: in a pre-test loop, every IV update must lie after the exit test (in the body or
+latch); a loop with an update in the header prefix refuses (S1). In a post-test loop, the test may
+read an IV before or after its update; the phase is fixed by instruction order.
 
-### 5. Constraints in the address model (R7)
+### B3. Trip count, values and wrap (R1, R2, R3, S1, S2, S4)
 
-- Each recorded access carries a normalized constraint set (linear integer constraints over atoms).
-  It survives lowering, compression and family extraction; accesses with different constraint sets
-  are never merged into one family, and constrained accesses are not aggregated into representative
-  CTA classes (each lane visit is checked on its own).
-- Queries: Z3 asks for atom values within their bounds and satisfying the access's constraints with
-  the address outside every declared piece of the access's direction. `Instantiate` includes atoms
-  that appear only in constraints. Unsat is contained, sat a violation with a witness that satisfies
-  the constraints, unknown undecided (never a pass).
-- The extrema cache is keyed by (offset, normalized constraints). `BoxOnly`, the free-atom and
-  constant-offset shortcuts may pass a constrained access only when the unconstrained hull is
-  inside (safe); they never report a violation for a constrained access.
+The exit test is `setp.<cmp>.<int type> p, a, b` in the test block, read by the exit branch with its
+polarity. One operand is an IV `x`; the other, `n`, is loop-invariant (a known integer or a term of
+stage A over entry values). `eq`, float tests and predicate combinations refuse.
 
-### 6. Output and consumer contract
+Let `U(k)` be the number of times an IV's update has executed when iteration `k` (0-based) is at a
+given program point. Pre-test: at the header test of visit `k`, `U = k`; in the body and latch of
+iteration `k`, `U = k` before the update and `k + 1` after it. Post-test: in the body of iteration
+`k`, `U = k` before and `k + 1` after the update; the test of iteration `k` sees `x0 + imm*U` at its
+phase. Values: `x0 + imm*U` as an exact integer.
 
-- `frontend_assumptions.loop_summaries`: per summarized loop, header and test lines, IVs, `T`'s
-  form, havocked register count; `loop_summary_refusals` with reasons.
-- `checks.footprint` is reported as today. The race analysis is not run on a launch with a
-  summarized loop: `result` is `unsupported`, diagnostic `loop_summary_race_not_checked`. Coral's
-  `check_verdicts.py` accepts `checks.footprint == passed` whatever the race result; no consumer
-  change is needed.
+Trip count `T` (body executions) is an integer atom with constraints, never a division:
 
-## Soundness argument (containment)
+- stay predicate `P(k)` is the test's comparison at the test's `U(k)`, read with the branch
+  polarity and the stay edge, as an exact integer comparison (valid by the no-wrap facts below);
+- pre-test: `T >= 0`, `P(j)` for `j < T` and `!P(T)`; with `P` monotone (proved: the IV moves toward
+  `n` under the comparison's direction), this is `T >= 0 && (T == 0 || P(T - 1)) && !P(T)`;
+- post-test: `T >= 1`, `(T == 1 || P(T - 2))` and `!P(T - 1)` likewise;
+- `ne`: refused unless the solver proves `imm != 0`, `(n - x0)` an exact multiple of `imm` with
+  quotient `>= 0` in the test's phase; then the equality form `imm * T' == n - x0` (with `T'` the
+  `U` at the hitting test, `T = T'` pre-test or `T' + 1` post-test per phase) is used, and only then
+  (S2). Monotone progress without wrap makes that test the first hit.
 
-Fix a concrete execution, a lane, and its `j`-th iteration of `L`. By 3, `j < T` for body and latch
-accesses and `j <= T` for pre-test header accesses, every IV equals `r0 + s*j` (one unpredicated
-update on every iteration path, no wrap), so the machine values used by the iteration are the
-summary's affine forms at `k = j`. Every other register's value at iteration start is some value of
-its type, which the havoc covers. Memory the iteration reads is either a read-only global object
-(stable for the launch by the validated read-only contract, so tensor-property atoms and pointer
-tables hold) or not read at all (no shared, no local stores, no shared loads); no cross-lane
-operation is in `L`. The iteration has no data-dependent branch other than the exit test, so its
-path is the one the summary executed for that program point. Hence each concrete access is an
-instance of a recorded access under its constraints, and the unsat outside query covers it. After
-the loop, IVs hold `r0 + s*T` exactly and every other carried register is havocked, which
-over-approximates every exit state; memory after the loop differs from entry only in write-only
-objects, which no later load reads.
+No wrap (S1, S4): the solver proves, under the entry path constraints and `T`'s constraints, that
+for every executed update (pre-test: `U` in `[0, T]`, the final failing header visit included;
+post-test: `U` in `[0, T]`), every IV value `x0 + imm*U` lies in its type's range in each reading the
+code uses (signed or unsigned), and every `w`-bit address operation inside `L` built from IVs does
+not wrap. Unknown or failed: refuse.
 
-## Coral coverage
+### B4. Summary execution (per lane)
 
-- `k_conv`: the target. Its claim is not made by this note: test 3 runs the pinned gb10 PTX of
-  `k_conv` with Coral's premises (`ends_tab` in `[0, 2048]`, `off_tab` in `[0, 1]`, from the
-  monitor's J1/J4 checks, Coral PR #5217) and must show contained; ordering `ends[s-1] <= ends[s]`
-  is not a premise, so the proof must hold for any order (a negative `n` gives `T = 0` under the
-  signed comparison, if that is the compiled form; the test shows which). If the compiled counter
-  arithmetic (masks, shifts) is not affine in the supported way, the row stays refused and this note
-  is revised with the gap (R9).
-- `k_sample` `row_of` (binary search): not covered (`lo`, `hi` are not IVs). A replacement of the
-  search in Coral's own kernel is a separate proposal with its own semantics, containment and
-  latency evidence (R10); nothing here claims it.
+1. Make an iteration atom `k >= 0` (identity: header line, CTA, warp, lane, visit) and the trip-count
+   atom `T`, with `T`'s constraints added to the lane's path set.
+2. Header prefix (test block before the exit branch): executed with IVs at `U = k`, constraint
+   `0 <= k <= T` (pre-test: it also runs on the failing visit) (R8).
+3. Body and latch: IVs at their `U` per program point, constraint `0 <= k < T`, other carried
+   registers havocked.
+4. Exit: each IV at `x0 + imm*U_exit` (`U_exit = T`), exact by the no-wrap proof (which covers it);
+   any IV the proof does not cover is havocked instead (S4). Every other carried register havocked.
+   `T` stays in the lane's path set, so a remainder loop starting from the main loop's exit counter
+   keeps the relation (R9).
 
-## Tests (test-first, native)
+The template executor falls back to per-lane execution before grouping any instruction of `L`.
 
-1. Counted loop `for (i = 0; i < n; i++) out[i] = in[i]`, `n` a loaded word bounded to the extent:
-   contained.
-2. Control: `i <= n`: violation, witness at the last element.
-3. The pinned `k_conv` PTX with Coral's gb10 premises: contained (target; see coverage).
-4. Control: an address from a havocked carried register (`p = in[p]` chase): not contained.
-5. Controls, each refused with its reason: a shared load in `L`; a `.local` store in `L`; a
-   predicated IV update; a vector destination redefining an IV; an `eq` test; an `ne` test whose
-   start is not a multiple of the step; a `u32` IV that can wrap (`i < UINT_MAX` stepping 2 from
-   `UINT_MAX - 1`); a global store to an object some load reads; a data branch in the body.
-6. A loop reaching `k = 2^31` (`u32` `i < n`, `n` up to `2^32 - 1`, an access past the extent only
-   at high `k`): violation (no fixed bound on `k`).
-7. A pre-test header load that runs on the failing test (`ld` before the exit branch reading
-   `a[i]`): checked at `k = T`.
+### B5. Memory the loop reads (R6, S5)
+
+The argument needs: a value the frontend models for a global load in `L` (an unknown, a
+tensor-property atom, a pointer-table value) holds at every iteration. Global objects in this
+frontend are either modeled by value (configured inputs, pointer arrays, tensor properties, which
+`ValidateConstantInputs` validates as constant against writes it can resolve) or not modeled (a load
+gives an unknown, which covers any value). Claim, by induction over the concrete execution's writes
+in order: if the footprint verdict is `contained`, then no write lands outside its object, so no
+write lands in a modeled read-only object; at the first write that would, all earlier modeled
+values were correct, so the analysis represents that write soundly and reports it outside (or as an
+unresolved or undeclared-object violation, which unresolved and generic writes already are), and
+the verdict is not `contained`. Hence a `contained` verdict implies the modeled values held. Stage
+B adds one check: a global load in `L` from an object some write of the launch (by provenance) also
+writes refuses the loop. Coral's inputs declare every object a kernel writes (`footprints`), and the
+pointer contract is `distinct_objects_noalias`; both are input facts, reported in the verdict.
+
+### B6. Output and consumer contract
+
+- `frontend_assumptions.loop_summaries` (header, test, IVs, `T` constraints, havocked count) and
+  `loop_summary_refusals`; `path_constraints` counts per leaf.
+- `checks.footprint` as today. With a summarized loop the race analysis is not run: `result`
+  `unsupported`, diagnostic `loop_summary_race_not_checked`. Coral accepts `checks.footprint ==
+  passed` whatever the race result.
+
+### B7. Soundness (containment)
+
+Fix a concrete execution following the leaf's choices, a lane and its iteration `j` of `L`. By B3,
+`j < T` for body and latch accesses and `j <= T` for pre-test header accesses, and every IV equals
+`x0 + imm*U(j)` at each program point (one unpredicated literal-step update per iteration, no wrap).
+Other registers at iteration start take some value of their type (havoc). The iteration's path is
+the unique path of the branch-free iteration CFG. Memory it reads holds its modeled values (B5), no
+shared or local state is involved, and no cross-lane operation is in `L`. So each concrete access is
+an instance of a recorded access under its constraints. After the loop, exported IVs are exact and
+the rest havocked, over-approximating every exit state.
+
+## Coral coverage (claims only after the tests pass)
+
+- `k_conv`: target of test B3 below (pinned gb10 PTX, Coral's premises from #5217: `ends_tab` in
+  `[0, 2048]`, `off_tab` in `[0, 1]`). No ordering premise on `ends`; the test shows whether the
+  compiled form needs one. If its counter arithmetic is outside A1, the row stays refused and this
+  note is revised with the gap.
+- `k_sample`: stage A removes the `or.pred` false alarm at split 1; `row_of` (binary search, `lo`
+  and `hi` not IVs) stays refused. Nothing here claims a replacement (R10).
+
+## Tests (test-first, native; PTX from `tests/footprint_cases/src/loop.cu` at nvcc 12.9 -O3)
+
+Stage A:
+1. `RefineGuard`'s existing cases (guarded read, off-by-one, complement destination, shadowing)
+   pass unchanged.
+2. `eq`/`ne` and two-unknown comparisons constrain a later read (contained); off-by-one controls
+   report outside.
+3. `or.pred` of two comparisons forced not taken bounds both (k_sample's shape); control: `and.pred`
+   forced not taken bounds neither.
+4. Mask quotient: a read at `n & -16` with `n` bounded is contained; control with `n & -15` is unknown.
+5. Infeasible leaf (contradictory choices) reports `infeasible_path`, never contained.
+6. Address-model controls: a cached extremum under one constraint set is not reused under another; a
+   representative CTA class is not used for a constrained access.
+
+Stage B:
+1. `k_copy_n` (`i < n`, `n` bounded by a premise): contained (unrolled 16/8/4/1 shape).
+2. Control `k_copy_le` (`i <= n`): violation at the last element.
+3. `k_conv` pinned PTX with Coral's gb10 premises: contained (target).
+4. Control `k_chase` (index from a havocked carried value): not contained.
+5. Refusals, each with its reason: shared load; `.local` store; predicated IV update; register step;
+   IV update in a pre-test header; vector destination redefining an IV; `eq` test; `ne` start not a
+   multiple; a `u32` IV that wraps (`i < UINT_MAX` stepping 2 from `UINT_MAX - 1`); an exported IV
+   that wraps; a load of an object the launch writes; an internal conditional branch.
+6. `u32 i < n`, `n` up to `2^32 - 1`, an access past the extent only at high `k`: violation.
+7. A pre-test header load runs on the failing visit: checked at `k = T`.
 8. A summarized launch reports `loop_summary_race_not_checked`, never `race_free`.
 
-## Cost
+## Cost and order
 
-Constrained accesses go to Z3 (no hull shortcut for violations, no family or CTA-class aggregation);
-each summarized loop adds one atom and up to two constraint sets per lane visit, and the template
-executor runs per lane through `L`.
+Constrained accesses go to Z3 with exact integer `mod` (slower than the hull); no family or CTA-class
+aggregation for them. Stage A lands first (its own review of the implementation, its controls, the
+Coral rows rerun), then stage B. Expect several days of fork work in total.
