@@ -1,6 +1,6 @@
 # Checking a large grid by CTA row shards (k_stage_in/out on H100)
 
-Status: design revision 3 (after review 2), for review before code. Owner: Coral SentryWard structural-mode lane.
+Status: design revision 4 (after review 3), for review before code. Owner: Coral SentryWard structural-mode lane.
 
 ## Problem
 
@@ -28,22 +28,38 @@ B. CTA row shards (recommended): check the launch as `K` inputs, shard `k` execu
 ## B in detail
 
 Admitted kernels only. A shard's execution must equal the launch restricted to its CTAs, so a
-launch may be sharded only when its PTX passes an **allowlist** scan (the existing precondition
-scan, `unit_classes.cpp` PreconditionScan, extended); any instruction or operand outside the list
-refuses sharding:
+launch may be sharded only when its PTX passes an **allowlist** scan over the entry and every
+function it reaches by direct call (an indirect call refuses). The scan is a new pass beside the
+existing precondition scan (`unit_classes.cpp` PreconditionScan). An instruction is admitted only
+if its opcode, every modifier and every operand kind are listed below; anything else refuses:
 
-- Special registers: only `%tid`, `%ntid`, `%ctaid`, `%nctaid`, `%laneid`, `%lanemask_*`, and
-  `%dynamic_smem_size`. Placement- or time-dependent registers (`%smid`, `%nsmid`, `%warpid`,
-  `%nwarpid`, `%clock`, `%clock64`, `%globaltimer*`, `%gridid`, `%cluster*`, `%pm*`) refuse.
-- Memory: `ld`/`st` of global, shared, local and param space with weak or relaxed-CTA semantics,
-  and generic-space accesses the frontend resolves to one of these; CTA-scope fences and
-  barriers. Refused: atomics and reductions of any scope on global memory, gpu/sys-scope fences,
-  volatile or `.mmio` accesses, `cp.async.bulk`/TMA and tensor-map operands, `st.async`,
-  `multimem`, `mbarrier` of cluster scope, distributed shared memory, cluster and grid barriers,
-  cooperative launches, and indirect calls or branches (`call` through a register, `brx.idx`).
-  (`cp.async` to shared memory within the CTA is allowed: its source is a global read like `ld`.)
-- No global read of a location some CTA of the launch writes unless reader and writer are in the
-  same shard; this is part of the cross-shard check below.
+- Integer and predicate arithmetic: `add`, `sub`, `mul` (`.lo`, `.hi`, `.wide`), `mad`, `div`,
+  `rem`, `min`, `max`, `neg`, `abs`, `and`, `or`, `xor`, `not`, `shl`, `shr`, `selp`, `setp`
+  (integer comparisons), `cvt` between integer types, `mov` of registers, immediates and the
+  special registers below. (Floating-point opcodes are not needed by the stage kernels; adding
+  any opcode is a reviewed change to the list.)
+- Special registers: only `%tid`, `%ntid`, `%ctaid`, `%nctaid`, `%laneid`. Every other special
+  register (placement or time dependent: `%smid`, `%warpid`, `%clock*`, `%globaltimer*`, `%gridid`,
+  `%cluster*`, `%pm*`, and the rest) refuses.
+- Control flow: `bra` and `bra.uni` to a label of the same function (predicated or not), `ret`,
+  `exit`, direct `call` to a function that passes the same scan.
+- Memory: `ld.param`; `ld.global` and `st.global` with no ordering or scope qualifier (weak), any
+  vector width, of a register address; `cvta.to.global`. Everything else in memory refuses,
+  including generic-space `ld`/`st` and `cvta` to generic, `ld.global.nc`, `ld.volatile`,
+  `.relaxed`/`.acquire`/`.release` forms, atomics and reductions of any space or scope, `prefetch`,
+  `cp.async` of any form, TMA and `cp.async.bulk`, `st.async`, `mbarrier`, `multimem`, shared and
+  distributed shared memory, `fence`, `bar`/`barrier` of any form, shuffles and votes.
+
+The list is the minimum the admitted kernels need, not a model of what is safe in general; it is
+widened only by a reviewed change with a control. Audit of the compiled H100 `k_stage_in`
+(`stage.cu`, `nvcc 12.9`, `sm_90a`, 137 lines of PTX): opcodes `add.s64`, `sub.s64`,
+`mul.lo.s64`, `mul.wide.u32`, `div.u32`, `div.u64`, `and.b64`, `or.b64`, `shl.b64`,
+`cvt.u32.u64`, `cvt.u64.u32`, `cvta.to.global.u64`, `mov.u32` (of `%tid.x`, `%ntid.x`,
+`%ctaid.x`, `%ctaid.y`, `%nctaid.x`), `setp.{eq,ne,lt,gt}`, `bra`, `bra.uni`, `ret`,
+`ld.param.u64`, `ld.global.u64`, `ld.global.v4.u32`, `st.global.v4.u32`; no call. All are on the
+list, so `k_stage_in` is admitted; the implementation re-runs this audit as a control on the
+record's PTX. Global reads of a location some CTA of the launch writes are handled by the
+cross-shard check below.
 
 - Fork input field `cta_rows: { y: [lo, hi) }`: the frontend plans units with the true grid,
   words and cluster shape and executes only the CTAs in the range. Facts that depend on the whole
@@ -112,13 +128,14 @@ row-to-entry binding would be a separate item; this design does not depend on it
 
 ## Cost
 
-A frontend filter with an extended allowlist scan, a generator split, per-shard piece export and
-an exact cross-shard check (interval comparisons; negligible next to execution).
+A frontend filter with the allowlist scan, a generator split, per-shard piece export and an exact
+cross-shard check (interval comparisons; negligible next to execution).
 
-Budget: each shard is its own record input, cached by `run.py --resume` and run under the
-4-process cap. Acceptance requires measured numbers, recorded in the PR, that meet the check
-budget: every shard of H100 `k_stage_in` under 5 minutes and under the 16 GiB memory cap (the
-GB10 8-row run is 293 s and about 14 GB, so the plan starts at 4 rows per shard, 12 shards, and
-the row count is chosen from the first measurement). The total wall time at the cap is reported.
-If a shard cannot meet 5 minutes at one row, the design is not accepted for that kernel and
-option A (admitting CTAs as translates without executing them) is the next step.
+Budget: the **complete uncached record** of one launch (every shard plus the cross-shard check)
+must finish in under 10 minutes wall time using at most 4 concurrent `sentryward-ptx` processes
+(the host-wide cap) and under the 16 GiB per-process memory cap. Estimate from the GB10 run (512 x
+8 CTAs, 293 s, about 14 GB): H100 is 6 times the CTAs, about 1,760 process-seconds, so about 7.5
+minutes on 4 processes at 4 rows per shard (12 shards, about 7 GB each). This is an estimate;
+acceptance is the measured uncached wall time recorded in the PR. If it is over 10 minutes, the
+design is not accepted for that kernel: the row stays trusted and option A (admitting CTAs as
+translates without executing them) is the next step. Recording a longer total is not a pass.
