@@ -806,17 +806,69 @@ class Checker {
   }
 
   // Whether `used` includes every bit operand y may vary in (an untracked operand or an undecided
-  // use: no), or y is a float's own bits and the bits not used are its low mantissa bits (a
-  // rounding toward zero to a narrower float: sign, exponent and leading mantissa bits kept,
-  // `__float_as_uint(v) >> 16` storing a bf16, numerics inside the atom like cvt.rz.bf16.f32).
+  // use: no).
   bool covers(const v::Value& y, std::optional<std::uint64_t> used) {
     const auto ow = bitWidth(y);
-    if (!used || !ow) return false;
-    const auto unused = bits(y).vary & ~*used & ones(ow);
+    return used && ow && (bits(y).vary & ~*used & ones(ow)) == 0;
+  }
+  // Whether `and` with the fixed mask `used` on y is a rounding in place: y is a float's own bits,
+  // the mask clears only a contiguous run of its low bits and keeps the sign and every exponent
+  // bit. An and keeps each kept bit at its position, so the result is that float's encoding with
+  // its low mantissa cleared: the float rounded toward zero, in its own format (numerics inside
+  // the atom). A shift moves the kept bits (no longer the float's encoding) and is not a rounding;
+  // a narrowing store of the top half is decided at the output (narrowed).
+  bool roundsInPlace(const v::Value& y, std::uint64_t used) {
+    const auto ow = bitWidth(y);
+    if (!ow) return false;
+    const auto unused = bits(y).vary & ~used & ones(ow);
     if (!unused) return true;
     const auto e = floatExponent(y);
     const auto low = 64u - unsigned(__builtin_clzll(unused));  // bits [0, low) hold every unused bit
-    return e && unused == ones(low) && (*used & ones(ow) & ~ones(low)) == (ones(ow) & ~ones(low)) && ow - low >= 1 + *e;
+    return e && unused == ones(low) && (used & ones(ow) & ~ones(low)) == (ones(ow) & ~ones(low)) && ow - low >= 1 + *e;
+  }
+  // The value whose rounding element `s` of an opaque node's output object `o` stores, when s is a
+  // narrowing of an f32 to bf16 by its top half: o's element is bf16 (2 bytes, the node's store
+  // format bf16 or none) and s, less same-width bitcasts and one integer truncation to 16 bits, is
+  // a shift right by the fixed amount 16 of an f32's own bits (`__float_as_uint(v) >> 16` stored
+  // as u16, k_combine_pos_store_trunc). The stored 16 bits are then the f32's bits 16..31: its bf16
+  // encoding rounded toward zero, as cvt.rz.bf16.f32 stores. Else s itself. Only the output's own
+  // checks start from the f32 (leaves, full leaves, factorization, roles): another use of the
+  // shifted value is an ordinary partial use.
+  v::Value narrowed(const v::Value& s, const TermNode& tn, const Object& o) {
+    if (o.element != "bf16" || o.bytes != 2 || !(tn.store.empty() || tn.store == "bf16")) return s;
+    auto x = resolve(s);
+    bool truncated = false;
+    for (unsigned n = 0; n < 8; ++n) {
+      if (!x.indices().empty()) return s;
+      const auto w = bitWidth(x);
+      if (const auto& c = x.conversion()) {
+        const auto sw = bitWidth(c->source);
+        if (c->spec->kind == v::TypeConversionKind::Bitcast && sw == w && w) { x = resolve(c->source); continue; }
+        if (c->spec->kind == v::TypeConversionKind::Convert && !c->spec->attributes.saturate && !truncated && w == 16 &&
+            sw == 32 && g_.type(x).element().isBitLike() && g_.type(c->source).element().isBitLike()) {
+          truncated = true;
+          x = resolve(c->source);
+          continue;
+        }
+        return s;
+      }
+      const auto& op = g_.definingNode(x).operation();
+      const auto xs = g_.instanceOperands(x).toVector();
+      if (dynamic_cast<const v::BitcastOp*>(&op) && xs.size() == 1 && bitWidth(xs[0]) == w && w) { x = resolve(xs[0]); continue; }
+      if (const auto* cv = dynamic_cast<const v::ConvertOp*>(&op); cv && xs.size() == 1 && !cv->attributes().saturate &&
+          !truncated && w == 16 && bitWidth(xs[0]) == 32 && g_.type(x).element().isBitLike() && g_.type(xs[0]).element().isBitLike()) {
+        truncated = true;
+        x = resolve(xs[0]);
+        continue;
+      }
+      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+      if (!b || b->opcode() != v::BinaryOpcode::ShiftRight || xs.size() != 2 || w != 32) return s;
+      const auto k = fixedBits(xs[1], bitWidth(xs[1]));
+      const auto e = floatExponent(xs[0]);
+      if (!k || *k != 16 || !e || *e != 8 || bitWidth(xs[0]) != 32) return s;
+      return xs[0];
+    }
+    return s;
   }
   // The exponent width of the float whose bits y is (a chain of same-width bitcasts of an f16,
   // bf16, f32 or f64 value), or none.
@@ -882,8 +934,9 @@ class Checker {
           if (!w) { check(0, std::nullopt, "a bit operation on an untracked value"); check(1, std::nullopt, "a bit operation on an untracked value"); return full; }
           const unsigned table = b->opcode() == B::BitAnd ? 0b1000 : b->opcode() == B::BitOr ? 0b1110 : 0b0110;
           const auto bw = bitwise(in, table, w);
-          check(0, bw.used[0], "a bitwise operation reads only some bits");
-          check(1, bw.used[1], "a bitwise operation reads only some bits");
+          for (std::size_t i = 0; i < 2; ++i)
+            if (!(b->opcode() == B::BitAnd && fixed(xs[1 - i]) && roundsInPlace(xs[i], bw.used[i])))
+              check(i, bw.used[i], "a bitwise operation reads only some bits");
           return full;
         }
         case B::ShiftLeft: case B::ShiftRight: {
@@ -1745,16 +1798,19 @@ class Checker {
           if (lifting_ && !slot) continue;  // a member's element: covered by its shift (classMode)
           const Json where = {{"node", n}, {"op", tn.op}, {"object", o.name}, {"element", {r, c}}};
           if (!slot) refuse("missing_output", "an element of the node's object is not written", where);
+          // An opaque node's element stored as a narrowing of an f32 to bf16 (its top half): its
+          // checks start from that f32 (narrowed).
+          const auto root = tn.primitive ? *slot : narrowed(*slot, tn, o);
           // 1. Leaves.
           const auto expected = materialize(full, r, c);
-          const auto actual = leaves(*slot);
+          const auto actual = leaves(root);
           if (actual != expected) {
             auto d = where;
             d["expected"] = render(expected);
             d["actual"] = render(actual);
             refuse("leaves", "the output's leaf set differs from the term's operands", d);
           }
-          requireFull(*slot, actual, fullLeaves(*slot), where);
+          requireFull(root, actual, fullLeaves(root), where);
           // 2. Primitive: the stored value (less the format clause's store conversion) is the one
           // operation on the operands, up to commutativity: an input element through its
           // conversion, an inner node's stored value, or an inner node's value (the cut) whose leaves
@@ -1914,16 +1970,16 @@ class Checker {
             // refuse it, with a less specific reason).
             if (has_body) {
               const auto expected_cut = materialize(cut, r, c);
-              const auto actual_cut = cutter.leaves(*slot);
+              const auto actual_cut = cutter.leaves(root);
               if (actual_cut != expected_cut) {
                 auto d = where;
                 d["expected"] = render(expected_cut);
                 d["actual"] = cutter.render(actual_cut);
                 refuse("factorization", "with the inner nodes' stored values as leaves, the output reaches other leaves", d);
               }
-              cutter.requireFull(*slot, actual_cut, cutter.fullLeaves(*slot), where);
+              cutter.requireFull(root, actual_cut, cutter.fullLeaves(root), where);
             }
-            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
+            checkRoles(n, root, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
           }
           ++checked;
         }
@@ -2029,15 +2085,18 @@ class Reference {
         const auto& tn = t_.nodes[n];
         if (!tn.out || *tn.out != obj) continue;
         const Json where = {{"node", n}, {"element", {r, c}}};
-        attempt(leaves, where, [&] { return reachedExactly(value, nullptr, expected(n, r, c, false)); });
         if (tn.primitive) {
+          attempt(leaves, where, [&] { return reachedExactly(value, nullptr, expected(n, r, c, false)); });
           bindingChecks(n, value, r, c, matched, bindings);
           continue;
         }
+        // An element stored as an f32's top half in a bf16 field: the checks start from the f32.
+        const auto root = topHalf(value, tn, t_.objects[obj]);
+        attempt(leaves, where, [&] { return reachedExactly(root, nullptr, expected(n, r, c, false)); });
         bool body = false, stored = true;
         for (const auto& a : tn.args) body |= a.body, stored &= !a.body || t_.nodes[a.ref].out.has_value();
-        if (body && stored) attempt(cuts, where, [&] { return reachedExactly(value, &n, expected(n, r, c, true)); });
-        roleChecks(n, value, r, c);
+        if (body && stored) attempt(cuts, where, [&] { return reachedExactly(root, &n, expected(n, r, c, true)); });
+        roleChecks(n, root, r, c);
       }
     }
     // The checker's bindings: each must be one the reference found (above); their roles.
@@ -2510,8 +2569,11 @@ class Reference {
       }
     }
     if (!ignored) return true;
-    // A float's own bits with only low mantissa bits ignored: a rounding toward zero to a narrower
-    // float (sign and exponent kept), numerics inside the atom.
+    // An and with a fixed mask on a float's own bits that ignores only low mantissa bits: the
+    // float rounded toward zero in its own format (an and keeps each bit in place), numerics
+    // inside the atom. Any other operation (a shift moves the kept bits) is not a rounding.
+    const auto* andop = dynamic_cast<const v::BinaryOp*>(&op);
+    if (!andop || andop->opcode() != v::BinaryOpcode::BitAnd || !word(xs[1 - q])) return false;
     // Follow same-width bitcasts down to a float.
     std::optional<v::Value> f = res(xs[q]);
     for (unsigned n = 0; f && n < 16 && g_.type(*f).element().kind() != v::ElementKind::Floating; ++n) {
@@ -2530,6 +2592,68 @@ class Reference {
     unsigned kept = 0;  // the high bits no flip ignores
     while (kept < ow && !(ignored >> (ow - 1 - kept) & 1)) ++kept;
     return ignored == wmask(ow - kept) && kept >= 1 + exponent;
+  }
+  // The f32 whose bf16 rounding toward zero `value` is, else value: the reference's own reading of
+  // a narrowing store. The object's element is bf16 (2 bytes; the node's store format bf16 or
+  // none) and the stored 16 bits, evaluated on the f32's bits as a free word, are its bits 16..31
+  // for every probe (one shift right by 16 under same-width bitcasts and integer resizes; every
+  // stored bit copies one f32 bit, so the probes decide it).
+  v::Value topHalf(const v::Value& value, const TermNode& tn, const Object& o) {
+    if (o.element != "bf16" || o.bytes != 2 || !(tn.store.empty() || tn.store == "bf16")) return value;
+    // Down the bit fragment to the one shift right by a word; its operand must be an f32's bits.
+    auto x = res(value);
+    for (unsigned n = 0; n < 8 && fragment(x); ++n) {
+        if (const auto& c = x.conversion()) { x = res(c->source); continue; }
+      const auto& op = g_.definingNode(x).operation();
+      const auto xs = g_.instanceOperands(x).toVector();
+      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+      if (!b) {
+        if ((dynamic_cast<const v::ConvertOp*>(&op) || dynamic_cast<const v::BitcastOp*>(&op)) && xs.size() == 1) { x = res(xs[0]); continue; }
+        return value;
+      }
+      if (b->opcode() != v::BinaryOpcode::ShiftRight || xs.size() != 2) return value;
+      // xs[0]: an f32 under same-width bitcasts.
+      std::optional<v::Value> f = res(xs[0]);
+      for (unsigned k = 0; f && k < 16 && g_.type(*f).element().kind() != v::ElementKind::Floating; ++k) {
+        const auto y = *f;
+        if (y.conversion() && y.conversion()->spec->kind == v::TypeConversionKind::Bitcast && y.indices().empty())
+          f = res(y.conversion()->source);
+        else if (!y.conversion() && y.indices().empty() && dynamic_cast<const v::BitcastOp*>(&g_.definingNode(y).operation()))
+          f = res(g_.instanceOperands(y).toVector().at(0));
+        else
+          f.reset();
+        if (f && widthOf(*f) != 32) f.reset();
+      }
+        if (!f || widthOf(*f) != 32 || g_.type(*f).element().toString() != "f32") return value;
+      // The stored word as a function of the f32's bits: bits 16..31 at every probe of xs[0].
+      // The fragment's one free value is a link of that bitcast chain (its bits are the f32's).
+      if (widthOf(res(value)) < 16) return value;
+      try {
+        std::vector<v::Value> fs;
+        frees(value, fs);
+        if (fs.size() != 1 || widthOf(fs[0]) != 32) return value;
+        bool link = false;
+        for (std::optional<v::Value> y = res(xs[0]); y && !link;) {
+          link = same(*y, fs[0]);
+          if (y->conversion() && y->conversion()->spec->kind == v::TypeConversionKind::Bitcast && y->indices().empty())
+            y = res(y->conversion()->source);
+          else if (!y->conversion() && y->indices().empty() && dynamic_cast<const v::BitcastOp*>(&g_.definingNode(*y).operation()))
+            y = res(g_.instanceOperands(*y).toVector().at(0));
+          else
+            y.reset();
+        }
+        if (!link) return value;
+        for (const std::uint64_t base : {std::uint64_t{0}, wmask(32)})
+          for (unsigned i = 0; i <= 32; ++i) {
+            const auto at = i < 32 ? base ^ (std::uint64_t{1} << i) : base;
+            if ((eval(value, fs, {at}) & 0xffff) != (at >> 16 & 0xffff)) return value;  // the store keeps the low 2 bytes
+          }
+      } catch (const Undecided&) {
+        return value;
+      }
+      return xs[0];
+    }
+    return value;
   }
   // Whether an integer product reads every varying bit of factor f, the other factor o not being a
   // word. Low half: f's bit i reaches the product exactly when o has fewer than w - i trailing
