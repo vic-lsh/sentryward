@@ -324,3 +324,45 @@ Stage A implementation choices (fork commit after 798dcbb):
   exact as `0 <= v < c` (or `v > c || v < 0`) when every negative value wraps above `c`.
 - Choice runs execute lane by lane with class mode off (lane atoms are per lane); k_feed's leaf
   takes about 95 s (was about 5 s).
+
+## Stage C: disjunctive facts as case splits (design, for review)
+
+Problem. A chosen branch's meaning is recorded only where it is a conjunction. An unsigned ordering
+of a value whose range crosses zero is exactly a disjunction: on 32 bits, `u(v) <u c` is
+`(v >= 0 && v < c) || (v < 0 && v + 2^32 < c)`. Compiled `k_conv` guards its unrolled loop with
+such a compare (`setp.gt.u32 p, lo - hi + 1, 0xFFFFFFFC`); its not-taken side is the fact that
+makes the loop's trip count provably nonnegative. Today it records nothing, so the loop is not
+summarized.
+
+Mechanism.
+- C1. Exact disjunctive terms. `CompareTerm`'s wrapped fallback (an unsigned ordering whose operand
+  `v` has range `[L, U]` with `-2^w <= L < 0 <= U < 2^w` and the other operand a known `c`) gives
+  the exact term `Or(And(v >= 0, v REL c), And(v < 0, v REL c - 2^w))`, simplified when a disjunct is
+  empty on `[L, U]` (today's rule is the case where the second disjunct is empty). Other forms are
+  unchanged.
+- C2. Cases. At a chosen branch, the asserted formula (term with the taken polarity) is put in
+  disjunctive normal form over its literals, at most 8 disjuncts (more: no fact, as today). One
+  disjunct: its literals are facts, as today. Several: the input's `fact_cases` (a list of
+  `{line, case}`) names the disjunct for that branch line; its literals are recorded. With no
+  entry for the line, the run stops with diagnostic `fact_disjunction` (details: line, `cases`, the
+  number of disjuncts), like `control_predicate_not_static`.
+- C3. Infeasible cases. A case whose facts contradict the run's other facts makes the fact set
+  unsat: the run reports result `infeasible_path` (the address model's consistency check proved
+  unsat; unknown is never reported as infeasible).
+
+Coverage. A case split is a choice like a branch choice: one case per line for every lane and
+visit, so leaves combine into a launch verdict under the same consumer condition (Coral
+`check_verdicts.py` `choice_tree_reason`: chosen lines in no CFG cycle, no cross-lane operation,
+no call). Each execution's lane satisfies one disjunct at each such branch, hence follows one leaf;
+an `infeasible_path` leaf stands for no execution and covers nothing that needs covering.
+
+Coral side. `run.py` expands `fact_disjunction` like a data branch, into one child per case
+(`fact_cases`), counted against the same depth and run budgets. `check_verdicts.py` accepts a leaf
+with result `infeasible_path` as covering no launch (a proved-unsat fact set), and counts
+`fact_cases` lines with the branch choice lines in `choice_tree_reason`.
+
+Tests (test-first). (1) The wrapped compare's two disjuncts each give their facts in their case;
+(2) k_conv's guard shape: case split lets the loop summarize and the leaf is contained (target);
+(3) control: a case whose facts contradict an earlier fact reports `infeasible_path`, not contained;
+(4) control: without `fact_cases` the run stops with `fact_disjunction`, never contained;
+(5) a disjunction with more than 8 disjuncts records nothing.
