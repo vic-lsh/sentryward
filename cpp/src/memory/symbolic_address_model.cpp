@@ -1076,6 +1076,47 @@ struct SymbolicAddressModel::Impl {
     return result;
   }
 
+  // WindowForm (relation-by-base): the exact form c + S x t + a(m). The frontend writes a lookup
+  // term only for an exact value (bounded execution keeps a truncation or sign extension only when
+  // the atom's premise range fits both widths); here every member must carry the same single term,
+  // the same width and the footprint's allocation, and the bounds must keep the window exact.
+  std::optional<WindowForm> Window(const MemoryAccessFamily& family, const FamilyFootprint& footprint) {
+    if (error || family.count == 0 || !footprint.affine || footprint.empty || !footprint.region_axes.empty() ||
+        footprint.bytes == 0 || !KnownSpace(footprint.space) || footprint.allocation.empty() || !footprint.alias.empty() ||
+        !family.first.bytes || *family.first.bytes != footprint.bytes)
+      return std::nullopt;
+    const auto shape = [&](const MemoryAccess& access) -> const Shape* {
+      const auto* id = std::get_if<AddressId>(&access.address);
+      if (!id) return nullptr;
+      const auto found = binding_shapes.find(id->value());
+      return found == binding_shapes.end() ? nullptr : &shapes[found->second];
+    };
+    const auto* first = shape(family.first);
+    if (!first || first->base != Base::kAllocation || first->absent || first->region_bytes || !first->offset ||
+        first->alias_scope != 0 || names[first->space] != footprint.space || names[first->identity] != footprint.allocation ||
+        first->offset->terms.size() != 1)
+      return std::nullopt;
+    const auto [atom, stride] = first->offset->terms.front();
+    if (stride <= 0 || atoms[atom].gather.empty()) return std::nullopt;
+    // Atom invariance and full widths over every member (Footprint checks the progression).
+    for (std::size_t k = 1; k < family.count; ++k) {
+      const auto access = family.at(family.first_member + k);
+      const auto* current = shape(access);
+      if (!current || current->base != first->base || current->identity != first->identity ||
+          current->space != first->space || current->alias_scope != 0 || current->absent || current->region_bytes ||
+          !current->offset || current->offset->terms != first->offset->terms || access.bytes != family.first.bytes)
+        return std::nullopt;
+    }
+    const auto [lower, upper] = BoundsOf(atom);
+    if (!lower || !upper || *lower < 0 || *upper < *lower) return std::nullopt;
+    const auto [lo, hi] = FootprintSpan(family, footprint);
+    if (lo < 0 || hi > stride) return std::nullopt;
+    const auto top = Checked(stride, *upper, true);
+    const auto end = top ? Checked(*top, hi, false) : std::nullopt;
+    if (!end || *end >= (Int(1) << 63)) return std::nullopt;
+    return WindowForm{atoms[atom].key, stride, *lower, *upper};
+  }
+
   // A family footprint as one shape: its lowest member's offset plus the lookups, and the
   // progression as one region axis. Nullopt when it is not affine or has a non-lookup suffix.
   std::optional<Shape> FamilyShape(const MemoryAccessFamily& family, const FamilyFootprint& footprint) {
@@ -1198,6 +1239,10 @@ OverlapResult SymbolicAddressModel::translatedFamilyOverlap(const MemoryAccessFa
   auto sa=impl_->FamilyShape(a,x),sb=impl_->FamilyShape(b,y);
   if(!sa || !sb)return OverlapResult::Unknown("family footprint is not an affine lookup form","translated_family_unsupported");
   return impl_->Decide(*sa,x.bytes,*sb,y.bytes);
+}
+std::optional<WindowForm> SymbolicAddressModel::windowForm(const MemoryAccessFamily& family,
+                                                         const FamilyFootprint& footprint) {
+  return impl_->Window(family, footprint);
 }
 const ConstantAddressModel& SymbolicAddressModel::constantModel() const noexcept { return impl_->constants; }
 std::unique_ptr<MemoryConflictCandidates> SymbolicAddressModel::conflictCandidatesWithExemptions(

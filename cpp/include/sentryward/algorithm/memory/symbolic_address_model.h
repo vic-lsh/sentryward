@@ -140,6 +140,11 @@ class SymbolicAddressModel final : public MemoryModel {
   // bindings. Unknown when either footprint has another suffix or is not affine.
   [[nodiscard]] OverlapResult translatedFamilyOverlap(const MemoryAccessFamily& a, const FamilyFootprint& x,
                                                       const MemoryAccessFamily& b, const FamilyFootprint& y) override;
+  // A family on one resolved allocation without alias scope whose members' offsets have one
+  // tensor-property lookup term S x t (the same atom and S > 0 for every member, all of one width),
+  // the atom with both premise bounds and 0 <= lower; the footprint's span within [0, S) and
+  // S x upper + span < 2^63, in checked 128-bit arithmetic. Otherwise null.
+  [[nodiscard]] std::optional<WindowForm> windowForm(const MemoryAccessFamily&, const FamilyFootprint&) override;
   // Footprint containment. `extent_bytes` null: only the touched interval is computed. Shapes the
   // address model cannot express (unresolved allocation, TMA regions, non-affine offsets) are
   // kUnknown, never kContained. Symbolic offsets are decided by the address solver over the

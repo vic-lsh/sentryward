@@ -122,6 +122,15 @@ inline std::pair<address_solver::Int,address_solver::Int> FootprintSpan(const Me
       b=footprint.offset+footprint.step*I(family.first_member+family.count-1);
   return {std::min(a,b),std::max(a,b)+I(footprint.bytes)};
 }
+// A family whose every member's offset is c + S x t + a(m) (docs/design/relation-by-base.md): `t`
+// one integer atom (canonical key `atom`), the same for every member, within its premise bounds
+// [lower, upper] (0 <= lower); `stride` S > 0; c + a(m) is the footprint's offset and step, and every
+// member's bytes lie in [0, S) of the window [S t, S (t + 1)). The value is exact: S x upper plus the
+// span is below 2^63, so the 64-bit address never wraps.
+struct WindowForm {
+  std::string atom;
+  address_solver::Int stride=0,lower=0,upper=0;
+};
 // A differing symbolic suffix remains Unknown; equal suffixes cancel exactly.
 struct FamilyOverlap {
   std::vector<MemberRelation> overlap,unknown;

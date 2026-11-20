@@ -49,6 +49,12 @@ class MemoryModel {
                                   "translated_family_unsupported");
   }
 
+  // The window form of a family with footprint `footprint` (WindowForm), or null: then the
+  // family is not related by its base and keeps the existing path.
+  [[nodiscard]] virtual std::optional<WindowForm> windowForm(const MemoryAccessFamily&, const FamilyFootprint&) {
+    return std::nullopt;
+  }
+
   [[nodiscard]] virtual std::optional<MemoryAnalysisError> validate() const {
     return std::nullopt;
   }
