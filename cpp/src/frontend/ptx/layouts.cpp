@@ -1104,6 +1104,7 @@ RegisterTable::RegisterTable(const Module &module, const Function &function) {
         }
         if (!declarations_.emplace(key, identity).second)
           Fail("duplicate register declaration in one lexical scope");
+        ++declaration_counts_[reg];
         widths_[identity] = width;
       }
     }

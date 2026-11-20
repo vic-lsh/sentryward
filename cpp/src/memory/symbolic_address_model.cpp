@@ -820,7 +820,6 @@ struct SymbolicAddressModel::Impl {
 
   // ---- Footprint containment ----
 
-  // The interval of an affine offset over the declared atom bounds (nullopt when an atom is unbounded).
   // An atom whose only constraint is its symbol's own bounds (both given).
   bool BoxOnly(AtomId atom) const {
     const auto& a = atoms[atom];
@@ -835,6 +834,17 @@ struct SymbolicAddressModel::Impl {
       if (std::find(group.begin(), group.end(), a.gather) != group.end()) return false;
     return true;
   }
+  // An atom of `offset` with empty bounds (lower > upper): no valuation exists, so no hull-based
+  // verdict may be drawn from it (the solver path reports the unsatisfiable environment).
+  bool EmptyBounds(const Affine& offset) const {
+    for (const auto& [atom, ignored] : offset.terms) {
+      (void)ignored;
+      const auto [lower, upper] = BoundsOf(atom);
+      if (lower && upper && *lower > *upper) return true;
+    }
+    return false;
+  }
+  // The interval of an affine offset over the declared atom bounds (nullopt when an atom is unbounded).
   std::optional<std::pair<Int, Int>> Hull(const Affine& offset) const {
     Int low = offset.constant, high = offset.constant;
     for (const auto& [atom, coefficient] : offset.terms) {
@@ -872,7 +882,7 @@ struct SymbolicAddressModel::Impl {
     if (!access.bytes) return unknown("access width is unknown");
     const Int width = Int(*access.bytes);
     const Affine& offset = *shape.offset;
-    const auto hull = Hull(offset);
+    const auto hull = EmptyBounds(offset) ? std::nullopt : Hull(offset);
     if (hull) {
       verdict.min_byte = Clamp(hull->first);
       verdict.max_byte_exclusive = Clamp(hull->second + width);

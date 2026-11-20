@@ -223,8 +223,15 @@ public:
     return it->second;
   }
 
+  // The name is declared in exactly one lexical scope of the function: every use names it.
+  [[nodiscard]] bool DeclaredOnce(std::string_view name) const {
+    const auto it = declaration_counts_.find(std::string(name));
+    return it != declaration_counts_.end() && it->second == 1;
+  }
+
 private:
   std::unordered_map<std::string, std::string> declarations_;
   std::unordered_map<std::string, std::uint32_t> widths_;
+  std::unordered_map<std::string, std::uint32_t> declaration_counts_;
 };
 } // namespace sentryward::frontend::ptx
