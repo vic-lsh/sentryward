@@ -1502,6 +1502,13 @@ private:
 
   std::optional<std::pair<std::uint32_t, Integer>>
   Assertion(const Instruction &, std::uint32_t) const;
+  // Branch-path condition: a user choice that decided an unknown predicate at `pc` (its value
+  // `truth`) bounds the register the predicate compares with a known integer, on this lane's
+  // path from the branch on (see the definition).
+  void RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth, State &s, std::uint32_t warp,
+                   std::uint32_t lane, std::uint64_t visit) const;
+  // The index of the `setp` RefineGuard reads for the branch at `pc`, when it has that shape.
+  std::optional<std::uint32_t> GuardCompare(std::uint32_t pc, std::uint32_t predicate) const;
   State Initial(const WarpContract &, std::uint32_t) const;
   Scalar Value(const Operand &o, const State &s) const {
     return o.reg == kMissing ? o.constant
@@ -1846,6 +1853,79 @@ void Executor::Prepare() {
 }
 // Build a basic-block CFG once per executor. Dominators use immediate-parent
 // chains, rather than a quadratic matrix over PTX instructions.
+// Branch-path conditions. A user choice (branch_decisions) decides a branch whose predicate the
+// fixed input does not determine; every lane that reaches it on this path takes that outcome, so
+// the predicate's value holds from the branch on. When the predicate is `setp.<cmp>.<int type> p,
+// a, b` earlier in the branch's basic block, with one operand an unknown register and the other a
+// known integer and neither register written in between, the unknown register is bounded by the
+// comparison's outcome (an exact value in a range, like a tensor-property element), so a read
+// guarded by it is checked against the guard. Only ranges inside [0, 2^(w-1)) are used (signed
+// and unsigned readings of the register agree there); eq/ne and other shapes are left unknown.
+// The identity names this lane's visit, so no two values share it.
+std::optional<std::uint32_t> Executor::GuardCompare(std::uint32_t pc, std::uint32_t predicate) const {
+  PrepareControl();
+  if (control_irreducible_ || pc >= control_block_for_pc_.size()) return {};
+  const auto block = control_block_for_pc_[pc];
+  for (std::uint32_t k = pc; k-- > 0;) {
+    if (control_block_for_pc_[k] != block) return {};
+    const auto &e = decoded_[k];
+    if (std::find(e.destinations.begin(), e.destinations.end(), predicate) == e.destinations.end()) continue;
+    const auto &in = *e.instruction;
+    if (in.opcode != "setp" || in.predicate || e.destinations.size() != 1 || e.operands.size() != 3) return {};
+    if (!(Has(in, "u32") || Has(in, "s32") || Has(in, "u64") || Has(in, "s64"))) return {};
+    if (!(Has(in, "lt") || Has(in, "le") || Has(in, "gt") || Has(in, "ge") || Has(in, "lo") || Has(in, "ls") ||
+          Has(in, "hi") || Has(in, "hs"))) return {};
+    const auto &a = e.operands[1], &b = e.operands[2];
+    for (auto j = k + 1; j < pc; ++j)
+      for (auto r : decoded_[j].destinations)
+        if ((a.reg != kMissing && r == a.reg) || (b.reg != kMissing && r == b.reg)) return {};
+    return k;
+  }
+  return {};
+}
+void Executor::RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth, State &s, std::uint32_t warp,
+                           std::uint32_t lane, std::uint64_t visit) const {
+  const auto at = GuardCompare(pc, predicate);
+  if (!at) return;
+  {
+    const auto &e = decoded_[*at];
+    const auto &in = *e.instruction;
+    unsigned width = 0;
+    bool sign = false;
+    for (const auto &[type, w, sg] : {std::tuple{"u32", 32u, false}, std::tuple{"s32", 32u, true},
+                                      std::tuple{"u64", 64u, false}, std::tuple{"s64", 64u, true}})
+      if (Has(in, type)) { width = w; sign = sg; }
+    std::string cmp;
+    for (const auto *c : {"lt", "le", "gt", "ge", "lo", "ls", "hi", "hs"})
+      if (Has(in, c)) cmp = c;
+    const auto &a = e.operands[1], &b = e.operands[2];
+    const Scalar va = Value(a, s), vb = Value(b, s);
+    // x cmp c, with x the unknown register; a constant on the left mirrors the comparison.
+    const bool left = Unknown(va) && a.reg != kMissing;
+    if (!(left ? Unknown(va) && ScalarInteger(vb) : Unknown(vb) && b.reg != kMissing && ScalarInteger(va))) return;
+    const auto reg = left ? a.reg : b.reg;
+    const Integer c = *ScalarInteger(left ? vb : va);
+    if (cmp == "lo") cmp = "lt"; else if (cmp == "ls") cmp = "le"; else if (cmp == "hi") cmp = "gt"; else if (cmp == "hs") cmp = "ge";
+    if (!left) cmp = cmp == "lt" ? "gt" : cmp == "le" ? "ge" : cmp == "gt" ? "lt" : "le";
+    if (!truth) cmp = cmp == "lt" ? "ge" : cmp == "le" ? "gt" : cmp == "gt" ? "le" : "lt";
+    const Integer low = sign ? -(Integer(1) << (width - 1)) : Integer(0);
+    const Integer high = (Integer(1) << (width - unsigned(sign))) - 1;
+    Integer lower = low, upper = high;
+    if (cmp == "lt") upper = c - 1; else if (cmp == "le") upper = c;
+    else if (cmp == "gt") lower = c + 1; else lower = c;
+    if (lower < 0 || upper >= (Integer(1) << (width - 1)) || upper < lower) return;
+    std::string cta;
+    for (const char *axis : {"%ctaid.x", "%ctaid.y", "%ctaid.z"})
+      if (const auto id = ids_.find(axis); id != ids_.end())
+        if (const auto n = ScalarInteger(s.registers[id->second])) cta += n->str() + ",";
+    // An element function of its own (an atom with these bounds), so pointer arithmetic on it
+    // keeps an affine offset that the footprint check bounds.
+    auto identity = "path:" + std::to_string(decoded_[pc].instruction->line) + ":" + cta + std::to_string(warp) +
+                    ":" + std::to_string(lane) + ":" + std::to_string(visit);
+    ElementAtom atom{"path_condition", (sign ? "s" : "u") + std::to_string(width), Integer(0), identity, lower, upper};
+    s.registers[reg] = MakeBounded(lower, upper, std::move(identity), {}, AffineForm{Integer(0), {{std::move(atom), Integer(1)}}});
+  }
+}
 void Executor::PrepareControl() const {
   if (control_ready_)
     return;
@@ -3686,6 +3766,8 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
         Error(i, warp.warp_id, lane,
               "known predicate disagrees with fixed-input branch contract");
       auto taken = supplied ? supplied : predicate;
+      if (override && !bound && !predicate && d.predicate != kMissing && taken)
+        RefineGuard(pc, d.predicate, *taken != i.predicate_negated, state, warp.warp_id, lane, visit);
       if (!taken && d.predicate != kMissing && target > pc + 1)
         if (const auto *arm = MergedArmAt(pc); arm && (!arm->aligned || arm->uniform)) {
           // Two-arm merge: this lane runs the fall-through arm (the superset arm); the arm's
@@ -4647,7 +4729,12 @@ TemplateTask Executor::RunTemplateTask(SharedExecution* runtime) {
             if(i.control=="direct_branch") {
               const auto supplied=c_.BranchOutcome(i.line,members[t].warp,members[t].lane,group.state.branch_visits[group.pc]);
               if(supplied && truth && *supplied!=*truth)static_choice_lines_.insert(i.line);
-              else if(supplied)truth=supplied;
+              else if(supplied) {
+                // A user choice on an unknown predicate that bounds a register (RefineGuard) runs
+                // per lane: the bound is this lane's.
+                if(!truth && d.predicate!=kMissing && GuardCompare(group.pc,d.predicate))throw TemplateFallback{};
+                truth=supplied;
+              }
             }
             if(!truth)unknown.push_back(t);
             else (*truth?yes:no).push_back(t);
