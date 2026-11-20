@@ -1627,7 +1627,8 @@ private:
   // Starts a summary at the test `pc` of an eligible loop: nullopt refuses (the lane stops as
   // before); a summary with no iteration (trip count 0) exits at once.
   std::optional<LoopSummary> StartSummary(const LoopPlan &plan, std::uint32_t pc, State &s, std::uint32_t warp,
-                                          std::uint32_t lane, std::uint64_t visit, LaneTrace &trace) const;
+                                          std::uint32_t lane, std::uint64_t visit, LaneTrace &trace,
+                                          std::string &why) const;
   void RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace) const;
   // This lane's CTA coordinates, as text for an atom identity.
   std::string CtaText(const State &s) const;
@@ -2387,11 +2388,12 @@ std::pair<Integer, Integer> AffineHull(const AffineForm &f) {
 }  // namespace
 std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan, std::uint32_t pc, State &s,
                                                             std::uint32_t warp, std::uint32_t lane,
-                                                            std::uint64_t visit, LaneTrace &trace) const {
+                                                            std::uint64_t visit, LaneTrace &trace,
+                                                            std::string &why) const {
   const Scalar v0 = s.registers[plan.test_iv];
   const Scalar n = plan.bound.reg == kMissing ? plan.bound.constant : s.registers[plan.bound.reg];
   const auto fv = AffineOf(v0), fn = AffineOf(n);
-  if (!fv || !fn) return std::nullopt;
+  if (!fv || !fn) { why = "summary_value_not_affine"; return std::nullopt; }
   // Exact comparison: both values in one window of 2^width (as CompareTerm for ne).
   const auto window = [&](bool sg) {
     const Integer low = sg ? -(Integer(1) << (plan.test_width - 1)) : Integer(0);
@@ -2399,18 +2401,18 @@ std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan
     const auto ra = AffineRange(*fv, s), rb = AffineRange(*fn, s);
     return ra && rb && low <= ra->first && ra->second <= high && low <= rb->first && rb->second <= high;
   };
-  if (!window(false) && !window(true)) return std::nullopt;
+  if (!window(false) && !window(true)) { why = "summary_compare_not_exact"; return std::nullopt; }
   const Integer step = plan.steps.at(plan.test_iv);
   // T = (n - v0) / step, exact: every coefficient and the constant divisible by the step.
   const AffineForm difference = AffineSum(*fn, *fv, Integer(-1));
-  if (difference.constant % step != 0) return std::nullopt;
+  if (difference.constant % step != 0) { why = "summary_trips_not_divisible"; return std::nullopt; }
   AffineForm trips{difference.constant / step, {}};
   for (const auto &[atom, c] : difference.terms) {
-    if (c % step != 0) return std::nullopt;
+    if (c % step != 0) { why = "summary_trips_not_divisible"; return std::nullopt; }
     trips.terms.emplace_back(atom, c / step);
   }
   const auto trange = AffineRange(trips, s);
-  if (!trange) return std::nullopt;
+  if (!trange) { why = "summary_trips_unbounded"; return std::nullopt; }
   auto [tl, th] = *trange;
   // T >= 0 for every entry state (else the counter could pass the bound and wrap): from the
   // interval, or from a recorded fact G >= 0 with T = G + d for a constant d >= 0.
@@ -2427,7 +2429,7 @@ std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan
     for (const auto &g : s.nonnegative)
       if (same_terms(g, trips) && trips.constant - g.constant >= 0) { tl = trips.constant - g.constant; break; }
   }
-  if (tl < 0) return std::nullopt;
+  if (tl < 0) { why = "summary_trips_sign_unproved"; return std::nullopt; }
   LoopSummary summary{pc, plan.exit_pc, plan.carried, {}};
   if (th == 0) return summary;  // no iteration: exit now with the current values
   const std::string ident = std::to_string(pc) + ":" + CtaText(s) + std::to_string(warp) + ":" +
@@ -2437,7 +2439,7 @@ std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan
   {
     AffineForm local = AffineSum(trips, AffineForm{Integer(1), {{k, Integer(1)}}}, Integer(-1));
     const auto json = FactTermJson(local);
-    if (!json) return std::nullopt;
+    if (!json) { why = "summary_fact_out_of_range"; return std::nullopt; }
     trace.path_facts.push_back(Json{{"term", *json}, {"lower_bound", 0},
         {"scope", algorithm::TensorPropertyFunctionSymbol(k.object, k.element_type, k.function)}}.dump());
   }
@@ -2468,7 +2470,7 @@ std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan
       if (pt) summary.exit_values[r] = *pt;
     }
   }
-  if (!start.contains(plan.test_iv)) return std::nullopt;
+  if (!start.contains(plan.test_iv)) { why = "summary_test_iv_wraps"; return std::nullopt; }
   for (const auto r : plan.carried) {
     s.registers[r] = start.contains(r) ? start.at(r) : Scalar{};
     s.pred_terms.erase(r);
@@ -3569,14 +3571,18 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
       const auto *bx = std::get_if<BoundedInteger>(&x);
       const Integer modulus = Integer(1) << *width;
       if (c && bx && (*bx)->affine && FitsType(*bx, *width, false)) {
-        const Integer mask = ((*c % modulus) + modulus) % modulus;  // the unsigned bit pattern
-        const Integer low_bits = modulus - mask;                    // 2^m for a high mask
+        // Only the bits below 2^b matter when 0 <= x < 2^b: x & M == x & (M mod 2^b), so a mask
+        // whose low b bits are 2^b - 2^m (such as 0x7FFFFFFC on a value below 2^31) is x & -2^m.
+        unsigned bits = 0;
+        while (bits < *width && (Integer(1) << bits) <= (*bx)->upper) ++bits;
+        const Integer window = Integer(1) << bits;
+        const Integer mask = ((*c % modulus) + modulus) % modulus % window;  // the bits that matter
         std::optional<unsigned> m;
         bool high = false;
-        for (unsigned k = 1; k < *width; ++k) {
+        for (unsigned k = 1; k < bits; ++k) {
           const Integer p = Integer(1) << k;
           if (mask == p - 1) { m = k; high = false; }
-          if (low_bits == p) { m = k; high = true; }
+          if (mask == window - p) { m = k; high = true; }
         }
         if (m) {
           const Integer p = Integer(1) << *m;
@@ -4473,9 +4479,12 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
           refusal != region_store_refusals_.end())
         throw ExecutionError("lifted_region_local_store", i.line,
                              "The data-dependent forward region of this branch holds a " + refusal->second);
-      if (!taken && path_facts_ && !state.summarizing && d.predicate != kMissing)
-        if (const auto &plan = PlanLoop(pc); plan.ok)
-          if (auto started = StartSummary(plan, pc, state, warp.warp_id, lane, visit, trace)) {
+      std::string not_summarized;
+      if (!taken && path_facts_ && !state.summarizing && d.predicate != kMissing) {
+        const auto &plan = PlanLoop(pc);
+        if (plan.refusal != "not_a_computation_loop") not_summarized = plan.refusal;
+        if (plan.ok)
+          if (auto started = StartSummary(plan, pc, state, warp.warp_id, lane, visit, trace, not_summarized)) {
             if (state.summarizing) {
               pc = plan.stay_pc;
               summary = std::move(started);
@@ -4484,6 +4493,18 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
             }
             continue;
           }
+      }
+      if (!taken && !not_summarized.empty()) {
+        // The stop names why the loop was not summarized (the code stays branch_not_static, so a
+        // choice tree still expands it).
+        try { UnresolvedControl(i, state, trace, d.predicate); }
+        catch (ExecutionError &error) {
+          if (error.code == "branch_not_static")
+            throw ExecutionError(error.code, i.line, "control predicate is not statically determined; loop not summarized: " +
+                                 not_summarized, error.required_parameters);
+          throw;
+        }
+      }
       if (!taken)
         UnresolvedControl(i, state, trace, d.predicate);
       auto occurrence = state.occurrences[pc]++;
