@@ -1,0 +1,136 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "k_feed",
+ "launch": {
+  "grid_dim": [
+   2048,
+   1,
+   1
+  ],
+  "block_dim": [
+   256,
+   1,
+   1
+  ],
+  "dynamic_shared_bytes": 0
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "hdr"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "feed"
+  },
+  {
+   "parameter": 2,
+   "type": "pointer",
+   "space": "global",
+   "object": "next_tok"
+  },
+  {
+   "parameter": 3,
+   "type": "pointer",
+   "space": "global",
+   "object": "meta"
+  }
+ ],
+ "arguments": [
+  {
+   "parameter": 4,
+   "type": "u32",
+   "value": 8
+  },
+  {
+   "parameter": 5,
+   "type": "u32",
+   "value": 2048
+  }
+ ],
+ "footprints": [
+  {
+   "object": "feed",
+   "direction": "read",
+   "extent_bytes": 8192,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 2048,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "hdr",
+   "direction": "read",
+   "extent_bytes": 16,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 1,
+     "stride": 16,
+     "period": 16,
+     "count": 1,
+     "width": 16,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "meta",
+   "direction": "readwrite",
+   "extent_bytes": 32800,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 1,
+     "stride": 32800,
+     "period": 32800,
+     "count": 1,
+     "width": 32800,
+     "direction": "readwrite"
+    }
+   ]
+  },
+  {
+   "object": "next_tok",
+   "direction": "read",
+   "extent_bytes": 32,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "read"
+    }
+   ]
+  }
+ ],
+ "footprint_reads": "noninterference",
+ "branch_decisions": [
+  {
+   "line": 1825,
+   "taken": false
+  },
+  {
+   "line": 1832,
+   "taken": false
+  },
+  {
+   "line": 1836,
+   "taken": false
+  }
+ ]
+}

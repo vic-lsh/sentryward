@@ -122,6 +122,22 @@ class FootprintNativeTest(unittest.TestCase):
         (reads,) = r["frontend_assumptions"]["field_reads"]
         self.assertEqual(reads["max_elements_per_cta"], 2)
 
+    # Branch-path conditions (k_feed: meta[8 + 4 t] = w - 1 < slots ? next_tok[w - 1] : NONE, with
+    # w = feed[t] loaded data). On the path that takes none of the three exits, the read of
+    # next_tok[w - 1] is under the guard w - 1 < slots (slots = 8, next_tok 32 bytes): contained.
+    def test_path_condition_bounds_guarded_read(self):
+        r = run("feed", "feed_guarded_read")
+        fp = self.footprint(r)
+        self.assertEqual(r["result"], "race_free")
+        self.assertEqual((fp["writes"], fp["reads"]), ("contained", "contained"))
+
+    # The same path with the guard weakened to w - 1 <= slots: next_tok[slots] is read.
+    def test_path_condition_off_by_one_guard_reads_outside(self):
+        r = run("feed_guard_off_by_one", "feed_guarded_read")
+        fp = self.footprint(r)
+        self.assertEqual(fp["reads"], "not_contained")
+        self.assertEqual(fp["outside_reads"][0]["object"], "next_tok")
+
 
 if __name__ == "__main__":
     unittest.main()
