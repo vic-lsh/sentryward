@@ -102,5 +102,13 @@ class StructuralNativeTest(unittest.TestCase):
         r = run("sel_neg_component", "sel", "handwritten")
         self.assertEqual((r["result"], r["reason"]), ("refused", "primitive_operands"))
 
+    def test_partial_stored_read_refused(self):
+        # Round-5 reproducer: P stores (a & 0xffff) | (b & 0xffff0000); C reads P's low half, so y
+        # ignores b. A read of part of a stored value is refused (its bytes' dependencies are not
+        # tracked), not credited with all of the value's leaves.
+        r = run("pack", "pack", "pack")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "partial_stored_read"))
+
+
 if __name__ == "__main__":
     unittest.main()

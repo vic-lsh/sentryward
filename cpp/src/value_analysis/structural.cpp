@@ -398,7 +398,18 @@ class Checker {
       if (initial_only) return std::nullopt;
       if (!x.indices().empty()) unsupported("load_component", "a component of a reassembled read");
       const auto piece = [&](const ReinterpretedRead& p) -> Set {
-        if (const auto* s = std::get_if<v::Value>(&p.source)) return leaves(*s);  // conservative: all of it
+        if (const auto* s = std::get_if<v::Value>(&p.source)) {
+          // A piece of a stored value: exact only when it is all of the value's bits (a same-width
+          // reinterpretation keeps every bit, so every leaf). A part of the value depends on the
+          // value's bytes, which this check does not track: crediting all its leaves could hide a
+          // missing dependency (a pack of a's low half and b's high half, read back as the low
+          // half, depends on a only).
+          if (p.byte_offset != 0 || p.type.bitSize() != g_.type(*s).bitSize())
+            refuse("partial_stored_read", "a read of part of a stored value (its per-byte dependencies are not decided)",
+                   {{"node", key.node}, {"instance", key.instance}, {"byte_offset", p.byte_offset},
+                    {"bits", p.type.bitSize()}, {"stored_bits", g_.type(*s).bitSize()}});
+          return leaves(*s);
+        }
         const auto& i = std::get<InitialMemorySymbol>(p.source);
         return regionLeaves(i.region.allocation, i.region.offset + p.byte_offset, p.type.bitSize() / 8);
       };
