@@ -1,8 +1,8 @@
 # Relational path conditions and loop summaries for footprint containment
 
-Status: design, revision 4, for review before implementation (Coral D253 follow-up 3). Fork branch
+Status: design, revision 5, for review before implementation (Coral D253 follow-up 3). Fork branch
 `claude/sw-loop-summaries`, based on `claude/sw-path-conds` (bfcdd5a). Revision 1 drew R1..R10
-(Codex review 1); revision 2 drew S1..S6 (Codex re-check). Each is cited where it is addressed.
+(Codex review 1); revision 2 drew S1..S6 (re-check 1); revision 3 drew T1..T6 (re-check 2). Each is cited where it is addressed.
 
 Footprint containment only: every load and store of a launch stays inside its object's declared
 bytes. Race freedom is never claimed from anything here.
@@ -71,33 +71,54 @@ model adds to every query, plus local sets only on accesses of summarized loop i
 
 ### A1. Symbolic integer terms
 
-An integer register's value, when not a known integer, is an exact term: the atoms the frontend
-already makes (tensor-property elements, path atoms, CTA/thread coordinates as integers), combined
-by `add`, `sub`, `mul` by a constant, `shl` by a constant, `neg`, `cvt` between integer types, and
-masks. Every term is evaluated with its machine width: the term denotes `v mod 2^w` (with the
-signed reading where an instruction reads it signed), encoded exactly with Z3 integer `mod`, so no
-wrap assumption is needed for constraints (S4 for stage A). A mask `x & -2^m` or `x & (2^m - 1)`
-introduces a quotient atom `q` with `x' = 2^m q + r`, `0 <= r < 2^m` (`x'` the `w`-bit value of `x`),
-and denotes `2^m q` or `r`. Any other operation (other bit ops, division, min/max, select on an
-unknown predicate) yields an unknown, as today.
+An integer register's value, when not a known integer, is an exact term over atoms (tensor-property
+elements, lane atoms of loaded values, path and iteration atoms, coordinates). Each operation is a
+width-indexed transformation of unsigned residues; `u_w(v) = v mod 2^w` and the signed reading
+`s_w(v) = u_w(v) - 2^w` when `u_w(v) >= 2^(w-1)`, else `u_w(v)` (T5):
+
+| PTX | term |
+| --- | --- |
+| `add/sub.<t>w` | `u_w(a +/- b)` |
+| `mul.lo.<t>w` by a known constant `c` | `u_w(a * c)` |
+| `mul.wide.<u/s>w` by a known constant | `u_2w(r_w(a) * c)`, `r_w` = `u_w` for `.u`, `s_w` for `.s` |
+| `shl.b<w>` by a known count `c` | `u_w(a * 2^c)` for `c < w`; `0` for `c >= w` (PTX clamps the count) |
+| `neg.s<w>` | `u_w(-a)` |
+| `cvt.<dst>.<src>` | widening: `u_dst(r_src(a))` (`r` = `s_src` when the source type is signed: sign extension, else `u_src`: zero extension); narrowing: `u_dst(a)` |
+| `and.b<w>` with `-2^m` / `2^m - 1` (`m < w`) | quotient atom `q`, remainder atom `r`, facts `u_w(a) = 2^m q + r`, `0 <= r < 2^m`, `0 <= q < 2^(w-m)`; the term is `2^m q` / `r` |
+| `mov`, `cvta` of an integer | unchanged |
+
+`setp.<cmp>.<t>w a, b` compares `r_w(a)` and `r_w(b)` at its own width and signedness (`r_w` as
+above), so a term wider than the comparison is read at the comparison's width. Any other operation
+(other bit ops, division, min/max, `selp` on an unknown predicate, carry chains) yields an unknown, as
+today. Each table row gets a boundary control (sign extension of `0xffffffff`, a shift by `w`, a
+mask of a value already reduced mod `2^w`).
 
 ### A2. Recording decided branches
 
-When a lane takes a branch whose predicate is unknown, by a user choice (`branch_decisions`), the
-predicate's defining expression is recorded with the taken polarity: `setp.<cmp>.<int type>` of two
-terms (all integer comparisons, `eq`/`ne` included, signedness from the type), and `and/or/xor/not`
-`.pred` of such predicates, followed through registers within the lane's trace (the definition the
-branch reads, found by the trace's origins, not by name: no scope ambiguity). A predicate with any
-unknown leaf records nothing (sound: fewer constraints). Predicated non-branch instructions whose
-predicate is unknown keep today's handling.
+Predicate terms are built when the defining instruction executes, from its operand values, not
+reconstructed from the trace afterwards (T4: trace origins forward through `cvt` and `mov` and lose
+extensions). A `setp.<cmp>.<int type>` whose result is unknown and whose operands are terms (or
+known) gives its destination predicate the term `cmp(r_w(a), r_w(b))`; a complement destination
+(`p|q`) gets the negation; `and/or/xor/not.pred` combine the terms of their operands; any other
+definition (a predicate loaded, moved through an integer, or combined with an unknown) has no term.
+Predicate terms live in the lane state beside the register values and are overwritten with them.
+
+When a lane takes a branch on an unknown predicate by a user choice (`branch_decisions`), the
+branch's predicate term, with the taken polarity, is recorded as a global fact. No term: nothing is
+recorded (sound: fewer facts). The template executor falls back to per-lane execution before every
+chosen branch whose predicate is unknown (not only `GuardCompare`'s shape), so each lane's term is
+its own. A later visit of the same line records its own fact; contradictory visits make the fact set
+unsat, which reports `infeasible_path` (never a pass).
 
 `RefineGuard` becomes a special case and is deleted when stage A lands (no old rule beside the
 general one); its tests stay and must pass on stage A.
 
 ### A3. Soundness
 
-A choice tree's leaf fixes one outcome per branch line for every lane (unchanged consumer condition
-in Coral's `check_verdicts.py`). A concrete execution that follows the leaf's outcomes satisfies, at
+A choice tree's leaf fixes one outcome per branch line for every lane and visit. Coral's consumer
+condition (`check_verdicts.py` `choice_tree_reason`: every chosen line a branch in no CFG cycle, no
+cross-lane operation, no call) still decides whether a set of leaves covers a launch; facts do not
+relax it. A concrete execution that follows the leaf's outcomes satisfies, at
 each access, every recorded formula, because each formula is the exact machine meaning of the
 predicate the lane branched on. So it is an instance of the access under its constraints.
 
@@ -109,12 +130,14 @@ predicate the lane branched on. So it is an instance of the access under its con
   (pre-test or post-test), whose only exit is its test; no `ret`, `exit`, `trap`, nested loop or call.
 - The iteration CFG (`L` without the backedge) is acyclic and has no conditional branch other than
   the exit test (S6). A predicated instruction in `L` is allowed only if its predicate is defined
-  outside `L` (loop-invariant), except memory instructions, which are recorded as executed
-  (conservative: an access that may not happen is still checked).
+  outside `L` (loop-invariant). If that predicate is known for the lane, the instruction runs as
+  today. If it is unknown, its access (if any) is recorded as possibly executed and every destination
+  is havocked, which covers both the executed value and the old value (T1).
 - No barrier, atomic or reduction, async copy or TMA, warp or CTA collective, `membar`/`fence`,
   `mbarrier`, shared load or store, or `.local` store in `L` (R5, R6).
 - Global stores in `L` only through pointers whose provenance is an object whose footprint is
   write-only and that no load of the launch reads (by provenance) (R6).
+- Every global load in `L` is from an object covered by the immutability premise (B5).
 - Register discovery covers every destination, including vector, packed and predicate
   destinations; a register name declared in more than one lexical scope, or a write the decoder
   does not list as a destination, refuses (R4).
@@ -149,10 +172,20 @@ Trip count `T` (body executions) is an integer atom with constraints, never a di
 - pre-test: `T >= 0`, `P(j)` for `j < T` and `!P(T)`; with `P` monotone (proved: the IV moves toward
   `n` under the comparison's direction), this is `T >= 0 && (T == 0 || P(T - 1)) && !P(T)`;
 - post-test: `T >= 1`, `(T == 1 || P(T - 2))` and `!P(T - 1)` likewise;
-- `ne`: refused unless the solver proves `imm != 0`, `(n - x0)` an exact multiple of `imm` with
-  quotient `>= 0` in the test's phase; then the equality form `imm * T' == n - x0` (with `T'` the
-  `U` at the hitting test, `T = T'` pre-test or `T' + 1` post-test per phase) is used, and only then
-  (S2). Monotone progress without wrap makes that test the first hit.
+- `ne`: refused unless the solver proves `imm != 0` and `(n - x0)` an exact multiple of `imm` with
+  quotient `T' >= 0`, where `T'` is the number of updates when the test first sees `x0 + imm*T' = n`.
+  Then `imm * T' = n - x0` (equality, used only here, S2) and, by case (T3):
+  pre-test (update after the test, B2): `T = T'`; post-test with a post-update test: `T = T'` and
+  `T' >= 1` required; post-test with a pre-update test: `T = T' + 1`. Monotone progress without wrap
+  makes that test the first hit.
+
+Existence (T6): before `T` is added, the solver proves, for every entry state satisfying the global
+facts and atom bounds, that the closed-form count `T*` of the case (relational: `max(0, ceil((n -
+x0) / imm))` adjusted for `le/ge` and post-test, as an integer function; `ne`: `(n - x0) / imm`)
+satisfies `T`'s definition and the no-wrap condition below. A loop whose entry states admit no such
+`T*` (a wrapping or nonterminating machine loop) refuses; `T`'s facts never make a feasible entry
+state infeasible. Control: a loop whose mathematical trip-count constraints are unsat for a
+reachable entry state refuses, rather than reporting `infeasible_path`.
 
 No wrap (S1, S4): the solver proves, under the facts recorded so far and `T`'s facts, that
 for every executed update (pre-test: `U` in `[0, T]`, the final failing header visit included;
@@ -179,19 +212,25 @@ The template executor falls back to per-lane execution before grouping any instr
 
 ### B5. Memory the loop reads (R6, S5)
 
-The argument needs: a value the frontend models for a global load in `L` (an unknown, a
-tensor-property atom, a pointer-table value) holds at every iteration. Global objects in this
-frontend are either modeled by value (configured inputs, pointer arrays, tensor properties, which
-`ValidateConstantInputs` validates as constant against writes it can resolve) or not modeled (a load
-gives an unknown, which covers any value). Claim, by induction over the concrete execution's writes
-in order: if the footprint verdict is `contained`, then no write lands outside its object, so no
-write lands in a modeled read-only object; at the first write that would, all earlier modeled
-values were correct, so the analysis represents that write soundly and reports it outside (or as an
-unresolved or undeclared-object violation, which unresolved and generic writes already are), and
-the verdict is not `contained`. Hence a `contained` verdict implies the modeled values held. Stage
-B adds one check: a global load in `L` from an object some write of the launch (by provenance) also
-writes refuses the loop. Coral's inputs declare every object a kernel writes (`footprints`), and the
-pointer contract is `distinct_objects_noalias`; both are input facts, reported in the verdict.
+The argument needs: a value the frontend models for a global load in `L` (a tensor-property atom, a
+pointer-table value, a configured input) holds at every iteration. Containment does not establish
+this (T2: a `readwrite` object can be overwritten within its bytes, and a wrongly modeled earlier
+read can misplace the first clobbering write). It is a premise instead: **modeled inputs are
+immutable during the launch**. SentryWard's input already states it for configured inputs (the
+fixed-read-only caller contract, `public_input_memory.cpp`), and Coral's generator emits premises
+only for images no kernel writes (its formats are read-only metadata checked before the step).
+Stage B makes the premise explicit and narrow:
+
+- a summarized loop may load only from objects declared `read` (not `readwrite` or `write`) in the
+  input's footprints, and a load in `L` from any other object refuses the loop;
+- the verdict lists the premise (`frontend_assumptions.modeled_inputs_immutable`, with the objects a
+  summarized loop read), so the consumer states it;
+- unmodeled loads (an unknown or a fresh lane atom) need no premise: their values are unconstrained
+  by the analysis except through recorded facts, which are about the value actually loaded.
+
+Coral side: the premise is the same one its tensor-property premises already rest on (the monitor
+checks each image before the step and no kernel writes it); `check_verdicts.py` must accept a
+footprint verdict with `modeled_inputs_immutable` only for objects whose declaration is read-only.
 
 ### B6. Output and consumer contract
 
@@ -207,7 +246,7 @@ Fix a concrete execution following the leaf's choices, a lane and its iteration 
 `j < T` for body and latch accesses and `j <= T` for pre-test header accesses, and every IV equals
 `x0 + imm*U(j)` at each program point (one unpredicated literal-step update per iteration, no wrap).
 Other registers at iteration start take some value of their type (havoc). The iteration's path is
-the unique path of the branch-free iteration CFG. Memory it reads holds its modeled values (B5), no
+the unique path of the branch-free iteration CFG. Memory it reads holds its modeled values (B5, by the immutability premise), no
 shared or local state is involved, and no cross-lane operation is in `L`. So each concrete access is
 an instance of a recorded access under its constraints. After the loop, exported IVs are exact and
 the rest havocked, over-approximating every exit state.
