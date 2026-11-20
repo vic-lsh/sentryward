@@ -154,12 +154,14 @@ not wrap. Unknown or failed: refuse.
 
 ### B4. Summary execution (per lane)
 
-1. Make an iteration atom `k >= 0` (identity: header line, CTA, warp, lane, visit) and the trip-count
-   atom `T`, with `T`'s facts added to the run's fact set.
-2. Header prefix (test block before the exit branch): executed with IVs at `U = k`, constraint
-   `0 <= k <= T` (pre-test: it also runs on the failing visit) (R8).
-3. Body and latch: IVs at their `U` per program point, constraint `0 <= k < T`, other carried
-   registers havocked.
+1. Make the trip-count atom `T` and an iteration atom `k` (identity: header line, CTA, warp, lane,
+   visit), with `T`'s facts and `0 <= k < T` added to the run's fact set.
+2. One iteration `k` (facts `0 <= k < T`): the header prefix (test block before the exit branch),
+   then the body and latch, IVs at their `U` per program point, other carried registers havocked
+   at iteration start. One atom covers the whole iteration, so values the prefix computes flow into
+   the body consistently (R8).
+3. Pre-test only, the final failing visit: the header prefix once more with every IV at `U = T` and
+   other carried registers havocked; its accesses are checked; then the exit edge.
 4. Exit: each IV at `x0 + imm*U_exit` (`U_exit = T`), exact by the no-wrap proof (which covers it);
    any IV the proof does not cover is havocked instead (S4). Every other carried register havocked.
    `T`'s facts stay in the fact set, so a remainder loop starting from the main loop's exit counter
