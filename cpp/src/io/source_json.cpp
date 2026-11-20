@@ -1600,7 +1600,7 @@ std::string Analyze(Input&& source, bool verify, MemoryRaceOptions memory_option
         bind_accesses(events);
         model = std::make_unique<SymbolicAddressModel>(
             input.addresses, input.address_invariants_json, input.address_solver, 4096,
-            input.tensor_properties_json);
+            input.tensor_properties_json, input.field_relations_json);
         ReportAddressMemory(model->constantModel(), "memory.address_model");
         if (const auto error = model->validate()) Fail(error->message);
       }

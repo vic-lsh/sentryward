@@ -130,6 +130,10 @@ inline std::pair<address_solver::Int,address_solver::Int> FootprintSpan(const Me
 struct WindowForm {
   std::string atom;
   address_solver::Int stride=0,lower=0,upper=0;
+  // The atom's lookup symbol and its one argument, the element's byte offset (empty `gather`
+  // when the lookup has another arity).
+  std::string gather;
+  address_solver::Int arg=0;
 };
 // A differing symbolic suffix remains Unknown; equal suffixes cancel exactly.
 struct FamilyOverlap {

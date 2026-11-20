@@ -38,6 +38,7 @@ size at parameter 1. Change the ABI and launch to match the actual PTX.
 | `assumptions` | Optional Boolean overrides of the [named analysis assumptions](input-json.md#assumptions) |
 | `address_invariants` | Optional trusted address constraints; see [forms and semantics](assumptions.md#address-invariants) |
 | `tensor_properties` | Optional trusted element properties of input objects; see [Tensor properties](#tensor-properties) |
+| `field_relations` | Optional trusted relations between fields of input objects; see [Field relations](#field-relations) |
 | `footprints` | Optional declared extent and access direction per input object, checked against every access; see [Footprints](#footprints) |
 | `data_branch_loop_iterations` | Optional positive iteration bound for loops under `bounded_computation_loops`; default 4; does not itself enable that assumption |
 
@@ -216,6 +217,32 @@ A load over several candidate elements counts each. A caller that splits a field
 (one input per case, every element in that case) covers a launch whose elements mix the cases only
 when this is at most 1: each CTA then reads one element, so its accesses are those of the case that
 element is in.
+
+## Field relations
+
+`field_relations` (optional, trusted, not checked) relates fields of input objects. The one kind
+is `distinct_rows`:
+
+```json
+"field_relations": [{"kind": "distinct_rows",
+  "write": {"object": "dst_tab", "offset": 0, "stride": 64, "count": 2, "bits": 64},
+  "read":  {"object": "src_tab", "offset": 0, "stride": 8,  "count": 2, "bits": 64}}]
+```
+
+A field is the 64-bit words at byte `offset + k*stride`, `k < count` (row `k`) of its object;
+`bits` is optional and must be 64. For rows `i != j`: `write[i] != write[j]` and
+`write[i] != read[j]`. Same-row pairs and two read rows are unrelated. Refused: another kind or
+width, an offset or stride not a multiple of 8, a zero stride or count, unequal counts, a word
+ending past byte 2^63, an unknown object, and an object without 64-bit `tensor_properties` (the
+objects' read-only contract: a launch writing one is refused with `constant_input_modified`).
+
+The family memory checker uses a relation where two access families on one allocation are each
+`c + S*t + a(m)` with one table word `t` per family (relation by base): when their words are rows
+`i != j` as above, the words differ and the windows `[S*t, S*(t+1))` are disjoint, so no member
+pair of the two families can share a byte. Any other case is decided as without the relation.
+The result counts such family pairs (`memory_analysis.family_analysis.distinct_row_relations`)
+and lists the relations under `frontend_assumptions.field_relations`.
+See [the design note](design/distinct-rows.md).
 
 ## Footprints
 

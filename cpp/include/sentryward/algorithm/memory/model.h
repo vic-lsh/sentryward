@@ -55,6 +55,10 @@ class MemoryModel {
     return std::nullopt;
   }
 
+  // True only when a trusted field relation (docs/design/distinct-rows.md) makes the two window
+  // forms' atoms unequal at every valuation; false keeps the relation-by-base rule unchanged.
+  [[nodiscard]] virtual bool distinctRows(const WindowForm&, const WindowForm&) const { return false; }
+
   [[nodiscard]] virtual std::optional<MemoryAnalysisError> validate() const {
     return std::nullopt;
   }

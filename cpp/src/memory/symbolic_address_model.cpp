@@ -217,12 +217,23 @@ struct SymbolicAddressModel::Impl {
   std::set<std::string> pinned_gathers;
   std::vector<std::vector<std::string>> joint_injective;
   std::set<std::pair<NameId, NameId>> distinct_allocations;
+  // distinct_rows relations (docs/design/distinct-rows.md): fields of 64-bit words of input
+  // objects; for rows i != j < count, write[i] != write[j] and write[i] != read[j].
+  struct RowField final {
+    std::string object;
+    std::uint64_t offset = 0, stride = 0, count = 0;
+  };
+  struct DistinctRows final {
+    RowField write, read;
+  };
+  std::vector<DistinctRows> distinct_rows;
 
   std::list<std::pair<PairKey, OverlapResult>> lru;
   std::unordered_map<PairKey, decltype(lru)::iterator, PairHash> cache;
 
   Impl(const std::vector<ConstantAddressBinding>& bindings, std::string_view invariants,
-       SymbolicSolverOptions solver_options, std::size_t cache_capacity, std::string_view tensor_properties)
+       SymbolicSolverOptions solver_options, std::size_t cache_capacity, std::string_view tensor_properties,
+       std::string_view field_relations)
       : constants(bindings, cache_capacity), options(solver_options),
         solver(address_solver::MakeSolver()), capacity(cache_capacity) {
     error = constants.validate();
@@ -251,6 +262,25 @@ struct SymbolicAddressModel::Impl {
         auto& policy = gather_policies[symbol];
         policy.injective = policy.injective || property.value("injective", false);
         Tighten(policy.lower, policy.upper, property);
+      }
+      // The input parser validated each relation (kind, 64-bit words, multiples of 8, one count,
+      // in range); recheck the shape so a malformed record is an error, never a relation.
+      for (const auto& relation : Json::parse(field_relations)) {
+        if (relation.at("kind").get<std::string>() != "distinct_rows")
+          throw std::invalid_argument("unknown field relation kind");
+        const auto field = [](const Json& f) {
+          RowField result{f.at("object").get<std::string>(), f.at("offset").get<std::uint64_t>(),
+                          f.at("stride").get<std::uint64_t>(), f.at("count").get<std::uint64_t>()};
+          if (f.value("bits", 64U) != 64U || result.stride == 0 || result.count == 0 || result.offset % 8 ||
+              result.stride % 8 ||
+              Int(result.offset) + Int(result.stride) * Int(result.count - 1) + 8 > (Int(1) << 63))
+            throw std::invalid_argument("malformed distinct_rows field");
+          return result;
+        };
+        DistinctRows rows{field(relation.at("write")), field(relation.at("read"))};
+        if (rows.write.count != rows.read.count)
+          throw std::invalid_argument("distinct_rows fields with different counts");
+        distinct_rows.push_back(std::move(rows));
       }
       for (const auto& binding : bindings) {
         const auto shape = InternShape(ParseBinding(binding));
@@ -1114,7 +1144,43 @@ struct SymbolicAddressModel::Impl {
     const auto top = Checked(stride, *upper, true);
     const auto end = top ? Checked(*top, hi, false) : std::nullopt;
     if (!end || *end >= (Int(1) << 63)) return std::nullopt;
-    return WindowForm{atoms[atom].key, stride, *lower, *upper};
+    WindowForm form{atoms[atom].key, stride, *lower, *upper};
+    if (atoms[atom].args.size() == 1) {
+      form.gather = atoms[atom].gather;
+      form.arg = atoms[atom].args.front();
+    }
+    return form;
+  }
+
+  // Row k of `field` when the form's atom is the lookup of the 64-bit element at byte
+  // field.offset + k * field.stride (k < field.count) of the field's object: a tensor-property
+  // lookup (TensorPropertySymbol, element type u64 or s64) whose object is the field's.
+  std::optional<Int> RowOf(const RowField& field, const WindowForm& form) const {
+    if (form.gather.empty()) return std::nullopt;
+    const auto parsed = ParseTensorPropertySymbol(form.gather);
+    if (!parsed || parsed->first != field.object || (parsed->second != "u64" && parsed->second != "s64"))
+      return std::nullopt;
+    const auto object = gather_objects.find(form.gather);
+    if (object == gather_objects.end() || object->second != field.object) return std::nullopt;
+    if (form.arg < Int(field.offset)) return std::nullopt;
+    const Int relative = form.arg - Int(field.offset);
+    if (relative % Int(field.stride) != 0) return std::nullopt;
+    const Int row = relative / Int(field.stride);
+    if (row >= Int(field.count)) return std::nullopt;
+    return row;
+  }
+
+  // t1 != t2 by a relation: one atom is write row i, the other write row j or read row j, i != j.
+  bool Distinct(const WindowForm& a, const WindowForm& b) const {
+    const auto separated = [&](const DistinctRows& relation, const WindowForm& x, const WindowForm& y) {
+      const auto i = RowOf(relation.write, x);
+      if (!i) return false;
+      const auto w = RowOf(relation.write, y), r = RowOf(relation.read, y);
+      return (w && *w != *i) || (r && *r != *i);
+    };
+    return std::any_of(distinct_rows.begin(), distinct_rows.end(), [&](const DistinctRows& relation) {
+      return separated(relation, a, b) || separated(relation, b, a);
+    });
   }
 
   // A family footprint as one shape: its lowest member's offset plus the lookups, and the
@@ -1191,8 +1257,10 @@ SymbolicAddressModel::SymbolicAddressModel(const std::vector<ConstantAddressBind
                                            std::string_view address_invariants,
                                            SymbolicSolverOptions solver,
                                            std::size_t cache_capacity,
-                                           std::string_view tensor_properties)
-    : impl_(std::make_unique<Impl>(bindings, address_invariants, solver, cache_capacity, tensor_properties)) {}
+                                           std::string_view tensor_properties,
+                                           std::string_view field_relations)
+    : impl_(std::make_unique<Impl>(bindings, address_invariants, solver, cache_capacity, tensor_properties,
+                                   field_relations)) {}
 SymbolicAddressModel::~SymbolicAddressModel() = default;
 SymbolicAddressModel::SymbolicAddressModel(SymbolicAddressModel&&) noexcept = default;
 SymbolicAddressModel& SymbolicAddressModel::operator=(SymbolicAddressModel&&) noexcept = default;
@@ -1243,6 +1311,9 @@ OverlapResult SymbolicAddressModel::translatedFamilyOverlap(const MemoryAccessFa
 std::optional<WindowForm> SymbolicAddressModel::windowForm(const MemoryAccessFamily& family,
                                                          const FamilyFootprint& footprint) {
   return impl_->Window(family, footprint);
+}
+bool SymbolicAddressModel::distinctRows(const WindowForm& a, const WindowForm& b) const {
+  return impl_->Distinct(a, b);
 }
 const ConstantAddressModel& SymbolicAddressModel::constantModel() const noexcept { return impl_->constants; }
 std::unique_ptr<MemoryConflictCandidates> SymbolicAddressModel::conflictCandidatesWithExemptions(

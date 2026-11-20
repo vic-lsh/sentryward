@@ -104,11 +104,13 @@ class SymbolicAddressModel final : public MemoryModel {
   // `address_invariants` is a JSON array of Gamma constraints (default empty).
   // `tensor_properties` are normalized input records (object, element_type, lower_bound,
   // upper_bound, injective); they bound the TensorPropertySymbol lookups (default none).
+  // `field_relations` are the input's distinct_rows relations (docs/design/distinct-rows.md).
   explicit SymbolicAddressModel(const std::vector<ConstantAddressBinding>& bindings,
                                 std::string_view address_invariants = "[]",
                                 SymbolicSolverOptions solver = {},
                                 std::size_t cache_capacity = 4096,
-                                std::string_view tensor_properties = "[]");
+                                std::string_view tensor_properties = "[]",
+                                std::string_view field_relations = "[]");
   ~SymbolicAddressModel() override;
   SymbolicAddressModel(SymbolicAddressModel&&) noexcept;
   SymbolicAddressModel& operator=(SymbolicAddressModel&&) noexcept;
@@ -145,6 +147,9 @@ class SymbolicAddressModel final : public MemoryModel {
   // the atom with both premise bounds and 0 <= lower; the footprint's span within [0, S) and
   // S x upper + span < 2^63, in checked 128-bit arithmetic. Otherwise null.
   [[nodiscard]] std::optional<WindowForm> windowForm(const MemoryAccessFamily&, const FamilyFootprint&) override;
+  // True when a distinct_rows relation makes the two forms' atoms rows i != j of its write field,
+  // or row i of its write field and row j of its read field (either order): then t1 != t2.
+  [[nodiscard]] bool distinctRows(const WindowForm&, const WindowForm&) const override;
   // Footprint containment. `extent_bytes` null: only the touched interval is computed. Shapes the
   // address model cannot express (unresolved allocation, TMA regions, non-affine offsets) are
   // kUnknown, never kContained. Symbolic offsets are decided by the address solver over the

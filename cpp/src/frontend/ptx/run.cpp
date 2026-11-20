@@ -1512,6 +1512,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         input_metadata["frontend_assumptions"]["tensor_property_decisions"] = Json::array();
         input_metadata["frontend_assumptions"]["field_reads"] = Json::array();
       }
+      if (config.fixed_input.contains("field_relation_contract"))
+        input_metadata["frontend_assumptions"]["field_relations"] = config.fixed_input["field_relation_contract"];
       const ptx::Function *function = nullptr;
       const bool explicit_prefix = config.entry.starts_with("prefix:");
       const auto selector =
@@ -2042,6 +2044,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
                    {"objects", footprints}, {"reads", config.raw.value("footprint_reads", Json("containment"))}}.dump();
         tensor_property_inputs = config.fixed_input.value("tensor_property_inputs", Json::array());
         lowered.artifact.tensor_properties_json = tensor_property_inputs.dump();
+        lowered.artifact.field_relations_json = config.raw.value("field_relations", Json::array()).dump();
         metadata["executed_records"] = records;
         const auto assumptions =
             config.raw.value("semantic_assumptions", Json::object());

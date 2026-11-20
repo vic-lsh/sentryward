@@ -407,6 +407,28 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
     if (JsonInteger(record["lower_bound"]) > JsonInteger(record["upper_bound"]))
       Fail("inconsistent_tensor_property", path, "the object's bounds are contradictory");
   }
+  // Field relations name input objects whose tensor_properties are 64-bit: their words are then
+  // lookups of exact elements, and the read-only contract of tensor_properties refuses a launch
+  // that writes them (constant_input_modified), so a relation always holds over the launch.
+  const Json field_relations = input.value("field_relations", Json::array());
+  for (std::size_t n = 0; n < field_relations.size(); ++n)
+    for (const auto *side : {"write", "read"}) {
+      const auto path = "$.field_relations[" + std::to_string(n) + "]." + side + ".object";
+      const auto object = field_relations[n][side]["object"].get<std::string>();
+      if (!object_resources.contains(object))
+        Fail("unknown_field_relation_object", path,
+             "no input object has this name (names come from pointer and tensor_map declarations)");
+      bool typed = false;
+      for (const auto &[key, record] : tensor_properties) {
+        (void)key;
+        if (record["object"] != object) continue;
+        if (!record["element_type"].get<std::string>().ends_with("64"))
+          Fail("invalid_field_relation", path, "the object's tensor_properties are not 64-bit words");
+        typed = true;
+      }
+      if (!typed)
+        Fail("invalid_field_relation", path, "the object has no tensor_properties (needed for its read-only contract)");
+    }
   // Footprint declarations name input objects (same names as tensor_properties).
   const Json footprints = input.value("footprints", Json::array());
   for (std::size_t n = 0; n < footprints.size(); ++n)
@@ -420,7 +442,7 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
       {"opaque_tensor_maps", opaque}, {"parameter_field_types", types}, {"input_objects", objects},
       {"null_pointer_fields", null_fields}, {"semantic_assumptions", supplied.fields.value("assumptions", Json::object())},
       {"address_invariants", supplied.fields.value("address_invariants", Json::array())},
-      {"footprints", footprints}, {"footprint_reads", input.value("footprint_reads", Json("containment"))},
+      {"footprints", footprints}, {"field_relations", field_relations}, {"footprint_reads", input.value("footprint_reads", Json("containment"))},
       {"data_branch_loop_iterations", supplied.fields.value("data_branch_loop_iterations", Json(4))},
       {"elect_lane", options.elect_lane}, {"max_steps_per_lane", options.max_steps_per_thread},
       {"compress_compute", options.compress_compute},
@@ -474,6 +496,12 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
                         : "Elements of these objects satisfy the stated bounds and injectivity (trusted, not checked); the objects are not written during the analyzed execution."},
         {"properties", input["tensor_properties"]}, {"regions", regions_out}};
   }
+  if (!field_relations.empty())
+    raw["fixed_input"]["field_relation_contract"] = {
+        {"kind", "trusted_relation"}, {"origin", "field_relations"},
+        {"text", "For rows i != j of each distinct_rows relation, write[i] != write[j] and write[i] != read[j] "
+                 "(trusted, not checked); its objects have tensor_properties and are not written during the analyzed execution."},
+        {"relations", field_relations}};
   auto result = ParseConfig(raw);
   result.tma_descriptors = descriptors; result.raw["tma_descriptors"] = descriptors;
   for (auto &[name,region] : result.parameter_regions) { (void)name; region.source = {{"kind", "typed_fields"}}; }

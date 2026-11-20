@@ -142,7 +142,7 @@ void TensorMaps(Json &root) {
 } // namespace
 
 KernelInput ParseKernelInput(const Json &value) {
-  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints", "footprint_reads"}, "$");
+  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "field_relations", "footprints", "footprint_reads"}, "$");
   if (value.value("schema", Json()) != "spverify.kernel-input/v1")
     Fail("invalid_schema", "$.schema", "expected spverify.kernel-input/v1");
   Json root = value;
@@ -356,6 +356,43 @@ KernelInput ParseKernelInput(const Json &value) {
     if ((property == "injective") == t.contains("value"))
       Fail("invalid_tensor_property", path + ".value", property == "injective" ? "injective takes no value" : "a bound requires a value");
     if (t.contains("value")) Scalar(t["value"], type.get<std::string>(), path + ".value");
+  }
+  // Relations between fields of input objects (trusted, docs/design/distinct-rows.md). The one
+  // kind, distinct_rows: `write` and `read` are fields of 64-bit words, the words at byte offset
+  // + k*stride, k < count, of their object; for rows i != j, write[i] != write[j] and
+  // write[i] != read[j]. Both fields have one count; every word lies below byte 2^63.
+  if (root.contains("field_relations")) {
+    Array(root["field_relations"], "$.field_relations");
+    for (std::size_t i = 0; i < root["field_relations"].size(); ++i) {
+      auto &r = root["field_relations"][i];
+      const auto path = ItemPath("field_relations", i);
+      Object(r, {"kind", "write", "read"}, path);
+      if (r.value("kind", Json()) != "distinct_rows")
+        Fail("invalid_field_relation", path + ".kind", "expected distinct_rows");
+      std::uint64_t counts[2] = {0, 0};
+      for (int side = 0; side < 2; ++side) {
+        const std::string name = side ? "read" : "write";
+        if (!r.contains(name)) Fail("invalid_field_relation", path + "." + name, "a distinct_rows relation needs write and read fields");
+        auto &f = r[name];
+        const auto field = path + "." + name;
+        Object(f, {"object", "offset", "stride", "count", "bits"}, field);
+        String(f.value("object", Json()), field + ".object");
+        if (f.contains("bits") && Natural(f["bits"], field + ".bits") != 64)
+          Fail("invalid_field_relation", field + ".bits", "distinct_rows relates 64-bit words");
+        f["bits"] = 64;
+        const auto offset = Natural(f.value("offset", Json()), field + ".offset");
+        const auto stride = Natural(f.value("stride", Json()), field + ".stride", 1);
+        const auto count = Natural(f.value("count", Json()), field + ".count", 1);
+        if (offset % 8 || stride % 8)
+          Fail("invalid_field_relation", field, "offset and stride must be multiples of the 8-byte word");
+        const unsigned __int128 end = (unsigned __int128)offset + (unsigned __int128)stride * (count - 1) + 8;
+        if (end > ((unsigned __int128)1 << 63))
+          Fail("invalid_field_relation", field, "the field's last word ends past byte 2^63");
+        counts[side] = count;
+      }
+      if (counts[0] != counts[1])
+        Fail("invalid_field_relation", path + ".read.count", "write and read fields must have one row count");
+    }
   }
   // Declared footprint of an input object (optional): the allocation extent and the access
   // direction the kernel's contract allows. Checked, not trusted, by the containment check.
