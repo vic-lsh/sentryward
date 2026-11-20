@@ -496,6 +496,9 @@ class Checker {
     if (x.conversion()) return transLeaves(x.conversion()->source, depth + 1);
     const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
     const bool plain = x.indices().empty() && !x.pointer();
+    // A cut value (an inner node's bound output) ends the path: what lies below it is the
+    // producer's, whose own roles cover its inputs.
+    if (plain && stop_.count(key)) return {};
     if (plain)
       if (auto it = trans_memo_.find(key); it != trans_memo_.end()) return *it->second;
     const auto& node = g_.definingNode(x);
@@ -598,14 +601,29 @@ class Checker {
     return s;
   }
 
-  // Role sets of opaque node m over its value `root` (m at outer pattern `at`).
+  // The cut elements of body argument k of node m (the producer's bound output elements it reads)
+  // at outer pattern `at`, output element (r, c).
+  Set argCut(std::size_t m, std::size_t k, const Pattern& at, std::uint64_t r, std::uint64_t c) const {
+    const auto& a = t_.nodes[m].args[k];
+    std::vector<SpacePattern> ps;
+    for (const auto& p : a.reads) ps.push_back({t_.objects.size() + a.ref, compose(p, at)});
+    return materialize(ps, r, c);
+  }
+
+  // Role sets of opaque node m over its value `root` (m at outer pattern `at`). A transcendental
+  // role is a fact about the paths from the argument's value to m's output: for an input argument
+  // from its loads, for a body argument from the node bound to its producer's output, so those
+  // roles run on `boundary` (this term's cut checker: inner nodes' stored values are leaves and
+  // end each path). A body argument with a transcendental role and no stored, bound output fails.
+  // Addend and Multiplicand keep their independence condition over the argument's leaves.
   void checkRoles(std::size_t m, const v::Value& root, const Pattern& at, std::uint64_t r, std::uint64_t c,
-                  const Json& where) {
+                  const Json& where, Checker* boundary = nullptr) {
     const auto& tn = t_.nodes[m];
     if (tn.primitive) return;
     std::optional<Set> through;
     for (std::size_t k = 0; k < tn.args.size(); ++k) {
       if (tn.roles[k].empty()) continue;
+      const auto& arg = tn.args[k];
       const auto e = argLeaves(m, k, at, r, c);
       for (const auto role : tn.roles[k]) {
         Set reached;
@@ -614,12 +632,21 @@ class Checker {
         Memo memo;
         switch (role) {
           case RoleKind::ThroughTranscendental:
-          case RoleKind::AvoidsTranscendental:
-            if (!through) through = transLeaves(root);
-            reached = *through;
-            ok = role == RoleKind::ThroughTranscendental ? unite(reached, e) == reached : disjoint(reached, e);
+          case RoleKind::AvoidsTranscendental: {
             name = role == RoleKind::ThroughTranscendental ? "through_transcendental" : "avoids_transcendental";
+            Checker& on = boundary ? *boundary : *this;
+            if (arg.body && (!boundary || !t_.nodes[arg.ref].out)) {
+              auto d = where;
+              d["argument"] = k;
+              d["role"] = name;
+              refuse("role_boundary", "a body argument's role needs its producer's output bound to a stored node", d);
+            }
+            const auto ek = arg.body ? argCut(m, k, at, r, c) : e;
+            if (!through) through = on.transLeaves(root);
+            reached = *through;
+            ok = role == RoleKind::ThroughTranscendental ? unite(reached, ek) == reached : disjoint(reached, ek);
             break;
+          }
           case RoleKind::Addend:
             reached = nonAddendLeaves(root, e, memo);
             ok = reached.empty();
@@ -990,7 +1017,8 @@ class Checker {
                 !(tn.commutative && matches(operands[1], 0) && matches(operands[0], 1)))
               refuse("primitive_operands", "the primitive's operands are not the term's operands in their formats", d);
           } else {
-            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
+            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where,
+                       has_body ? &cutter : nullptr);
           }
           // 3. Factorization.
           if (has_body && !tn.primitive) {
