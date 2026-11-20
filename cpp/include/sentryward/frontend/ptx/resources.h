@@ -459,6 +459,15 @@ private:
 // positions, kinds, slices and instructions, never their values: a value read's answer is copied).
 // AddressIds in BindingRead and AbsoluteCheck are the worker's table's: Replay maps them.
 // O(event size) per event both ways.
+// EventTape's record view, at namespace scope: GCC 12 rejects a nested struct with default member
+// initializers used in a type trait before its enclosing class is complete.
+struct EventTapeView {
+  RecordRef at;
+  std::vector<RegId> slice;
+  RecordKind kind = RecordKind::Full;
+  bool positioned = false;
+};
+
 class EventTape final : public QuerySink {
 public:
   void On(const QueryEvent &event, ConsumerTag consumer, bool in_slot, bool in_partition) noexcept override;
@@ -472,12 +481,7 @@ public:
   }
 
 private:
-  struct View {
-    RecordRef at;
-    std::vector<RegId> slice;
-    RecordKind kind = RecordKind::Full;
-    bool positioned = false;
-  };
+  using View = EventTapeView;
   struct ValueRead { View view; RegId reg; std::optional<Scalar> answer; };
   struct LegacyUniform { RecordRef leader; bool expanded; std::string name; std::optional<Integer> answer;
                          std::vector<LaneRef> members; };

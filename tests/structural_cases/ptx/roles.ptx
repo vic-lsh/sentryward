@@ -276,4 +276,182 @@
 	ret;
 
 }
+	// .globl	chain_pos
+.visible .entry chain_pos(
+	.param .u64 chain_pos_param_0,
+	.param .u64 chain_pos_param_1,
+	.param .u64 chain_pos_param_2,
+	.param .u64 chain_pos_param_3
+)
+{
+	.reg .f32 	%f<5>;
+	.reg .b32 	%r<2>;
+	.reg .b64 	%rd<14>;
+
+
+	ld.param.u64 	%rd1, [chain_pos_param_0];
+	ld.param.u64 	%rd2, [chain_pos_param_1];
+	ld.param.u64 	%rd3, [chain_pos_param_2];
+	ld.param.u64 	%rd4, [chain_pos_param_3];
+	cvta.to.global.u64 	%rd5, %rd4;
+	cvta.to.global.u64 	%rd6, %rd3;
+	cvta.to.global.u64 	%rd7, %rd2;
+	cvta.to.global.u64 	%rd8, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd9, %r1, 4;
+	add.s64 	%rd10, %rd8, %rd9;
+	ld.global.f32 	%f1, [%rd10];
+	fma.rn.f32 	%f2, %f1, %f1, 0f3F800000;
+	add.s64 	%rd11, %rd7, %rd9;
+	st.global.f32 	[%rd11], %f2;
+	add.f32 	%f3, %f2, %f2;
+	add.s64 	%rd12, %rd6, %rd9;
+	st.global.f32 	[%rd12], %f3;
+	mul.f32 	%f4, %f2, %f3;
+	add.s64 	%rd13, %rd5, %rd9;
+	st.global.f32 	[%rd13], %f4;
+	ret;
+
+}
+	// .globl	chain_neg_exp
+.visible .entry chain_neg_exp(
+	.param .u64 chain_neg_exp_param_0,
+	.param .u64 chain_neg_exp_param_1,
+	.param .u64 chain_neg_exp_param_2,
+	.param .u64 chain_neg_exp_param_3
+)
+{
+	.reg .f32 	%f<20>;
+	.reg .b32 	%r<4>;
+	.reg .b64 	%rd<14>;
+
+
+	ld.param.u64 	%rd1, [chain_neg_exp_param_0];
+	ld.param.u64 	%rd2, [chain_neg_exp_param_1];
+	ld.param.u64 	%rd3, [chain_neg_exp_param_2];
+	ld.param.u64 	%rd4, [chain_neg_exp_param_3];
+	cvta.to.global.u64 	%rd5, %rd4;
+	cvta.to.global.u64 	%rd6, %rd3;
+	cvta.to.global.u64 	%rd7, %rd2;
+	cvta.to.global.u64 	%rd8, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd9, %r1, 4;
+	add.s64 	%rd10, %rd8, %rd9;
+	ld.global.f32 	%f1, [%rd10];
+	fma.rn.f32 	%f2, %f1, %f1, 0f3F800000;
+	add.s64 	%rd11, %rd7, %rd9;
+	st.global.f32 	[%rd11], %f2;
+	mov.f32 	%f3, 0f3F000000;
+	mov.f32 	%f4, 0f3BBB989D;
+	fma.rn.f32 	%f5, %f2, %f4, %f3;
+	cvt.sat.f32.f32 	%f6, %f5;
+	mov.f32 	%f7, 0f4B400001;
+	mov.f32 	%f8, 0f437C0000;
+	fma.rm.f32 	%f9, %f6, %f8, %f7;
+	add.f32 	%f10, %f9, 0fCB40007F;
+	neg.f32 	%f11, %f10;
+	mov.f32 	%f12, 0f3FB8AA3B;
+	fma.rn.f32 	%f13, %f2, %f12, %f11;
+	mov.f32 	%f14, 0f32A57060;
+	fma.rn.f32 	%f15, %f2, %f14, %f13;
+	mov.b32 	%r2, %f9;
+	shl.b32 	%r3, %r2, 23;
+	mov.b32 	%f16, %r3;
+	ex2.approx.ftz.f32 	%f17, %f15;
+	mul.f32 	%f18, %f17, %f16;
+	add.s64 	%rd12, %rd6, %rd9;
+	st.global.f32 	[%rd12], %f18;
+	mul.f32 	%f19, %f2, %f18;
+	add.s64 	%rd13, %rd5, %rd9;
+	st.global.f32 	[%rd13], %f19;
+	ret;
+
+}
+	// .globl	unstored_neg_conv
+.visible .entry unstored_neg_conv(
+	.param .u64 unstored_neg_conv_param_0,
+	.param .u64 unstored_neg_conv_param_1,
+	.param .u64 unstored_neg_conv_param_2,
+	.param .u64 unstored_neg_conv_param_3,
+	.param .u64 unstored_neg_conv_param_4
+)
+{
+	.reg .b16 	%rs<3>;
+	.reg .f32 	%f<8>;
+	.reg .b32 	%r<2>;
+	.reg .b64 	%rd<17>;
+
+
+	ld.param.u64 	%rd1, [unstored_neg_conv_param_0];
+	ld.param.u64 	%rd2, [unstored_neg_conv_param_1];
+	ld.param.u64 	%rd3, [unstored_neg_conv_param_2];
+	ld.param.u64 	%rd4, [unstored_neg_conv_param_3];
+	ld.param.u64 	%rd5, [unstored_neg_conv_param_4];
+	cvta.to.global.u64 	%rd6, %rd5;
+	cvta.to.global.u64 	%rd7, %rd3;
+	cvta.to.global.u64 	%rd8, %rd4;
+	cvta.to.global.u64 	%rd9, %rd2;
+	cvta.to.global.u64 	%rd10, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd11, %r1, 4;
+	add.s64 	%rd12, %rd10, %rd11;
+	ld.global.f32 	%f3, [%rd12];
+	fma.rn.f32 	%f1, %f3, %f3, 0f3F800000;
+	add.s64 	%rd13, %rd9, %rd11;
+	ld.global.f32 	%f4, [%rd13];
+	add.f32 	%f5, %f4, %f1;
+	add.s64 	%rd14, %rd8, %rd11;
+	st.global.f32 	[%rd14], %f5;
+	// begin inline asm
+	{  cvt.rn.f16.f32 %rs1, %f1;}
+
+	// end inline asm
+	// begin inline asm
+	{  cvt.f32.f16 %f2, %rs1;}
+
+	// end inline asm
+	add.s64 	%rd15, %rd7, %rd11;
+	ld.global.f32 	%f6, [%rd15];
+	add.f32 	%f7, %f2, %f6;
+	add.s64 	%rd16, %rd6, %rd11;
+	st.global.f32 	[%rd16], %f7;
+	ret;
+
+}
+	// .globl	body_mult
+.visible .entry body_mult(
+	.param .u64 body_mult_param_0,
+	.param .u64 body_mult_param_1,
+	.param .u64 body_mult_param_2,
+	.param .u64 body_mult_param_3
+)
+{
+	.reg .f32 	%f<5>;
+	.reg .b32 	%r<2>;
+	.reg .b64 	%rd<14>;
+
+
+	ld.param.u64 	%rd1, [body_mult_param_0];
+	ld.param.u64 	%rd2, [body_mult_param_1];
+	ld.param.u64 	%rd3, [body_mult_param_2];
+	ld.param.u64 	%rd4, [body_mult_param_3];
+	cvta.to.global.u64 	%rd5, %rd4;
+	cvta.to.global.u64 	%rd6, %rd2;
+	cvta.to.global.u64 	%rd7, %rd3;
+	cvta.to.global.u64 	%rd8, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd9, %r1, 4;
+	add.s64 	%rd10, %rd8, %rd9;
+	ld.global.f32 	%f1, [%rd10];
+	fma.rn.f32 	%f2, %f1, %f1, 0f3F800000;
+	add.s64 	%rd11, %rd7, %rd9;
+	st.global.f32 	[%rd11], %f2;
+	add.s64 	%rd12, %rd6, %rd9;
+	ld.global.f32 	%f3, [%rd12];
+	mul.f32 	%f4, %f2, %f3;
+	add.s64 	%rd13, %rd5, %rd9;
+	st.global.f32 	[%rd13], %f4;
+	ret;
+
+}
 

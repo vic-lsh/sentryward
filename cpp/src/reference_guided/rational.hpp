@@ -445,10 +445,9 @@ public:
   template <RationalInteger Arg> friend bool operator<=(const Arg &b, const Rational &a) { return !a.operator<(b); }
   template <RationalOperand Arg> friend bool operator>=(const Rational &a, const Arg &b) { return !a.operator<(b); }
   template <RationalInteger Arg> friend bool operator>=(const Arg &b, const Rational &a) { return !a.operator>(b); }
-  template <RationalOperand Arg> friend bool operator!=(const Rational &a, const Arg &b) { return !a.operator==(b); }
-  template <RationalInteger Arg> friend bool operator!=(const Arg &b, const Rational &a) { return !a.operator==(b); }
   template <RationalInteger Arg> friend bool operator<(const Arg &b, const Rational &a) { return a.operator>(b); }
   template <RationalInteger Arg> friend bool operator>(const Arg &b, const Rational &a) { return a.operator<(b); }
+  // `!=` is the C++20 rewrite of `==` (explicit `!=` overloads made GCC 12 report `q != 0` ambiguous).
   template <RationalInteger Arg> friend bool operator==(const Arg &b, const Rational &a) { return a.operator==(b); }
 };
 static_assert(sizeof(Rational) == 2 * sizeof(Z));

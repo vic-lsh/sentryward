@@ -66,5 +66,24 @@ class StructuralNativeTest(unittest.TestCase):
         self.assertEqual((r["result"], r["reason"]), ("refused", "role"))
         self.assertEqual(r["detail"]["role"], "multiplicand")
 
+    def test_chain_without_transcendental_matches(self):
+        self.assertEqual(run("chain_pos", "chain")["result"], "matched")
+
+    def test_path_through_another_producers_transcendental_refused(self):
+        # C(P(a), Q(P(a))), Q = exp: p reaches C's output through Q, behind q's cut. A body
+        # argument's paths end only at its own bound values.
+        r = run("chain_neg_exp", "chain")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "role"))
+        self.assertEqual(r["detail"]["role"], "avoids_transcendental")
+
+    def test_unstored_producer_converted_at_one_use_refused(self):
+        # t at one use, f32(f16(t)) at the other: one node, two values.
+        r = run("unstored_neg_conv", "unstored")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "producer_binding"))
+
+    def test_multiplicand_on_a_body_argument_refused(self):
+        r = run("body_mult", "body_mult")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "role_boundary"))
+
 if __name__ == "__main__":
     unittest.main()

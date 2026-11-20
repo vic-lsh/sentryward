@@ -503,17 +503,21 @@ class Checker {
     return c == O::Exp2 || c == O::Log2 || c == O::Sin || c == O::Cos || c == O::Tanh;
   }
 
-  // The leaves x reaches by a path through a transcendental operation (memoized).
-  Set transLeaves(v::Value x, unsigned depth = 0) {
+  // The leaves x reaches by a path through a transcendental operation (memoized per `own`).
+  // `own`: the cut space of the body argument whose role is checked; a path ends at that
+  // argument's own bound values (below them is its producer's), never at another argument's cut,
+  // so a path from the argument through another producer's transcendental is seen (C(P(a),
+  // Q(P(a))) with Q applying exp). Other cut values still count as leaves of their own spaces.
+  Set transLeaves(v::Value x, unsigned depth = 0, std::optional<std::uint64_t> own = std::nullopt) {
     if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
     x = resolve(x);
     if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
-    if (x.conversion()) return transLeaves(x.conversion()->source, depth + 1);
+    if (x.conversion()) return transLeaves(x.conversion()->source, depth + 1, own);
     const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
     const bool plain = x.indices().empty() && !x.pointer();
-    // A cut value (an inner node's bound output) ends the path: what lies below it is the
-    // producer's, whose own roles cover its inputs.
-    if (plain && stop_.count(key)) return {};
+    if (plain && own)
+      if (auto it = stop_.find(key); it != stop_.end() && (it->second >> kShift) == *own) return {};
+    auto& trans_memo_ = trans_memo_by_[own];
     if (plain)
       if (auto it = trans_memo_.find(key); it != trans_memo_.end()) return *it->second;
     const auto& node = g_.definingNode(x);
@@ -522,9 +526,9 @@ class Checker {
       s = leaves(x, depth + 1);
     } else if (dynamic_cast<const v::LoadOp*>(&node.operation())) {
       if (const auto* r = m_.readReplacement({x.nodeId(), x.instanceIndex()}))
-        if (const auto* value = std::get_if<v::Value>(r)) s = transLeaves(*value, depth + 1);
+        if (const auto* value = std::get_if<v::Value>(r)) s = transLeaves(*value, depth + 1, own);
     } else {
-      for (const auto& a : g_.instanceOperands(x)) s = unite(s, transLeaves(a, depth + 1));
+      for (const auto& a : g_.instanceOperands(x)) s = unite(s, transLeaves(a, depth + 1, own));
     }
     if (plain) trans_memo_.emplace(key, std::make_shared<const Set>(s));
     return s;
@@ -669,7 +673,8 @@ class Checker {
     if (tn.primitive) return;
     // Reached-through-transcendental sets: from the loads (input arguments: every path from the
     // argument's loads, through producers too) and on the cut checker (body arguments).
-    std::optional<Set> through_in, through_cut;
+    std::optional<Set> through_in;
+    std::map<std::size_t, Set> through_cut;  // per body argument's producer node
     for (std::size_t k = 0; k < tn.args.size(); ++k) {
       if (tn.roles[k].empty()) continue;
       const auto& arg = tn.args[k];
@@ -690,18 +695,36 @@ class Checker {
               refuse("role_boundary", "a body argument's role needs its producer's output bound to a stored node", d);
             }
             const auto ek = arg.body ? argCut(m, k, at, r, c) : e;
-            auto& through = arg.body ? through_cut : through_in;
-            if (!through) through = arg.body ? boundary->transLeaves(root) : transLeaves(root);
-            reached = *through;
+            if (arg.body) {
+              auto it = through_cut.find(arg.ref);
+              if (it == through_cut.end())
+                it = through_cut.emplace(arg.ref, boundary->transLeaves(root, 0, t_.objects.size() + arg.ref)).first;
+              reached = it->second;
+            } else {
+              if (!through_in) through_in = transLeaves(root);
+              reached = *through_in;
+            }
             ok = role == RoleKind::ThroughTranscendental ? unite(reached, ek) == reached : disjoint(reached, ek);
             break;
           }
           case RoleKind::Addend:
+            if (arg.body) {  // its leaf-cone walk would cross into the producer (#5030)
+              auto d = where;
+              d["argument"] = k;
+              d["role"] = "addend";
+              refuse("role_boundary", "an addend role on a body argument is not supported", d);
+            }
             reached = nonAddendLeaves(root, e, memo);
             ok = reached.empty();
             name = "addend";
             break;
           case RoleKind::Multiplicand: {
+            if (arg.body) {  // its leaf-cone walk would cross into the producer (#5030)
+              auto d = where;
+              d["argument"] = k;
+              d["role"] = "multiplicand";
+              refuse("role_boundary", "a multiplicand role on a body argument is not supported", d);
+            }
             // Every leaf of the argument is reached as a factor of a product whose other factor
             // is independent of it, and no path reaches one without passing such a product.
             reached = factorLeaves(root, e, memo);
@@ -1016,7 +1039,7 @@ class Checker {
               return !named.empty() ? named : elem == op_type ? std::string() : op_type;
             };
             const auto operands = g_.instanceOperands(x);
-            std::vector<std::pair<std::pair<std::size_t, std::uint64_t>, Key>> pending;
+            std::vector<std::pair<std::pair<std::size_t, std::uint64_t>, v::Value>> pending;
             std::optional<std::pair<std::size_t, std::uint64_t>> conflict;
             const auto matches = [&](const v::Value& operand, std::size_t k) -> bool {
               const auto& a = tn.args[k];
@@ -1077,9 +1100,12 @@ class Checker {
               if (leaves(y) != materialize(ps, r, c)) return false;
               // The element's identity is its coordinate (an unstored node has no layout object).
               const auto coord = coordinate(at, r, c);
-              if (!coord) unsupported("producer_element", "an unstored inner node read at more than one element", where);
+              if (!coord || (*coord)[1] >> 32 || (*coord)[0] >> 32)
+                unsupported("producer_element", "an unstored inner node read at more than one element or past 2^32", where);
               const std::pair<std::size_t, std::uint64_t> slot_key{a.ref, ((*coord)[0] << 32) | (*coord)[1]};
-              const Key value{y.nodeId(), y.resultIndex(), y.instanceIndex()};
+              // The full resolved value (conversion chain, indices and selector included): a and
+              // f32(f16(a)) are two values.
+              const v::Value value = y;
               if (auto it = bound_.find(slot_key); it != bound_.end() && !(it->second == value)) {
                 conflict = slot_key;
                 return false;
@@ -1144,9 +1170,9 @@ class Checker {
   ScalarSpecialization spec_;
   std::map<Key, std::uint64_t> stop_;
   // Per unstored inner node and element: the one value its uses bind (`producer_binding`).
-  std::map<std::pair<std::size_t, std::uint64_t>, Key> bound_;
+  std::map<std::pair<std::size_t, std::uint64_t>, v::Value> bound_;
   std::map<Key, SetRef> memo_;
-  std::map<Key, SetRef> trans_memo_;
+  std::map<std::optional<std::uint64_t>, std::map<Key, SetRef>> trans_memo_by_;
   std::vector<std::string> foreign_;
 };
 

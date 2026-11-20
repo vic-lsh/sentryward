@@ -1,0 +1,44 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "chain_neg_exp",
+ "launch": {
+  "grid_dim": [
+   1,
+   1,
+   1
+  ],
+  "block_dim": [
+   256,
+   1,
+   1
+  ],
+  "dynamic_shared_bytes": 0
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "a"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "p"
+  },
+  {
+   "parameter": 2,
+   "type": "pointer",
+   "space": "global",
+   "object": "q"
+  },
+  {
+   "parameter": 3,
+   "type": "pointer",
+   "space": "global",
+   "object": "y"
+  }
+ ],
+ "arguments": []
+}
