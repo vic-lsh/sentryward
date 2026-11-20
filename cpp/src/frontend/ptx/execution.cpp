@@ -3394,6 +3394,13 @@ bool Executor::SharedData(const Decoded &d, State &state, std::uint32_t warp,
         if (!runtime.cluster_tickets.contains(actor)) throw ExecutionError("shared_control_invalid_sync",i.line,"cluster wait has no arrival");
         runtime.Collective("cluster",c_.Threads()*cluster_size,actor,runtime.cluster_tickets.at(actor));
       } else throw ExecutionError("shared_control_collective_variant",i.line,"unsupported cluster collective");
+    } else if (Has(i,"red")) {
+      // bar.red.{popc.u32,and.pred,or.pred} d, a{, b}, {!}c: the CTA barrier a, whose result
+      // reduces every participating thread's c. The other threads' operands are not known here,
+      // so d is unknown; it is the same value in every thread (a branch on it is one case split).
+      runtime.Collective(prefix+"named."+std::to_string(number(operand(1))),
+          d.operands.size()>3?number(operand(2)):std::int64_t(c_.Threads()),actor,key,true);
+      Set(d,state,{Scalar{}});
     } else if (Has(i,"sync") || Has(i,"arrive"))
       runtime.Collective(prefix+"named."+std::to_string(number(operand(0))),
           d.operands.size()>1?number(operand(1)):std::int64_t(c_.Threads()),actor,key,Has(i,"sync"));

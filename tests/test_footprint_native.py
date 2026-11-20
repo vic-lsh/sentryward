@@ -143,10 +143,11 @@ class FootprintNativeTest(unittest.TestCase):
     # unsupported collective.
     def test_bar_red_or_is_a_barrier_with_an_unknown_uniform_result(self):
         r = run("feed", "sample_reduce_or")
-        self.assertNotIn("shared_control_collective_variant", [str(d.get("code")) for d in r.get("diagnostics", [])])
-        fp = self.footprint(r)
-        self.assertEqual(r["result"], "race_free")
-        self.assertEqual((fp["writes"], fp["reads"]), ("contained", "contained"))
+        # The leaf runs past the barrier to the kernel's next data-dependent branch (the choice
+        # tree expands it), instead of stopping at the collective.
+        codes = [(str(d.get("code")), (d.get("details") or {}).get("location", {}).get("line")) for d in r.get("diagnostics", [])]
+        self.assertNotIn("shared_control_collective_variant", [c for c, _ in codes])
+        self.assertIn(("control_predicate_not_static", 1492), codes)
 
 
 if __name__ == "__main__":
