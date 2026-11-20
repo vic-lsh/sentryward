@@ -1258,18 +1258,20 @@ class Checker {
               }
             }
           } else {
-            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
-          }
-          // 3. Factorization.
-          if (has_body && !tn.primitive) {
-            const auto expected_cut = materialize(cut, r, c);
-            const auto actual_cut = cutter.leaves(*slot);
-            if (actual_cut != expected_cut) {
-              auto d = where;
-              d["expected"] = render(expected_cut);
-              d["actual"] = cutter.render(actual_cut);
-              refuse("factorization", "with the inner nodes' stored values as leaves, the output reaches other leaves", d);
+            // 3. Factorization, before the roles: a consumer that does not read its producer's
+            // bound values is a factorization failure (a body role's reachability would also
+            // refuse it, with a less specific reason).
+            if (has_body) {
+              const auto expected_cut = materialize(cut, r, c);
+              const auto actual_cut = cutter.leaves(*slot);
+              if (actual_cut != expected_cut) {
+                auto d = where;
+                d["expected"] = render(expected_cut);
+                d["actual"] = cutter.render(actual_cut);
+                refuse("factorization", "with the inner nodes' stored values as leaves, the output reaches other leaves", d);
+              }
             }
+            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
           }
           ++checked;
         }
