@@ -25,43 +25,63 @@ B. CTA row shards (recommended): check the launch as `K` inputs, shard `k` execu
    declared write pieces, plus, where a write address is data-dependent, a premise that is
    checked elsewhere.
 
-## B in detail
+## B in detail (revision 2, after review 1)
 
-- Fork input field `cta_rows: { y: [lo, hi) }`: the frontend executes and lowers only those
-  CTAs; footprints and races are over them. Nothing else changes.
-- Generator (Coral `coral-mv2-sentryward`): for a launch whose grid exceeds a budget, emit shards
-  of whole y rows (GB10-sized, 8 rows each for H100: 6 shards).
-- Cross-shard writes:
-  - `k_stage_in` writes only staging rows `y` (affine in `y`, declared piece rows): shards write
-    disjoint staging rows by the declared pieces alone (checked by `check_verdicts.py` from the
-    pieces: row ranges of different shards do not intersect).
-  - `k_stage_out` writes state entry `tab[(req + y) * stride]`: shards are disjoint when the
-    entries of different rows are distinct. That is the verified monitor's `injective_spec` (a
-    step whose two tokens write one state unit is refused; `coral-monitor` `check/injective.rs`,
-    control `neg_monitor_injective_state_twice`), so it is a checked premise, not a trusted row;
-    the record names it, and `check_verdicts.py` accepts the shard set only with that premise
-    named.
-  - Reads cannot race with reads; a read in one shard against a write in another is covered by
-    the same disjointness (the read and write sets are per-row).
-- Coverage: a row is `checked` only when every shard of every launch passes and the cross-shard
-  check passes; a missing shard is `trusted` with a reason.
+Admitted kernels only. A launch may be sharded only when its PTX has no inter-CTA communication
+SentryWard cannot see within a shard: no cluster launch, distributed shared memory, cluster or
+grid barrier, cooperative launch, atomics or fences of gpu/sys scope on global memory, and no
+global read of a location some CTA of the launch writes unless the reader and the writer are in
+the same shard. The first conditions are a static PTX scan (the existing precondition scan,
+`unit_classes.cpp` PreconditionScan, extended); the last is part of the cross-shard check below.
+A kernel that fails any condition is not sharded.
+
+- Fork input field `cta_rows: { y: [lo, hi) }`: the frontend plans units with the true grid,
+  words and cluster shape and executes only the CTAs in the range. Facts that depend on the whole
+  grid (class planning, grid extents) are computed from the true grid; the shard's report records
+  the full launch identity (kernel digest, grid, block, words, allocations, premises, config).
+- Each shard reports its actual accessed byte pieces per allocation (reads and writes, from its
+  verified footprint evidence, not from declarations) and its race and containment verdicts.
+- Cross-shard check, exact, in `check_verdicts.py` (or a small tool it calls): for every pair of
+  shards and every allocation pair that may alias (same identity, or a shared alias scope, or an
+  unknown identity: refuse), no write piece of one shard intersects a write piece or a read piece
+  of the other. Pieces are interpreted with their base, rows, stride, period, count and width. A
+  symbolic piece (a data-dependent base) cannot be compared exactly and refuses the shard set.
+- Coverage authentication: the shards of one launch must have identical launch identity, and
+  their row ranges must partition `[0, grid.y)` exactly (no gap, no overlap), each covering all x
+  and z CTAs; every existing record obligation (case trees, split fields, field reads) holds per
+  shard. A row is `checked` only then.
+
+Consequence for Coral today. `k_stage_in`: writes only staging rows `y` (affine, exact pieces),
+reads `state` and `tab` (never written by the launch), so its cross-shard check is exact; it can be
+sharded. `k_stage_out`: writes `state` at the data-dependent entry `tab[(req + y) * stride]`, a
+symbolic piece, so the shard set is refused and the row stays trusted. The verified monitor's
+`injective_spec` is not usable as stated: it quantifies over one checked step's tokens and
+excludes null outputs, and nothing binds `tab[(req + y) * stride]` of a launch row to a distinct
+non-null token output (prefill segments, padding and pad sinks included). A proved row-to-token
+binding would be a separate item; this design does not depend on it.
 
 ## Soundness obligations (for the reviewer)
 
-1. A shard execution is the launch's execution restricted to its CTAs (same words, grid, inputs).
-2. Race freedom of the launch = race freedom within each shard + no conflicting pair across
-   shards; the cross-shard condition is decided from declared pieces or the named checked
-   premise, never sampled.
-3. Containment of the launch = containment of every shard (a union of per-CTA facts).
-4. Intra-CTA and CTA-local facts (shared memory, barriers) are unaffected: shards are whole CTAs.
+1. A shard execution equals the launch restricted to its CTAs, for admitted kernels (no
+   inter-CTA communication other than through memory compared exactly across shards).
+2. Launch race freedom = within-shard race freedom + no cross-shard write/write or write/read
+   byte intersection over possibly aliasing allocations, decided exactly or refused.
+3. Launch containment = containment of every shard's accesses.
+4. The shard set is an exact partition of one launch with one identity.
 
 ## Controls
 
-- A kernel whose row `y` also writes row `y + 1`'s staging slot: the cross-shard check refuses it.
-- `k_stage_out` with the injective premise removed: the shard set is not accepted.
-- A shard set missing one row range: coverage stays trusted.
+- `out[y]` written and `out[y + 1]` read by row `y`: the cross-shard write/read check refuses.
+- Input and output allocations sharing an alias scope: refused.
+- A kernel with a grid barrier or a gpu-scope atomic on global memory: not sharded.
+- A shard set with a gap or an overlap in y, or differing launch words: not accepted.
+- `k_stage_out`: refused (symbolic write piece), stays trusted.
 
 ## Cost
 
-A small frontend filter, a generator split and a check in `check_verdicts.py`. Option A stays
-open for later.
+A frontend filter with an extended precondition scan, a generator split, per-shard piece
+export and an exact cross-shard check. Measured cost is part of acceptance: for H100
+`k_stage_in` (6 shards of 8 rows; one 8-row run is 293 s and about 14 GB on GB10) record the total
+and peak per shard; if the total exceeds the 10-minute check budget, shards run as separate inputs
+of the record (each under the 900 s box) and the record's wall time is reported, not hidden.
+Option A stays open for later.
