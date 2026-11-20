@@ -247,7 +247,6 @@ std::vector<SpacePattern> patterns(const Term& t, std::size_t n, bool cut) {
 }
 
 // ---- The check. ----
-using Key = std::tuple<std::size_t, std::size_t, std::size_t>;  // node, result, instance
 
 class Checker {
  public:
@@ -412,35 +411,118 @@ class Checker {
     unsupported("unresolved_load", "a load with no read resolution", {{"node", key.node}, {"instance", key.instance}});
   }
 
-  // The leaf set of value x, cut values (stop_) counting as leaves. Memoized per plain value.
+  // The identity of value x, as a canonical key: its node result and instance, pointer properties,
+  // indices and conversion chain, each level resolved. Two values are one value iff their keys are
+  // equal; every comparison or map of values in this check uses it (cut values, producer bindings,
+  // primitive operands, memos). A thread selector the launch does not decide is unsupported.
+  std::string ident(v::Value x, unsigned depth = 0) {
+    if (depth > 512) unsupported("identity_depth", "a value's conversion and index nesting is deeper than 512");
+    x = resolve(x);
+    if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
+    std::string s = std::to_string(x.graphIdentity()) + ":" + std::to_string(x.nodeId()) + "." +
+                    std::to_string(x.resultIndex()) + "." + std::to_string(x.instanceIndex());
+    if (const auto& c = x.conversion()) {
+      const auto& sp = *c->spec;
+      const auto& at = sp.attributes;
+      s += std::string(sp.kind == v::TypeConversionKind::Convert ? "|cvt." : "|bit.") + sp.target.toString() + "." +
+           sp.element.toString() + "." + std::to_string(int(at.rounding)) + (at.saturate ? "s" : "") +
+           (at.flush_to_zero ? "f" : "") + (at.saturate_finite ? "S" : "") + "(" + ident(c->source, depth + 1) + ")";
+    }
+    if (const auto& p = x.pointer())
+      s += "|ptr(" + p->identity + "," + p->addressing + "," +
+           (p->owner_cta ? std::to_string(*p->owner_cta) : "-") + "," +
+           (p->owner_thread ? std::to_string(*p->owner_thread) : "-") + ")";
+    if (!x.indices().empty()) {
+      s += "|sel[";
+      for (const auto& i : x.indices()) s += ident(i, depth + 1) + ";";
+      s += "]";
+    }
+    return s;
+  }
+
+  // One step of the complete dataflow of a resolved value x (no thread selector): its successors
+  // (index values first, then the conversion source, the replaced load's stored value or the
+  // operation's operands), whether x is a leaf (an initial-memory load, a constant, a parameter or
+  // a coordinate) and whether x's operation is a transcendental. Anything this cannot decide is
+  // unsupported: a load at a data-dependent position or without a read resolution, a read
+  // reassembled from stored values, and an operation of a kind not listed here.
+  struct Flow {
+    std::vector<v::Value> next;
+    std::size_t indices = 0;  // next[0, indices) are x's index values
+    bool leaf = false, trans = false, load = false;
+  };
+  Flow flow(const v::Value& x) {
+    Flow f;
+    for (const auto& i : x.indices()) f.next.push_back(i);
+    f.indices = f.next.size();
+    if (const auto& c = x.conversion()) {
+      f.next.push_back(c->source);
+      return f;
+    }
+    const auto& op = g_.definingNode(x).operation();
+    if (dynamic_cast<const v::LoadOp*>(&op)) {
+      f.load = true;
+      const MemoryInstance key{x.nodeId(), x.instanceIndex()};
+      if (m_.symbolic_initial_reads.contains(key)) return f.leaf = true, f;
+      if (m_.symbolic_read_positions.contains(key))
+        unsupported("symbolic_read_position", "a read at a data-dependent position (needs table premises)");
+      if (const auto* r = m_.readReplacement(key)) {
+        if (const auto* value = std::get_if<v::Value>(r)) {
+          f.next.push_back(x.indices().empty() ? *value : g_.component(*value, {x.indices().begin(), x.indices().end()}));
+          return f;
+        }
+        if (std::get_if<InitialMemorySymbol>(r)) return f.leaf = true, f;
+        const auto initial = [](const ReinterpretedRead& p) { return std::holds_alternative<InitialMemorySymbol>(p.source); };
+        bool all = true;
+        if (const auto* p = std::get_if<ReinterpretedRead>(r)) all = initial(*p);
+        else for (const auto& p : std::get<AssembledRead>(*r).pieces) all &= initial(p);
+        if (!all) unsupported("reassembled_read", "a read reassembled from stored values (its dataflow per byte is not resolved)");
+        return f.leaf = true, f;
+      }
+      if (m_.initialRead(key)) return f.leaf = true, f;
+      unsupported("unresolved_load", "a load with no read resolution", {{"node", key.node}, {"instance", key.instance}});
+    }
+    if (dynamic_cast<const v::ConstantOp*>(&op) || dynamic_cast<const v::InputParameterOp*>(&op) ||
+        dynamic_cast<const v::CoordinateOp*>(&op))
+      return f.leaf = true, f;
+    const bool known = dynamic_cast<const v::UnaryOp*>(&op) || dynamic_cast<const v::BinaryOp*>(&op) ||
+                       dynamic_cast<const v::FmaOp*>(&op) || dynamic_cast<const v::IdealExp2Op*>(&op) ||
+                       dynamic_cast<const v::ConvertOp*>(&op) || dynamic_cast<const v::BitcastOp*>(&op) ||
+                       dynamic_cast<const v::CompareOp*>(&op) || dynamic_cast<const v::SelectOp*>(&op) ||
+                       dynamic_cast<const v::ThreadForwardOp*>(&op) || dynamic_cast<const v::PtxScalarOp*>(&op);
+    if (!known)
+      unsupported("operation_kind", "an operation kind the structural check does not classify",
+                  {{"operation", std::string(op.name())}});
+    f.trans = transcendental(op);
+    for (const auto& a : g_.instanceOperands(x)) f.next.push_back(a);
+    return f;
+  }
+
+  // The leaf set of value x, cut values (stop_, by identity) counting as leaves. Memoized by identity.
   Set leaves(v::Value x, unsigned depth = 0) {
     if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
     x = resolve(x);
-    if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
-    if (x.conversion()) {
-      auto s = leaves(x.conversion()->source, depth + 1);
-      for (const auto& i : x.indices()) s = unite(s, leaves(i, depth + 1));
-      return s;
-    }
-    const bool plain = x.indices().empty() && !x.pointer();
-    const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
-    if (plain) {
-      if (auto it = stop_.find(key); it != stop_.end()) return {{it->second, it->second + 1}};
-      if (auto it = memo_.find(key); it != memo_.end()) return *it->second;
-    }
-    const auto& node = g_.definingNode(x);
-    const auto& op = node.operation();
+    const auto key = ident(x);
+    if (auto it = stop_.find(key); it != stop_.end()) return {{it->second, it->second + 1}};
+    if (auto it = memo_.find(key); it != memo_.end()) return *it->second;
     Set s;
-    if (dynamic_cast<const v::LoadOp*>(&op)) {
-      s = *loadLeaves(x, false);
-    } else if (dynamic_cast<const v::ConstantOp*>(&op) || dynamic_cast<const v::InputParameterOp*>(&op) ||
-               dynamic_cast<const v::CoordinateOp*>(&op)) {
-    } else {
-      const auto operands = g_.instanceOperands(x);
-      for (const auto& a : operands) s = unite(s, leaves(a, depth + 1));
+    if (x.conversion()) {
+      s = leaves(x.conversion()->source, depth + 1);
       for (const auto& i : x.indices()) s = unite(s, leaves(i, depth + 1));
+    } else {
+      const auto& op = g_.definingNode(x).operation();
+      if (dynamic_cast<const v::LoadOp*>(&op)) {
+        s = *loadLeaves(x, false);
+      } else if (dynamic_cast<const v::ConstantOp*>(&op) || dynamic_cast<const v::InputParameterOp*>(&op) ||
+                 dynamic_cast<const v::CoordinateOp*>(&op)) {
+      } else if (dynamic_cast<const v::OpaqueValueOp*>(&op) || dynamic_cast<const v::FailedClcResponseOp*>(&op)) {
+        unsupported("undetermined_value", "a value whose bits the IR does not determine");
+      } else {
+        for (const auto& a : g_.instanceOperands(x)) s = unite(s, leaves(a, depth + 1));
+        for (const auto& i : x.indices()) s = unite(s, leaves(i, depth + 1));
+      }
     }
-    if (plain) memo_.emplace(key, std::make_shared<const Set>(s));
+    memo_.emplace(key, std::make_shared<const Set>(s));
     return s;
   }
 
@@ -473,9 +555,9 @@ class Checker {
     x = resolve(x);
     if (!convert.empty()) {
       if (x.conversion() && x.conversion()->spec->kind == v::TypeConversionKind::Convert &&
-          x.conversion()->spec->target.element().toString() == convert) {
+          x.conversion()->spec->target.element().toString() == convert && x.indices().empty()) {
         x = resolve(x.conversion()->source);
-      } else if (!x.conversion() && dynamic_cast<const v::ConvertOp*>(&g_.definingNode(x).operation()) &&
+      } else if (!x.conversion() && x.indices().empty() && dynamic_cast<const v::ConvertOp*>(&g_.definingNode(x).operation()) &&
                  g_.type(x).element().toString() == convert) {
         x = resolve(g_.instanceOperands(x).at(0));
       } else {
@@ -494,44 +576,79 @@ class Checker {
     return s->front().begin;
   }
 
+  // The transcendentals of the role signatures: ex2, lg2, sin, cos, tanh (every PTX scalar opcode
+  // is listed, so a new one is a compile warning here, never silently a non-transcendental).
   static bool transcendental(const v::Operation& op) {
     if (dynamic_cast<const v::IdealExp2Op*>(&op)) return true;
     const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op);
     if (!p) return false;
     using O = v::PtxScalarOpcode;
-    const auto c = p->opcode();
-    return c == O::Exp2 || c == O::Log2 || c == O::Sin || c == O::Cos || c == O::Tanh;
+    switch (p->opcode()) {
+      case O::Exp2: case O::Log2: case O::Sin: case O::Cos: case O::Tanh:
+        return true;
+      case O::AddCarry: case O::SubtractCarry: case O::MultiplyAdd: case O::MultiplyAddCarry:
+      case O::SetPredicate: case O::SetValue: case O::SelectSign: case O::AddressSpaceConvert:
+      case O::ClusterSharedAddress: case O::BitReverse: case O::BitFind: case O::CountLeadingZeros:
+      case O::PopulationCount: case O::BitExtract: case O::BitInsert: case O::BytePermute: case O::Logic3:
+      case O::FunnelShift: case O::CopySign: case O::LogicalNot: case O::TestPredicate:
+      case O::Reciprocal: case O::Sqrt: case O::ReciprocalSqrt:
+        return false;
+    }
+    unsupported("operation_kind", "a PTX scalar opcode the structural check does not classify");
   }
 
-  // The leaves x reaches by a path through a transcendental operation (memoized per `own`).
-  // `own`: the cut space of the body argument whose role is checked; a path ends at that
-  // argument's own bound values (below them is its producer's), never at another argument's cut,
-  // so a path from the argument through another producer's transcendental is seen (C(P(a),
-  // Q(P(a))) with Q applying exp). Other cut values still count as leaves of their own spaces.
-  Set transLeaves(v::Value x, unsigned depth = 0, std::optional<std::uint64_t> own = std::nullopt) {
+  // Reachability over the complete dataflow below a value: `all`, the source elements some path
+  // from the value reaches; `through`, those reached by a path that passes a transcendental
+  // operation strictly above the source. No cut ends a path. A source is the argument's value:
+  // for an input argument an initial-memory load (its elements), for a body argument a value the
+  // producer's output is bound to (by identity, its cut element).
+  struct Reach {
+    Set all, through;
+  };
+  using ReachMemo = std::map<std::string, std::shared_ptr<const Reach>>;
+  template <class Source>
+  const Reach& reach(v::Value x, ReachMemo& memo, const Source& source, unsigned depth = 0) {
     if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
     x = resolve(x);
-    if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
-    if (x.conversion()) return transLeaves(x.conversion()->source, depth + 1, own);
-    const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
-    const bool plain = x.indices().empty() && !x.pointer();
-    if (plain && own)
-      if (auto it = stop_.find(key); it != stop_.end() && (it->second >> kShift) == *own) return {};
-    auto& trans_memo_ = trans_memo_by_[own];
-    if (plain)
-      if (auto it = trans_memo_.find(key); it != trans_memo_.end()) return *it->second;
-    const auto& node = g_.definingNode(x);
-    Set s;
-    if (transcendental(node.operation())) {
-      s = leaves(x, depth + 1);
-    } else if (dynamic_cast<const v::LoadOp*>(&node.operation())) {
-      if (const auto* r = m_.readReplacement({x.nodeId(), x.instanceIndex()}))
-        if (const auto* value = std::get_if<v::Value>(r)) s = transLeaves(*value, depth + 1, own);
-    } else {
-      for (const auto& a : g_.instanceOperands(x)) s = unite(s, transLeaves(a, depth + 1, own));
+    auto key = ident(x);
+    if (auto it = memo.find(key); it != memo.end()) return *it->second;
+    const auto f = flow(x);
+    Reach r;
+    Set below;
+    for (const auto& n : f.next) {
+      const auto& s = reach(n, memo, source, depth + 1);
+      below = unite(below, s.all);
+      r.through = unite(r.through, s.through);
     }
-    if (plain) trans_memo_.emplace(key, std::make_shared<const Set>(s));
-    return s;
+    if (f.trans) r.through = unite(r.through, below);
+    r.all = unite(below, source(x, key, f));
+    return *memo.emplace(std::move(key), std::make_shared<const Reach>(std::move(r))).first->second;
+  }
+  // Sources of an input argument: initial-memory loads.
+  const Reach& inputReach(const v::Value& root) {
+    return reach(root, reach_in_, [&](const v::Value& x, const std::string&, const Flow& f) {
+      return f.load && f.leaf ? *loadLeaves(x, false) : Set{};
+    });
+  }
+  // Sources of body argument on producer m: the values m's stored output elements hold (by
+  // identity; one value at two elements is ambiguous).
+  const Reach& bodyReach(const v::Value& root, std::size_t m) {
+    auto [src, fresh] = sources_.try_emplace(m);
+    if (fresh) {
+      const auto space = t_.objects.size() + m;
+      const auto& values = stored_.at(*t_.nodes[m].out);
+      for (std::size_t e = 0; e < values.size(); ++e) {
+        if (!values[e]) continue;
+        const auto id = (std::uint64_t(space) << kShift) | e;
+        if (auto [it, added] = src->second.emplace(ident(*values[e]), id); !added && it->second != id)
+          refuse("ambiguous_cut", "one value stored at two elements of an inner node", {{"node", m}});
+      }
+    }
+    const auto& map = src->second;
+    return reach(root, reach_body_[m], [&](const v::Value&, const std::string& key, const Flow&) {
+      const auto it = map.find(key);
+      return it == map.end() ? Set{} : Set{{it->second, it->second + 1}};
+    });
   }
 
   // The expected leaves of argument k of term node m when m is evaluated at outer pattern `at`
@@ -548,8 +665,8 @@ class Checker {
     return materialize(ps, r, c);
   }
 
-  // Memoized per argument set k (roles are few, so one memo per (root, k)).
-  using Memo = std::map<Key, SetRef>;
+  // Memoized per argument set k (roles are few, so one memo per (root, k)), by value identity.
+  using Memo = std::map<std::string, SetRef>;
 
   // The leaves of k that x reaches as a factor of a multiply (or an fma's product) whose other
   // factor reaches no leaf of k.
@@ -565,11 +682,11 @@ class Checker {
       }
       for (const auto& a : xs) s = unite(s, factorLeaves(a, k, memo, d + 1));
       return s;
-    });
+    }, [&](const v::Value& i, unsigned d) { return factorLeaves(i, k, memo, d); });
   }
 
   // The leaves of k that x reaches on some path that passes no product whose other factor reaches
-  // no leaf of k (a path that bypasses the multiply).
+  // no leaf of k (a path that bypasses the multiply). An index value is never a factor.
   Set bypassLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
     return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
       const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
@@ -586,7 +703,7 @@ class Checker {
       }
       for (std::size_t i = from; i < xs.size(); ++i) s = unite(s, operandBypass(xs[i], k, memo, d + 1));
       return s;
-    });
+    }, [&](const v::Value& i, unsigned d) { return operandBypass(i, k, memo, d); });
   }
   // An operand's bypass leaves: a leaf of k itself, else its own walk.
   Set operandBypass(const v::Value& a, const Set& k, Memo& memo, unsigned depth) {
@@ -625,30 +742,28 @@ class Checker {
         for (const auto& a : xs) s = unite(s, meet(leaves(a, d + 1), k));
       }
       return s;
-    });
+    }, [&](const v::Value& i, unsigned d) { return meet(leaves(i, d), k); });
   }
 
-  // A memoized walk of x's defining DAG: through conversions and replaced loads, `f` on any other
-  // operation with its operands; an unreplaced load (a leaf) gives the empty set.
-  template <class F>
-  Set walk(v::Value x, Memo& memo, unsigned depth, const F& f) {
+  // A memoized walk of x's complete dataflow (flow): through conversions and replaced loads, `f`
+  // on any other operation with its operands, `index` on each index value; a leaf gives the empty
+  // set. Undecided steps are unsupported (flow).
+  template <class F, class I>
+  Set walk(v::Value x, Memo& memo, unsigned depth, const F& f, const I& index) {
     if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
     x = resolve(x);
-    if (x.threadSelector()) unsupported("thread_selector", "a thread selector the launch does not decide");
-    if (x.conversion()) return walk(x.conversion()->source, memo, depth + 1, f);
-    const Key key{x.nodeId(), x.resultIndex(), x.instanceIndex()};
-    const bool plain = x.indices().empty() && !x.pointer();
-    if (plain)
-      if (auto it = memo.find(key); it != memo.end()) return *it->second;
-    const auto& op = g_.definingNode(x).operation();
+    auto key = ident(x);
+    if (auto it = memo.find(key); it != memo.end()) return *it->second;
+    const auto fl = flow(x);
     Set s;
-    if (dynamic_cast<const v::LoadOp*>(&op)) {
-      if (const auto* r = m_.readReplacement({x.nodeId(), x.instanceIndex()}))
-        if (const auto* value = std::get_if<v::Value>(r)) s = walk(*value, memo, depth + 1, f);
-    } else {
-      s = f(op, g_.instanceOperands(x), depth);
+    for (std::size_t i = 0; i < fl.indices; ++i) s = unite(s, index(fl.next[i], depth + 1));
+    const std::vector<v::Value> rest(fl.next.begin() + std::ptrdiff_t(fl.indices), fl.next.end());
+    if (x.conversion() || fl.load) {
+      for (const auto& n : rest) s = unite(s, walk(n, memo, depth + 1, f, index));
+    } else if (!fl.leaf) {
+      s = unite(s, f(g_.definingNode(x).operation(), rest, depth));
     }
-    if (plain) memo.emplace(key, std::make_shared<const Set>(s));
+    memo.emplace(std::move(key), std::make_shared<const Set>(s));
     return s;
   }
 
@@ -662,19 +777,17 @@ class Checker {
   }
 
   // Role sets of opaque node m over its value `root` (m at outer pattern `at`). A transcendental
-  // role is a fact about the paths from the argument's value to m's output: for an input argument
-  // from its loads, for a body argument from the node bound to its producer's output, so those
-  // roles run on `boundary` (this term's cut checker: inner nodes' stored values are leaves and
-  // end each path). A body argument with a transcendental role and no stored, bound output fails.
-  // Addend and Multiplicand keep their independence condition over the argument's leaves.
+  // role is a fact about the paths from the argument's value to m's output over the complete
+  // dataflow (no cut ends a path): for an input argument from its initial-memory loads, for a body
+  // argument from the values its producer's stored output elements hold (by identity). Every
+  // element of the argument must reach the output; through: each by some path that passes a
+  // transcendental strictly above it; avoids: none by such a path. A body argument's role whose
+  // producer has no stored output is refused (its bound values are not fixed). Addend and
+  // Multiplicand keep their independence condition over the argument's leaves.
   void checkRoles(std::size_t m, const v::Value& root, const Pattern& at, std::uint64_t r, std::uint64_t c,
-                  const Json& where, Checker* boundary = nullptr) {
+                  const Json& where) {
     const auto& tn = t_.nodes[m];
     if (tn.primitive) return;
-    // Reached-through-transcendental sets: from the loads (input arguments: every path from the
-    // argument's loads, through producers too) and on the cut checker (body arguments).
-    std::optional<Set> through_in;
-    std::map<std::size_t, Set> through_cut;  // per body argument's producer node
     for (std::size_t k = 0; k < tn.args.size(); ++k) {
       if (tn.roles[k].empty()) continue;
       const auto& arg = tn.args[k];
@@ -688,22 +801,23 @@ class Checker {
           case RoleKind::ThroughTranscendental:
           case RoleKind::AvoidsTranscendental: {
             name = role == RoleKind::ThroughTranscendental ? "through_transcendental" : "avoids_transcendental";
-            if (arg.body && (!boundary || !t_.nodes[arg.ref].out)) {
+            if (arg.body && !t_.nodes[arg.ref].out) {
               auto d = where;
               d["argument"] = k;
               d["role"] = name;
               refuse("role_boundary", "a body argument's role needs its producer's output bound to a stored node", d);
             }
             const auto ek = arg.body ? argCut(m, k, at, r, c) : e;
-            if (arg.body) {
-              auto it = through_cut.find(arg.ref);
-              if (it == through_cut.end())
-                it = through_cut.emplace(arg.ref, boundary->transLeaves(root, 0, t_.objects.size() + arg.ref)).first;
-              reached = it->second;
-            } else {
-              if (!through_in) through_in = transLeaves(root);
-              reached = *through_in;
+            const auto& rr = arg.body ? bodyReach(root, arg.ref) : inputReach(root);
+            if (unite(rr.all, ek) != rr.all) {
+              auto d = where;
+              d["argument"] = k;
+              d["role"] = name;
+              d["argument_leaves"] = render(ek);
+              d["reached"] = render(rr.all);
+              refuse("role", "an element of a role's argument does not reach the atom's output", d);
             }
+            reached = rr.through;
             ok = role == RoleKind::ThroughTranscendental ? unite(reached, ek) == reached : disjoint(reached, ek);
             break;
           }
@@ -911,7 +1025,7 @@ class Checker {
 
   Json run() {
     // Stored values per output object element.
-    std::map<std::size_t, std::vector<std::optional<v::Value>>> stored;
+    auto& stored = stored_;
     for (const auto& n : t_.nodes)
       if (n.out) stored[*n.out].assign(t_.objects[*n.out].rows * (t_.objects[*n.out].stride / t_.objects[*n.out].bytes), std::nullopt);
     std::size_t writes = 0;
@@ -956,8 +1070,8 @@ class Checker {
       const auto per = o.stride / o.bytes;
       const auto full = patterns(t_, n, false), cut = patterns(t_, n, true);
       const bool has_body = std::any_of(tn.args.begin(), tn.args.end(), [](const Arg& a) { return a.body; });
-      // The cut leaves: each inner node's stored values, by element.
-      std::map<Key, std::uint64_t> stop;
+      // The cut leaves: each inner node's stored values (by identity), by element.
+      std::map<std::string, std::uint64_t> stop;
       if (has_body && !tn.primitive)
         for (const auto& a : tn.args) {
           if (!a.body) continue;
@@ -966,10 +1080,7 @@ class Checker {
           const auto& values = stored.at(*t_.nodes[m].out);
           for (std::size_t e = 0; e < values.size(); ++e) {
             if (!values[e]) continue;
-            auto x = resolve(*values[e]);
-            if (x.conversion() || !x.indices().empty() || x.threadSelector())
-              unsupported("cut_value_form", "an inner node's stored value is not a plain value", {{"node", m}});
-            const Key k{x.nodeId(), x.resultIndex(), x.instanceIndex()};
+            const auto k = ident(*values[e]);
             const auto id = (space << kShift) | e;
             if (auto [it, added] = stop.emplace(k, id); !added && it->second != id)
               refuse("ambiguous_cut", "one value stored at two elements of an inner node", {{"node", m}});
@@ -1009,9 +1120,10 @@ class Checker {
               x = resolve(x.conversion()->source);
             if (!tn.store.empty()) {
               if (x.conversion() && x.conversion()->spec->kind == v::TypeConversionKind::Convert &&
-                  x.conversion()->spec->target.element().toString() == tn.store)
+                  x.conversion()->spec->target.element().toString() == tn.store && x.indices().empty())
                 x = resolve(x.conversion()->source);
-              else if (!x.conversion() && dynamic_cast<const v::ConvertOp*>(&g_.definingNode(x).operation()) &&
+              else if (!x.conversion() && x.indices().empty() &&
+                       dynamic_cast<const v::ConvertOp*>(&g_.definingNode(x).operation()) &&
                        g_.type(x).element().toString() == tn.store)
                 x = resolve(g_.instanceOperands(x).at(0));
               else if (x.conversion() || g_.type(x).element().toString() != tn.store)
@@ -1031,7 +1143,8 @@ class Checker {
             if (want == opcodes.end()) unsupported("primitive_operation", "no PTX opcode for " + tn.operation);
             // The compute element is the op's numerics unless the term names it (D199).
             const auto op_type = g_.type(x).element().toString();
-            if (!b || b->opcode() != want->second || tn.args.size() != 2 || g_.type(x).element().kind() != v::ElementKind::Floating ||
+            if (!b || !x.indices().empty() || b->opcode() != want->second || tn.args.size() != 2 ||
+                g_.type(x).element().kind() != v::ElementKind::Floating ||
                 (!tn.type.empty() && op_type != tn.type))
               refuse("primitive", "the stored value is not the term's primitive operation", d);
             // An operand of another element than the op's is converted to the op's.
@@ -1039,7 +1152,7 @@ class Checker {
               return !named.empty() ? named : elem == op_type ? std::string() : op_type;
             };
             const auto operands = g_.instanceOperands(x);
-            std::vector<std::pair<std::pair<std::size_t, std::uint64_t>, v::Value>> pending;
+            std::vector<std::pair<std::pair<std::size_t, std::uint64_t>, std::pair<std::string, v::Value>>> pending;
             std::optional<std::pair<std::size_t, std::uint64_t>> conflict;
             const auto matches = [&](const v::Value& operand, std::size_t k) -> bool {
               const auto& a = tn.args[k];
@@ -1055,7 +1168,8 @@ class Checker {
               if (inner.out) {
                 const auto cv = convert_to(t_.objects[*inner.out].element, a.convert);
                 if (!cv.empty()) {
-                  if (!(y.conversion() && y.conversion()->spec->target.element().toString() == cv)) return false;
+                  if (!(y.conversion() && y.conversion()->spec->target.element().toString() == cv && y.indices().empty()))
+                    return false;
                   y = resolve(y.conversion()->source);
                 }
               }
@@ -1068,22 +1182,29 @@ class Checker {
                 // reinterprets no float, so it is skipped on either side (a bf16 stored through its
                 // u16 image). A bitcast to a float type is not skipped.
                 const auto bits = [&](v::Value v) {
-                  while (v.conversion() && v.conversion()->spec->kind == v::TypeConversionKind::Bitcast) {
+                  while (v.conversion() && v.conversion()->spec->kind == v::TypeConversionKind::Bitcast && v.indices().empty()) {
                     const auto e = v.conversion()->spec->target.element().toString();
                     if (e.empty() || (e[0] != 'u' && e[0] != 's' && e[0] != 'b') || e.rfind("bf", 0) == 0) break;
                     v = resolve(v.conversion()->source);
                   }
                   return v;
                 };
+                // At each conversion level the specs and the indices agree; the base values have one
+                // identity (node result, instance, pointer, indices).
                 auto z = bits(resolve(*sv));
                 y = bits(y);
                 while (y.conversion() && z.conversion()) {
-                  if (!(*y.conversion()->spec == *z.conversion()->spec)) return false;
+                  if (!(*y.conversion()->spec == *z.conversion()->spec) || y.indices().size() != z.indices().size())
+                    return false;
+                  for (std::size_t i = 0; i < y.indices().size(); ++i)
+                    if (ident(y.indices()[i]) != ident(z.indices()[i])) return false;
+                  if (static_cast<bool>(y.pointer()) != static_cast<bool>(z.pointer()) ||
+                      (y.pointer() && !(*y.pointer() == *z.pointer())))
+                    return false;
                   y = bits(resolve(y.conversion()->source));
                   z = bits(resolve(z.conversion()->source));
                 }
-                return !y.conversion() && !z.conversion() && y.nodeId() == z.nodeId() &&
-                       y.resultIndex() == z.resultIndex() && y.instanceIndex() == z.instanceIndex();
+                return !y.conversion() && !z.conversion() && ident(y) == ident(z);
               }
               // The cut: a value whose leaves are the inner node's operands at that element. The
               // inner node's element is one node of the graph: every use binds the same value.
@@ -1103,10 +1224,10 @@ class Checker {
               if (!coord || (*coord)[1] >> 32 || (*coord)[0] >> 32)
                 unsupported("producer_element", "an unstored inner node read at more than one element or past 2^32", where);
               const std::pair<std::size_t, std::uint64_t> slot_key{a.ref, ((*coord)[0] << 32) | (*coord)[1]};
-              // The full resolved value (conversion chain, indices and selector included): a and
-              // f32(f16(a)) are two values.
-              const v::Value value = y;
-              if (auto it = bound_.find(slot_key); it != bound_.end() && !(it->second == value)) {
+              // The value's identity (conversion chain and indices included): a and f32(f16(a))
+              // are two values.
+              const std::pair<std::string, v::Value> value{ident(y), y};
+              if (auto it = bound_.find(slot_key); it != bound_.end() && it->second.first != value.first) {
                 conflict = slot_key;
                 return false;
               }
@@ -1128,7 +1249,7 @@ class Checker {
               refuse("primitive_operands", "the primitive's operands are not the term's operands in their formats", d);
             }
             for (const auto& [k, v] : pending) {
-              if (auto [it, added] = bound_.emplace(k, v); !added && !(it->second == v)) {
+              if (auto [it, added] = bound_.emplace(k, v); !added && it->second.first != v.first) {
                 auto dc = d;
                 dc["inner_node"] = k.first;
                 dc["inner_element"] = k.second;
@@ -1136,8 +1257,7 @@ class Checker {
               }
             }
           } else {
-            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where,
-                       has_body ? &cutter : nullptr);
+            checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
           }
           // 3. Factorization.
           if (has_body && !tn.primitive) {
@@ -1168,11 +1288,18 @@ class Checker {
   const Term& t_;
   const UnitLifting* lifting_;
   ScalarSpecialization spec_;
-  std::map<Key, std::uint64_t> stop_;
-  // Per unstored inner node and element: the one value its uses bind (`producer_binding`).
-  std::map<std::pair<std::size_t, std::uint64_t>, v::Value> bound_;
-  std::map<Key, SetRef> memo_;
-  std::map<std::optional<std::uint64_t>, std::map<Key, SetRef>> trans_memo_by_;
+  // Cut values by identity (the cut checker's leaves).
+  std::map<std::string, std::uint64_t> stop_;
+  std::map<std::string, SetRef> memo_;
+  ReachMemo reach_in_;
+  std::map<std::size_t, ReachMemo> reach_body_;
+  std::map<std::size_t, std::map<std::string, std::uint64_t>> sources_;  // body sources per producer
+ public:
+  // Stored values per output object element, and per unstored inner node and element the one
+  // value its uses bind (`producer_binding`; identity and value).
+  std::map<std::size_t, std::vector<std::optional<v::Value>>> stored_;
+  std::map<std::pair<std::size_t, std::uint64_t>, std::pair<std::string, v::Value>> bound_;
+ private:
   std::vector<std::string> foreign_;
 };
 
