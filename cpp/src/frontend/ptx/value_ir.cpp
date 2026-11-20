@@ -3587,6 +3587,109 @@ class AddressDagWriter {
   // Canonical mode: the global allocations some Store of the launch writes, when the graph is
   // known to hold every write of the launch (KeyReadOnlyLoads); unset otherwise.
   std::optional<std::set<std::string>> written_allocations;
+  mutable std::map<Key, std::optional<std::uint64_t>> fixed_values;
+  static bool IntegerScalar(const v::ValueType& type) {
+    if (!type.isScalar()) return false;
+    const auto element = type.element();
+    return (element.isInteger() || element.kind() == v::ElementKind::Bit) &&
+        element.width() >= 1 && element.width() <= 64;
+  }
+  static std::uint64_t Mask(unsigned bits) { return bits == 64 ? UINT64_MAX : (std::uint64_t(1) << bits) - 1; }
+  // `value` of `from` bits widened or truncated to `to` bits: sign extension from a signed
+  // source, zero extension otherwise (PTX cvt and mul.wide on integers).
+  static std::uint64_t Resize(std::uint64_t value, unsigned from, unsigned to, bool is_signed) {
+    value &= Mask(from);
+    if (to > from && is_signed && from < 64 && (value >> (from - 1)) & 1) value |= ~Mask(from);
+    return value & Mask(to);
+  }
+  // The exact value modulo 2^width of an integer `value` built only from non-pointer constants,
+  // this instance's thread and CTA coordinates and wrap-exact integer operations (add, sub, low
+  // and wide multiply, shift left by less than the width, and, or, xor, bitcasts and plain
+  // integer conversions); nullopt for anything else (loads, parameters, pointers, saturation).
+  std::optional<std::uint64_t> Fixed(v::Value value, unsigned depth = 0) const {
+    if (depth > 256) return {};
+    try { value = Selected(value); } catch (const std::invalid_argument&) { return {}; }
+    if (!value.indices().empty() || !IntegerScalar(value.type(graph))) return {};
+    const Key key{value.nodeId(), value.instanceIndex(), value.resultIndex(), value.conversion().get()};
+    if (const auto found = fixed_values.find(key); found != fixed_values.end()) return found->second;
+    auto result = FixedUncached(value, depth);
+    fixed_values.emplace(key, result);
+    return result;
+  }
+  std::optional<std::uint64_t> FixedConversion(v::Value source, const v::ValueType& target,
+                                               bool bitcast, unsigned depth) const {
+    if (!source.indices().empty() || !IntegerScalar(source.type(graph))) return {};
+    const auto from = source.type(graph).element().width(), to = target.element().width();
+    if (bitcast && from != to) return {};
+    const auto x = Fixed(source, depth + 1);
+    if (!x) return {};
+    return Resize(*x, from, to, source.type(graph).element().kind() == v::ElementKind::SignedInteger);
+  }
+  std::optional<std::uint64_t> FixedUncached(v::Value value, unsigned depth) const {
+    const auto type = value.type(graph);
+    const auto bits = type.element().width();
+    const auto mask = Mask(bits);
+    if (value.conversion()) {
+      const auto& spec = *value.conversion()->spec;
+      if (spec.kind == v::TypeConversionKind::Convert && spec.attributes != v::ConversionAttributes{}) return {};
+      return FixedConversion(value.conversion()->source, type, spec.kind == v::TypeConversionKind::Bitcast, depth);
+    }
+    const auto& op = graph.definingNode(value).operation();
+    const auto instance = graph.instance(value);
+    if (dynamic_cast<const v::BitcastOp*>(&op))
+      return FixedConversion(instance.operands.at(0), type, true, depth);
+    if (const auto* convert = dynamic_cast<const v::ConvertOp*>(&op)) {
+      if (convert->attributes() != v::ConversionAttributes{}) return {};
+      return FixedConversion(instance.operands.at(0), type, false, depth);
+    }
+    if (const auto* literal = dynamic_cast<const v::ConstantOp*>(&op)) {
+      auto integer = ParseInteger(literal->literal());
+      if (!integer || literal->pointer() || value.pointer()) return {};
+      return (*integer & Integer(mask)).convert_to<std::uint64_t>();
+    }
+    if (const auto* coordinate = dynamic_cast<const v::CoordinateOp*>(&op)) {
+      const auto axis = static_cast<unsigned>(coordinate->axis());
+      std::uint64_t x;
+      if (coordinate->kind() == v::CoordinateKind::ThreadIndex && instance.origin.thread_coordinates)
+        x = instance.origin.thread_coordinates->at(axis);
+      else if (coordinate->kind() == v::CoordinateKind::BlockIndex && instance.origin.cta_coordinates)
+        x = instance.origin.cta_coordinates->at(axis);
+      else return {};
+      return x & mask;
+    }
+    const auto* binary = dynamic_cast<const v::BinaryOp*>(&op);
+    if (!binary) return {};
+    const auto& attributes = binary->attributes();
+    if (attributes.saturate || attributes.flush_to_zero || attributes.propagate_nan ||
+        attributes.rounding != v::RoundingMode::None) return {};
+    const auto operands = instance.operands;
+    const auto a = Fixed(operands.at(0), depth + 1);
+    if (!a) return {};
+    const auto b = Fixed(operands.at(1), depth + 1);
+    if (!b) return {};
+    const auto mode = attributes.multiply_mode;
+    if (binary->opcode() != v::BinaryOpcode::Multiply && mode != v::IntegerMultiplyMode::Low) return {};
+    switch (binary->opcode()) {
+      case v::BinaryOpcode::Add: return (*a + *b) & mask;
+      case v::BinaryOpcode::Subtract: return (*a - *b) & mask;
+      case v::BinaryOpcode::BitAnd: return *a & *b & mask;
+      case v::BinaryOpcode::BitOr: return (*a | *b) & mask;
+      case v::BinaryOpcode::BitXor: return (*a ^ *b) & mask;
+      case v::BinaryOpcode::ShiftLeft:
+        // PTX clamps a shift amount at the width; only amounts below it are evaluated here.
+        if (*b >= bits) return {};
+        return (*a << *b) & mask;
+      case v::BinaryOpcode::Multiply: {
+        if (mode == v::IntegerMultiplyMode::Low) return (*a * *b) & mask;
+        if (mode != v::IntegerMultiplyMode::Wide) return {};
+        const auto operand = operands.at(0).type(graph).element();
+        if (operand.width() * 2 != bits) return {};
+        const bool is_signed = operand.kind() == v::ElementKind::SignedInteger;
+        return (Resize(*a, operand.width(), bits, is_signed) * Resize(*b, operand.width(), bits, is_signed)) & mask;
+      }
+      default: return {};
+    }
+  }
 public:
   explicit AddressDagWriter(const v::Graph& graph, bool canonical = false)
       : graph(graph), canonical_terms(canonical) {
@@ -3787,8 +3890,63 @@ public:
       return allocation && !written_allocations->contains(*allocation);
     } catch (const std::invalid_argument&) { return false; }
   }
+  // The summands of `value` over integer Add of its width: those Fixed evaluates are summed into
+  // `constant` (mod 2^bits); the others are kept in `rest`.
+  void Summands(v::Value value, unsigned bits, std::uint64_t& constant, std::vector<v::Value>& rest,
+                unsigned depth = 0) {
+    value = Normalize(value);
+    while (value.indices().empty() && IntegerScalar(value.type(graph))) {
+      if (value.conversion() && value.conversion()->spec->kind == v::TypeConversionKind::Bitcast &&
+          IntegerScalar(value.conversion()->source.type(graph)) &&
+          value.conversion()->source.type(graph).element().width() == bits)
+        value = Normalize(value.conversion()->source);
+      else if (!value.conversion() && dynamic_cast<const v::BitcastOp*>(&graph.definingNode(value).operation()) &&
+               IntegerScalar(graph.instance(value).operands.at(0).type(graph)) &&
+               graph.instance(value).operands.at(0).type(graph).element().width() == bits)
+        value = Normalize(graph.instance(value).operands.at(0));
+      else break;
+    }
+    if (value.indices().empty() && !value.threadSelector() && IntegerScalar(value.type(graph)) &&
+        value.type(graph).element().width() == bits) {
+      if (const auto fixed = Fixed(value)) { constant = (constant + *fixed) & Mask(bits); return; }
+      const auto* binary = value.conversion() ? nullptr
+          : dynamic_cast<const v::BinaryOp*>(&graph.definingNode(value).operation());
+      if (depth < 256 && binary && binary->opcode() == v::BinaryOpcode::Add && !binary->attributes().saturate) {
+        const auto operands = graph.instance(value).operands;
+        for (const auto& operand : operands) Summands(operand, bits, constant, rest, depth + 1);
+        return;
+      }
+    }
+    rest.push_back(value);
+  }
+  // Canonical mode: the address as c + sum of opaque summand atoms. Integer Add of one width is
+  // associative and commutative modulo 2^bits, so the address equals (c + sum of the remaining
+  // summands' values) mod 2^bits exactly. The symbolic model reads this sum over the integers,
+  // where it may exceed the bit-vector value by a multiple of 2^bits. Disjointness drawn from
+  // constant differences between two addresses with the same summand atoms is wrap-safe: their
+  // difference is c1 - c2 modulo 2^bits and |c1 - c2| < 2^(bits-1) because each c is peeled only
+  // when 0 <= c < 2^(bits-1). Containment of c + sum in an allocation still needs the remainder
+  // bounded, which the footprint check takes from premises, never from this form. Members of a
+  // strided family then share their summand atoms and differ only in c (the affine footprint).
+  std::optional<Json> Peeled(v::Value value) {
+    const auto normalized = Normalize(value);
+    if (!normalized.indices().empty() || normalized.threadSelector() || !IntegerScalar(normalized.type(graph)))
+      return {};
+    const auto bits = normalized.type(graph).element().width();
+    std::uint64_t constant = 0;
+    std::vector<v::Value> rest;
+    Summands(normalized, bits, constant, rest);
+    if (rest.empty() || constant >= (std::uint64_t(1) << (bits - 1))) return {};
+    Json operands = Json::array({constant});
+    for (const auto& summand : rest)
+      operands.push_back({{"operator", "opaque"},
+          {"provenance", Json::array({"canonical_value_dag", value.graphIdentity(), pool_id, Node(summand)})}});
+    return Json{{"offset", {{"operator", "add"}, {"operands", std::move(operands)}}}};
+  }
   Json Write(v::Value value) {
     slice_visits = 0;
+    if (canonical_terms)
+      if (auto peeled = Peeled(value)) return std::move(*peeled);
     const auto root = Node(value);
     if (canonical_terms)
       return {{"offset", {{"operator", "opaque"},
