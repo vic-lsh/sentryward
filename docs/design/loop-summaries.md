@@ -28,32 +28,40 @@ relations between masked values.
 
 ## Shared mechanism: a global fact set (R7)
 
-Revision 4 replaces per-access constraint sets with one fact set per run, which the address model
-adds to every query (an extension of the existing `address_invariants`, which are per-term only).
+Revision 4 replaces per-access constraint sets with one global fact set per run, which the address
+model adds to every query, plus local sets only on accesses of summarized loop iterations (an extension of the existing
+`address_invariants`, which are per-term only).
 
 - A fact is a formula over atoms that is true of every concrete execution the run stands for (an
   execution following the leaf's branch choices). Atoms that denote one lane's values carry that
   lane's identity (CTA, warp, lane, visit), so facts from different lanes share only atoms that
   denote the same value in every lane (tensor-property elements, coordinates of the same thread).
   The conjunction of all recorded facts is then true of each such execution, under the assignment
-  of every atom to its concrete value: one global environment is sound, and no fact needs to be
-  attached to an access.
-- Stage B adds iteration atoms (a summarized loop's `k`, havocked registers of an iteration). Their
-  facts (`0 <= k < T`, ...) mention only that loop visit's atoms, so for any concrete iteration `j`
-  the assignment `k = j` (and the iteration's concrete register values) satisfies them together with
-  every other fact at its concrete values.
+  of every atom to its concrete value: one global environment is sound, and no global fact needs
+  to be attached to an access. Atoms a loop exit havocks denote one concrete value each (the exit
+  state), so facts on them are global like any other.
+- Iteration facts are local, not global. A summarized loop's iteration atom `k` stands for every
+  iteration, so `0 <= k < T` is not a fact about the execution: in the global set it would assert
+  `T >= 1` and exclude zero-trip executions from every other query. Each access recorded inside a
+  summarized iteration carries a handle to its local fact set (`0 <= k < T`), which its query adds to
+  the global facts; no other access sees it. For any concrete iteration `j`, the assignment `k = j`
+  (and the iteration's concrete values for its havocked registers) satisfies the local set together
+  with the global facts at their concrete values. Global facts never mention iteration atoms (no
+  internal branches in a summarized body, and exported values use `T`, not `k`). `T` and its facts
+  are global: `T` is the trip count, which exists in every execution.
 - Query: Z3 searches for atom values within their bounds, satisfying the facts that share atoms with
   the address (closure over shared atoms), with the address outside every declared piece of the
   access's direction. Unsat is contained; sat is a violation with a witness; unknown is undecided
   (never a pass). The fact set is checked satisfiable once per run; an unsat set (an infeasible
   leaf) reports `infeasible_path`, which a consumer treats as no evidence (never a pass) (S2).
-- The environment is fixed for the run, so the extrema cache stays keyed by offset. `Instantiate`
-  adds atoms that occur only in facts. The `BoxOnly`, free-atom and constant-offset shortcuts may
-  still pass an access whose unconstrained hull is inside (sound: facts only shrink the set); they
-  may not report a violation for an access whose atoms occur in a fact. Family extraction is
-  unchanged (lane-identity atoms already differ per member, so such accesses do not merge).
-  Representative CTA classes (`footprint_checker.cpp`) are disabled for a run with any fact, since
-  a member's facts are not its representative's shifted. Each rule gets a native control.
+- The global environment is fixed for the run, so the extrema cache stays keyed by offset for
+  accesses without local facts; an access with local facts is keyed by (offset, local set) (R7).
+  `Instantiate` adds atoms that occur only in facts. The `BoxOnly`, free-atom and constant-offset
+  shortcuts may still pass an access whose unconstrained hull is inside (sound: facts only shrink
+  the set); they may not report a violation for an access whose atoms occur in a fact. Accesses with
+  different local sets never share a family. Representative CTA classes (`footprint_checker.cpp`)
+  are disabled for a run with any fact, since a member's facts are not its representative's shifted.
+  Each rule gets a native control.
 - Atoms for loaded values: in a run with `branch_decisions` or a summarized loop, an integer load
   whose value would otherwise be unknown yields a fresh lane atom bounded by its type's range (exact
   identity: load line, CTA, warp, lane, visit), so values derived from it (`cvt`, `add`, `shl`)
@@ -154,9 +162,9 @@ not wrap. Unknown or failed: refuse.
 
 ### B4. Summary execution (per lane)
 
-1. Make the trip-count atom `T` and an iteration atom `k` (identity: header line, CTA, warp, lane,
-   visit), with `T`'s facts and `0 <= k < T` added to the run's fact set.
-2. One iteration `k` (facts `0 <= k < T`): the header prefix (test block before the exit branch),
+1. Make the trip-count atom `T` (its facts global) and an iteration atom `k` (identity: header line,
+   CTA, warp, lane, visit) with the local fact set `0 <= k < T`.
+2. One iteration `k` (its accesses carry the local set): the header prefix (test block before the exit branch),
    then the body and latch, IVs at their `U` per program point, other carried registers havocked
    at iteration start. One atom covers the whole iteration, so values the prefix computes flow into
    the body consistently (R8).
