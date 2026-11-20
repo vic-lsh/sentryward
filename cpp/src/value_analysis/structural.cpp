@@ -1404,7 +1404,8 @@ class Checker {
   std::map<std::size_t, std::map<std::string, std::uint64_t>> sources_;  // body sources per producer
  public:
   // Stored values per output object element, and per unstored inner node and element the one
-  // value its uses bind (`producer_binding`; identity and value). Read by the reference.
+  // value its uses bind (`producer_binding`; identity and value). The reference checks bound_
+  // against its own reading of the consumers; it keeps its own map of output writes.
   std::map<std::size_t, std::vector<std::optional<v::Value>>> stored_;
   std::map<std::pair<std::size_t, std::uint64_t>, std::pair<std::string, v::Value>> bound_;
   bool outputs_complete_ = false;  // stored_ holds every final output write
@@ -1412,71 +1413,213 @@ class Checker {
   std::vector<std::string> foreign_;
 };
 
-// ---- Reference (tests only, --structural-reference): the role predicates by plain reachability. ----
-// Written apart from the checker's traversal: its own successor relation over the value DAG, its
-// own structural value equality (resolved at every level), a fresh graph and search per (output
-// element, argument, role, source element), no memo shared across queries and no cut. Shared with
-// the checker: the term's expected elements (argLeaves, argCut), which term elements an initial
-// load reads (loadLeaves), the stored values and the producer bindings the checker made.
-// Verdicts: holds, fails, undecided (a step it cannot follow), unsupported (a role the checker
-// refuses by construction: addend or multiplicand on a body argument, a role on a body argument
-// of an unstored producer).
+// ---- Reference (tests only, --structural-reference): an independent restatement by plain reachability. ----
+// Written apart from the checker: its own successor relation over the value DAG, its own
+// structural value equality (resolved at every level), its own term-element expansion (each read
+// pattern evaluated at concrete coordinates, recursively through body nodes), its own load mapping
+// (memory elimination's read records to term elements by byte arithmetic), its own map from output
+// writes to elements, a fresh graph per query and no memo shared across queries. Shared: the
+// parsed term, the value graph, memory elimination's records and the scalar specialization
+// (SentryWard's infrastructure, not the check's). The checker's producer bindings (bound_) are not
+// trusted: each is checked against the consumer's own operands at the coordinate the reference
+// computes, and every coordinate a consumer reads must be bound.
+// Checks: leaves (every output element reaches exactly its term elements), cuts (an opaque node
+// with body arguments, with its producers' stored values as stops, reaches exactly its cut
+// elements and direct operands), bindings, and the four roles. Verdicts: holds, fails, undecided
+// (a step it cannot follow); roles also unsupported (a role the checker refuses by construction:
+// addend or multiplicand on a body argument, a role on a body argument of an unstored producer).
 class Reference {
  public:
-  Reference(Checker& c, const v::Graph& g, const MemoryEliminationResult& m, const Term& t, bool lifting)
+  Reference(const Checker& c, const v::Graph& g, const MemoryEliminationResult& m, const Term& t, bool lifting)
       : c_(c), g_(g), m_(m), t_(t), spec_(g, lifting) {}
 
-  Json run() {
-    Json fails = Json::array(), undecided = Json::array();
-    std::size_t checks = 0, holds = 0, unsupported_roles = 0;
-    const auto at = Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}};
-    const auto check = [&](std::size_t m, const v::Value& root, std::uint64_t r, std::uint64_t c) {
+  // `matched`: the checker matched, so every binding it needed was made (completeness is checked).
+  Json run(bool matched) {
+    m_.forEachOutput(g_, [&](const OutputWrite& w) {
+      if (const auto e = elementOf(w.region.allocation, w.region.offset)) stored_.emplace(*e, w.value);
+    });
+    Tally roles, leaves, cuts, bindings;
+    std::size_t unsupported_roles = 0;
+    const auto attempt = [&](Tally& tally, const Json& where, const auto& f) {
+      ++tally.checks;
+      try {
+        if (f()) ++tally.holds;
+        else tally.fail(where);
+      } catch (const Undecided& u) {
+        auto d = where;
+        d["why"] = u.why;
+        tally.undecide(d);
+      }
+    };
+    const auto roleChecks = [&](std::size_t m, const v::Value& root, std::uint64_t r, std::uint64_t c) {
       const auto& tn = t_.nodes[m];
       for (std::size_t k = 0; k < tn.args.size(); ++k)
         for (const auto role : tn.roles[k]) {
-          ++checks;
           const Json where = {{"node", m}, {"element", {r, c}}, {"argument", k}, {"role", int(role)}};
-          try {
-            const auto v = decide(m, k, role, root, at, r, c);
-            if (v == "holds") ++holds;
-            else if (v == "unsupported") ++unsupported_roles;
-            else if (fails.size() < 32) fails.push_back(where);
-            else fails.push_back("...");
-          } catch (const Undecided& u) {
-            auto d = where;
-            d["why"] = u.why;
-            if (undecided.size() < 32) undecided.push_back(d);
-          }
+          std::string v;
+          attempt(roles, where, [&] {
+            v = decide(m, k, role, root, r, c);
+            return v != "fails";
+          });
+          if (v == "unsupported") ++unsupported_roles, --roles.holds;
         }
     };
-    for (std::size_t m = 0; m < t_.nodes.size(); ++m) {
-      const auto& tn = t_.nodes[m];
-      if (tn.primitive || !tn.out) continue;
-      const auto& o = t_.objects[*tn.out];
-      const auto per = o.stride / o.bytes;
-      const auto& values = c_.stored_.at(*tn.out);
-      for (std::size_t e = 0; e < values.size(); ++e)
-        if (values[e] && e % per < o.cols) check(m, *values[e], e / per, e % per);
+    for (const auto& [e, value] : stored_) {
+      const auto obj = std::get<0>(e), r = std::get<1>(e), c = std::get<2>(e);
+      for (std::size_t n = 0; n < t_.nodes.size(); ++n) {
+        const auto& tn = t_.nodes[n];
+        if (!tn.out || *tn.out != obj) continue;
+        const Json where = {{"node", n}, {"element", {r, c}}};
+        attempt(leaves, where, [&] { return reached(value, nullptr) == expected(n, r, c, false); });
+        if (tn.primitive) {
+          bindingChecks(n, value, r, c, matched, bindings);
+          continue;
+        }
+        bool body = false, stored = true;
+        for (const auto& a : tn.args) body |= a.body, stored &= !a.body || t_.nodes[a.ref].out.has_value();
+        if (body && stored) attempt(cuts, where, [&] { return reached(value, &n) == expected(n, r, c, true); });
+        roleChecks(n, value, r, c);
+      }
     }
-    for (const auto& [key, value] : c_.bound_) check(key.first, value.second, key.second >> 32, key.second & 0xffffffffu);
-    return {{"checks", checks}, {"holds", holds}, {"unsupported", unsupported_roles},
-            {"fails", fails}, {"undecided", undecided}};
+    // The checker's bindings: each must be one the reference found (above); their roles.
+    for (const auto& [key, value] : c_.bound_) {
+      const Json where = {{"node", key.first}, {"coordinate", {key.second >> 32, key.second & 0xffffffffu}}};
+      if (!seen_.contains(key)) {
+        ++bindings.checks;
+        bindings.fail(where);
+        continue;
+      }
+      roleChecks(key.first, value.second, key.second >> 32, key.second & 0xffffffffu);
+    }
+    auto out = roles.json();
+    out["unsupported"] = unsupported_roles;
+    out["leaves"] = leaves.json();
+    out["cuts"] = cuts.json();
+    out["bindings"] = bindings.json();
+    return out;
   }
 
  private:
   struct Undecided {
     std::string why;
   };
+  struct Tally {
+    std::size_t checks = 0, holds = 0;
+    Json fails = Json::array(), undecided = Json::array();
+    void fail(const Json& w) { push(fails, w); }
+    void undecide(const Json& w) { push(undecided, w); }
+    static void push(Json& xs, const Json& w) {
+      if (xs.size() < 32) xs.push_back(w);
+      else if (xs.size() == 32) xs.push_back("...");
+    }
+    Json json() const { return {{"checks", checks}, {"holds", holds}, {"fails", fails}, {"undecided", undecided}}; }
+  };
+  using El = std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>;  // space, row, column
+  using Els = std::set<El>;
+  static constexpr std::uint64_t kForeign = ~std::uint64_t{0};
   enum class Kind { Other, Add, Mul, Fma, Bits, Conv, Load, Leaf };
   struct N {
     v::Value x;
     Kind kind = Kind::Other;
     bool trans = false, initial = false;
+    std::optional<El> cut;  // a stop: the cut element this value is
     std::size_t indices = 0;  // succ[0, indices): index values
     std::vector<std::size_t> succ;
-    Set reads;  // an initial load's elements
+    Els reads;  // an initial load's elements
   };
 
+  // ---- Term elements, by evaluating read patterns at concrete coordinates. ----
+  static std::vector<std::array<std::uint64_t, 2>> coords(const Pattern& p, std::uint64_t r, std::uint64_t c) {
+    const std::array<std::uint64_t, 2> out{r, c};
+    std::array<std::vector<std::uint64_t>, 2> axis;
+    for (std::size_t d = 0; d < 2; ++d) {
+      const auto& i = p[d];
+      switch (i.kind) {
+        case Index::Out: axis[d] = {out[i.value]}; break;
+        case Index::Const: axis[d] = {i.value}; break;
+        case Index::Mod: axis[d] = {out[i.value] % i.size}; break;
+        case Index::All:
+          for (std::uint64_t u = 0; u < i.value; ++u) axis[d].push_back(u);
+          break;
+        case Index::Block:
+          for (std::uint64_t u = out[i.value] / i.size * i.size, e = u + i.size; u < e; ++u) axis[d].push_back(u);
+          break;
+      }
+    }
+    std::vector<std::array<std::uint64_t, 2>> xs;
+    for (const auto a : axis[0])
+      for (const auto b : axis[1]) xs.push_back({a, b});
+    return xs;
+  }
+  // The elements argument `a` reads at its node's output (r, c): input elements; for a body
+  // argument the producer's cut elements (`cut`) or, recursively, the producer's own elements.
+  void argElements(const Arg& a, std::uint64_t r, std::uint64_t c, bool cut, Els& out) const {
+    for (const auto& p : a.reads)
+      for (const auto& q : coords(p, r, c)) {
+        if (!a.body) out.insert({t_.inputs[a.ref], q[0], q[1]});
+        else if (cut) out.insert({t_.objects.size() + a.ref, q[0], q[1]});
+        else for (const auto& e : expected(a.ref, q[0], q[1], false)) out.insert(e);
+      }
+  }
+  Els expected(std::size_t n, std::uint64_t r, std::uint64_t c, bool cut) const {
+    Els out;
+    for (const auto& a : t_.nodes[n].args) argElements(a, r, c, cut, out);
+    return out;
+  }
+
+  // ---- Memory: bytes of an allocation to term elements. ----
+  std::optional<El> elementOf(const std::string& allocation, std::uint64_t byte) const {
+    for (std::size_t i = 0; i < t_.objects.size(); ++i) {
+      const auto& o = t_.objects[i];
+      if (o.allocation != allocation || byte < o.base) continue;
+      const auto rel = byte - o.base, row = rel / o.stride, col = rel % o.stride / o.bytes;
+      if (row < o.rows && col < o.cols) return El{i, row, col};
+    }
+    return std::nullopt;
+  }
+  Els region(const std::string& allocation, std::uint64_t offset, std::uint64_t bytes) const {
+    Els s;
+    for (auto b = offset; b < offset + bytes; ++b) {
+      const auto e = elementOf(allocation, b);
+      s.insert(e ? *e : El{kForeign, 0, b});
+    }
+    return s;
+  }
+  // The term elements initial-memory load x reads (none: it reads a stored value).
+  std::optional<Els> loadElements(const v::Value& x) {
+    const MemoryInstance key{x.nodeId(), x.instanceIndex()};
+    const std::uint64_t bytes = g_.type(x.withoutSelection()).element().width() / 8;
+    std::optional<std::uint64_t> sel;
+    if (!x.indices().empty()) {
+      const auto k = x.indices().size() == 1 ? spec_.known(x.indices()[0]) : std::nullopt;
+      if (!k || k->literal.empty() || k->literal[0] == '-') throw Undecided{"a load component that is not a constant"};
+      sel = std::stoull(k->literal) * bytes;
+    }
+    const auto narrow = [&](const ConstantRegion& r) {
+      return sel ? region(r.allocation, r.offset + *sel, bytes) : region(r.allocation, r.offset, r.bytes);
+    };
+    if (const auto it = m_.symbolic_initial_reads.find(key); it != m_.symbolic_initial_reads.end()) return narrow(it->second);
+    if (m_.symbolic_read_positions.contains(key)) throw Undecided{"symbolic read position"};
+    if (const auto* r = m_.readReplacement(key)) {
+      if (std::get_if<v::Value>(r)) return std::nullopt;
+      if (const auto* i = std::get_if<InitialMemorySymbol>(r)) return narrow(i->region);
+      if (sel) throw Undecided{"a component of a reassembled read"};
+      Els s;
+      const auto piece = [&](const ReinterpretedRead& p) {
+        const auto* i = std::get_if<InitialMemorySymbol>(&p.source);
+        if (!i) throw Undecided{"read reassembled from stored values"};
+        const auto e = region(i->region.allocation, i->region.offset + p.byte_offset, p.type.bitSize() / 8);
+        s.insert(e.begin(), e.end());
+      };
+      if (const auto* p = std::get_if<ReinterpretedRead>(r)) piece(*p);
+      else for (const auto& p : std::get<AssembledRead>(*r).pieces) piece(p);
+      return s;
+    }
+    if (const auto i = m_.initialRead(key)) return narrow(i->region);
+    throw Undecided{"unresolved load"};
+  }
+
+  // ---- The value DAG. ----
   v::Value res(v::Value x) { return spec_.selected(g_.canonicalInterpretation(x)); }
   bool same(v::Value a, v::Value b) {
     a = res(a);
@@ -1507,35 +1650,24 @@ class Reference {
     const auto& op = g_.definingNode(x).operation();
     if (dynamic_cast<const v::LoadOp*>(&op)) {
       const MemoryInstance key{x.nodeId(), x.instanceIndex()};
+      if (const auto* r = m_.readReplacement(key); r && std::get_if<v::Value>(r) && !m_.symbolic_initial_reads.contains(key)) {
+        const auto& value = std::get<v::Value>(*r);
+        n.kind = Kind::Load;
+        out.push_back(x.indices().empty() ? value : g_.component(value, {x.indices().begin(), x.indices().end()}));
+        return out;
+      }
       n.kind = Kind::Leaf;
       n.initial = true;
-      if (m_.symbolic_initial_reads.contains(key)) return out;
-      if (m_.symbolic_read_positions.contains(key)) throw Undecided{"symbolic read position"};
-      if (const auto* r = m_.readReplacement(key)) {
-        if (const auto* value = std::get_if<v::Value>(r)) {
-          n.kind = Kind::Load;
-          n.initial = false;
-          out.push_back(x.indices().empty() ? *value : g_.component(*value, {x.indices().begin(), x.indices().end()}));
-          return out;
-        }
-        if (std::get_if<InitialMemorySymbol>(r)) return out;
-        const auto* p = std::get_if<ReinterpretedRead>(r);
-        if (p && !std::get_if<v::Value>(&p->source)) return out;
-        if (!p) {
-          bool initial = true;
-          for (const auto& q : std::get<AssembledRead>(*r).pieces) initial &= !std::get_if<v::Value>(&q.source);
-          if (initial) return out;
-        }
-        throw Undecided{"read reassembled from stored values"};
-      }
-      if (m_.initialRead(key)) return out;
-      throw Undecided{"unresolved load"};
+      n.reads = *loadElements(x);
+      return out;
     }
     if (dynamic_cast<const v::ConstantOp*>(&op) || dynamic_cast<const v::InputParameterOp*>(&op) ||
         dynamic_cast<const v::CoordinateOp*>(&op)) {
       n.kind = Kind::Leaf;
       return out;
     }
+    if (dynamic_cast<const v::OpaqueValueOp*>(&op) || dynamic_cast<const v::FailedClcResponseOp*>(&op))
+      throw Undecided{"undetermined value"};
     if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op)) {
       using B = v::BinaryOpcode;
       const auto c = b->opcode();
@@ -1558,8 +1690,17 @@ class Reference {
     return out;
   }
 
-  // The DAG below root, values interned by structural equality (root is node 0).
-  std::vector<N> graph(const v::Value& root) {
+  // The DAG below root, values interned by structural equality (root is node 0). With `cuts` (an
+  // opaque node), a value equal to a stored value of one of the node's body producers is a stop.
+  std::vector<N> graph(const v::Value& root, const std::size_t* cuts = nullptr) {
+    std::vector<std::pair<v::Value, El>> stops;
+    if (cuts)
+      for (const auto& a : t_.nodes[*cuts].args) {
+        if (!a.body) continue;
+        const auto obj = *t_.nodes[a.ref].out;
+        for (const auto& [e, value] : stored_)
+          if (std::get<0>(e) == obj) stops.push_back({value, {t_.objects.size() + a.ref, std::get<1>(e), std::get<2>(e)}});
+      }
     std::vector<N> ns;
     std::vector<std::size_t> todo;
     const auto intern = [&](const v::Value& x) {
@@ -1577,44 +1718,94 @@ class Reference {
       const auto i = todo.back();
       todo.pop_back();
       N n;
-      const auto xs = successors(ns[i].x, n);
       n.x = ns[i].x;
-      if (n.initial) n.reads = *c_.loadLeaves(n.x, false);
-      for (const auto& y : xs) n.succ.push_back(intern(y));
+      for (const auto& [value, e] : stops)
+        if (same(n.x, value)) {
+          if (n.cut && *n.cut != e) throw Undecided{"one value stored at two cut elements"};
+          n.cut = e;
+        }
+      if (!n.cut)
+        for (const auto& y : successors(n.x, n)) n.succ.push_back(intern(y));
       ns[i] = std::move(n);
     }
     return ns;
   }
-
-  static bool contains(const Set& s, std::uint64_t e) {
-    for (const auto& x : s)
-      if (x.begin <= e && e < x.end) return true;
-    return false;
+  // The elements root reaches: initial-load elements, and with `cuts` the cut elements of stops
+  // (nothing below a stop).
+  Els reached(const v::Value& root, const std::size_t* cuts) {
+    Els s;
+    for (const auto& n : graph(root, cuts)) {
+      if (n.cut) s.insert(*n.cut);
+      if (n.initial) s.insert(n.reads.begin(), n.reads.end());
+    }
+    return s;
   }
 
-  std::string decide(std::size_t m, std::size_t k, Role role, const v::Value& root, const Pattern& at,
-                     std::uint64_t r, std::uint64_t c) {
+  // Primitive consumer n's stored value at (r, c): each body argument of an unstored producer
+  // reads one coordinate q of it; (producer, q) must be bound (when the checker matched), to a
+  // value that is an operand of n's operation there (below the store conversion), with the
+  // producer's elements at q.
+  void bindingChecks(std::size_t n, const v::Value& value, std::uint64_t r, std::uint64_t c, bool matched, Tally& t) {
+    const auto& tn = t_.nodes[n];
+    for (std::size_t k = 0; k < tn.args.size(); ++k) {
+      const auto& a = tn.args[k];
+      if (!a.body || t_.nodes[a.ref].out || a.reads.size() != 1) continue;
+      const auto qs = coords(a.reads[0], r, c);
+      if (qs.size() != 1) continue;  // the checker refuses (producer_element)
+      const auto q = qs[0];
+      const std::pair<std::size_t, std::uint64_t> key{a.ref, (q[0] << 32) | q[1]};
+      const Json where = {{"node", n}, {"element", {r, c}}, {"argument", k}, {"producer", a.ref}, {"coordinate", q}};
+      const auto it = c_.bound_.find(key);
+      if (it == c_.bound_.end()) {
+        if (matched) ++t.checks, t.fail(where);
+        continue;
+      }
+      seen_.insert(key);
+      ++t.checks;
+      try {
+        auto x = res(value);
+        while (x.conversion() && x.indices().empty() &&
+               (x.conversion()->spec->kind == v::TypeConversionKind::Convert ||
+                g_.type(x.conversion()->source).element().width() == g_.type(x).element().width()))
+          x = res(x.conversion()->source);
+        if (!x.conversion() && x.indices().empty() && dynamic_cast<const v::ConvertOp*>(&g_.definingNode(x).operation()))
+          x = res(g_.instanceOperands(x).at(0));
+        bool operand = false;
+        for (const auto& o : g_.instanceOperands(x)) operand |= same(o, it->second.second);
+        if (operand && reached(it->second.second, nullptr) == expected(a.ref, q[0], q[1], false)) ++t.holds;
+        else t.fail(where);
+      } catch (const Undecided& u) {
+        auto d = where;
+        d["why"] = u.why;
+        t.undecide(d);
+      }
+    }
+  }
+
+  static bool contains(const Els& s, const El& e) { return s.contains(e); }
+
+  // Role `role` of argument k of opaque node m, whose value at its output (r, c) is root.
+  std::string decide(std::size_t m, std::size_t k, Role role, const v::Value& root, std::uint64_t r, std::uint64_t c) {
     const auto& arg = t_.nodes[m].args[k];
     const bool trans_role = role == RoleKind::ThroughTranscendental || role == RoleKind::AvoidsTranscendental;
     if (arg.body && (!trans_role || !t_.nodes[arg.ref].out)) return "unsupported";
-    const auto ek = arg.body ? c_.argCut(m, k, at, r, c) : c_.argLeaves(m, k, at, r, c);
-    std::vector<std::uint64_t> elements;
-    for (const auto& x : ek)
-      for (auto e = x.begin; e < x.end; ++e) elements.push_back(e);
+    Els own;
+    argElements(arg, r, c, arg.body, own);
+    const std::vector<El> elements(own.begin(), own.end());
     const auto ns = graph(root);
     const auto n = ns.size();
+    // A source of element e: for an input argument an initial load reading e; for a body argument
+    // the producer's stored value at e.
+    const auto source = [&](std::size_t i, const El& e) {
+      if (!arg.body) return ns[i].initial && contains(ns[i].reads, e);
+      const auto it = stored_.find({*t_.nodes[arg.ref].out, std::get<1>(e), std::get<2>(e)});
+      return it != stored_.end() && same(ns[i].x, it->second);
+    };
     // reach[e][i]: a path from node i reaches source element e (a fresh search per element).
     std::vector<std::vector<char>> reach;
-    for (const auto e : elements) {
+    for (const auto& e : elements) {
       std::vector<char> src(n, 0);
-      for (std::size_t i = 0; i < n; ++i) {
-        if (arg.body) {
-          const auto& sv = c_.stored_.at(*t_.nodes[arg.ref].out).at(e & kElementMask);
-          src[i] = sv && same(ns[i].x, *sv);
-        } else {
-          src[i] = ns[i].initial && contains(ns[i].reads, e);
-        }
-      }
+      for (std::size_t i = 0; i < n; ++i) src[i] = source(i, e);
       std::vector<signed char> memo(n, -1);
       std::function<bool(std::size_t)> go = [&](std::size_t i) -> bool {
         if (memo[i] >= 0) return memo[i];
@@ -1690,12 +1881,12 @@ class Reference {
           const auto other = x.succ[x.indices + (1 - (q - x.indices))];
           return any(x.succ[q]) && !any(other);
         };
-        for (std::size_t ei = 0; ei < elements.size(); ++ei) {
+        for (const auto& e : elements) {
           // unguarded[i]: some path from i reaches the element using no guard edge.
           std::vector<signed char> um(n, -1);
           std::function<bool(std::size_t)> ug = [&](std::size_t i) -> bool {
             if (um[i] >= 0) return um[i];
-            bool h = ns[i].initial && contains(ns[i].reads, elements[ei]);
+            bool h = ns[i].initial && contains(ns[i].reads, e);
             for (std::size_t q = 0; q < ns[i].succ.size(); ++q)
               if (!guard(i, q)) h = ug(ns[i].succ[q]) || h;
             um[i] = h;
@@ -1709,11 +1900,13 @@ class Reference {
     return "fails";
   }
 
-  Checker& c_;
+  const Checker& c_;
   const v::Graph& g_;
   const MemoryEliminationResult& m_;
   const Term& t_;
   ScalarSpecialization spec_;
+  std::map<El, v::Value> stored_;  // output writes by element (the reference's own map)
+  std::set<std::pair<std::size_t, std::uint64_t>> seen_;  // bindings a consumer element confirmed
 };
 
 }  // namespace
@@ -1739,11 +1932,11 @@ std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryElimin
     report["reason"] = "term_or_internal";
     report["message"] = e.what();
   }
-  // The reference also runs after a refusal (over the stored values and the bindings committed
-  // so far), so a test can compare refusals too; it never changes the result.
+  // The reference also runs after a refusal (over the output writes and the bindings committed so
+  // far), so a test can compare refusals too; it never changes the result.
   if (reference && checker && checker->outputs_complete_) {
     try {
-      report["reference"] = Reference(*checker, graph, memory, *term, lifting != nullptr).run();
+      report["reference"] = Reference(*checker, graph, memory, *term, lifting != nullptr).run(report["result"] == "matched");
     } catch (const std::exception& e) {
       report["reference"] = {{"error", e.what()}};
     }
