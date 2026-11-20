@@ -1978,7 +1978,7 @@ std::string Analyze(Input&& source, bool verify, MemoryRaceOptions memory_option
           {"logical_accesses",family.logical_accesses},{"access_families",family.access_families},
           {"candidate_relations",family.candidate_relations},{"affine_member_rows",family.affine_member_rows},
           {"hb_member_enumerations",family.hb_member_enumerations},{"hb_frontier_pieces",family.hb_frontier_pieces},
-          {"base_relations",family.base_relations}};
+          {"base_relations",family.base_relations},{"distinct_row_relations",family.distinct_row_relations}};
       }
       report["memory_analysis"]["address_model"] = {
           {"refined_pairs", address.refined}, {"cache_hits", address.cache_hits},

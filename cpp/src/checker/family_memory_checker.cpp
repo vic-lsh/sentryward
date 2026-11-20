@@ -364,7 +364,7 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
     counts.nodes=result.reducedFamilies();counts.edges=result.memberChecks();
     return result;
   });
-  std::size_t relation_count=0,row_enumerations=0,base_relations=0;
+  std::size_t relation_count=0,row_enumerations=0,base_relations=0,distinct_row_relations=0;
   std::size_t obligation_rows=0,self_rows=0;
   ProfileScope expansion("memory.family.expansion_sites");
   ObligationGroups duplicates,same_values;
@@ -420,7 +420,7 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
     profile.pruned=row_enumerations+hb.stats().member_enumerations-initial_hb_stats.member_enumerations;
     result.family_stats=MemoryRaceResult::FamilyStats{logical_accesses,families.size(),relation_count,
         row_enumerations,hb.stats().member_enumerations-initial_hb_stats.member_enumerations,hb.stats().frontier_pieces-initial_hb_stats.frontier_pieces,
-        base_relations};
+        base_relations,distinct_row_relations};
     result.reachability_stats.batches=hb.stats().traversals-initial_hb_stats.traversals;
     result.reachability_stats.queries=result.address_candidates;
     result.reachability_stats.edge_visits=hb.stats().relation_visits-initial_hb_stats.relation_visits;
@@ -590,6 +590,11 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
           if(base) {
             window=ClassifyFamilyOverlap(first,within_window(i),second,within_window(j));
             if(!window->unknown.empty()) {window.reset();base=false;}
+            // Distinct rows (docs/design/distinct-rows.md): a trusted relation makes t1 == t2
+            // impossible, so only the case t1 != t2 remains, whose windows share no byte: R is
+            // empty. Each family has one atom (windowForm checks every member), so its table
+            // word is fixed; the relation's tables are read-only for the launch.
+            else if(memory.distinctRows(*window_of(i),*window_of(j))) {window->overlap.clear();++distinct_row_relations;}
           }
           auto overlap=window?std::move(*window):ClassifyFamilyOverlap(first,footprints[i],second,footprints[j]);
           if(base)++base_relations;
