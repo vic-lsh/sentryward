@@ -586,15 +586,18 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
           // A pair related by base: R from the within-window offsets, by the same exact interval
           // arithmetic; an unknown part (unrepresentable arithmetic) keeps the existing path.
           bool base=related_by_base(i,j);
+          // Distinct rows (docs/design/distinct-rows.md): a trusted relation makes t1 == t2
+          // impossible, so only the case t1 != t2 remains, whose windows share no byte (each
+          // family's bytes lie in [0, S) of its window, windowForm's span check): R is empty and
+          // is not computed. Each family has one atom (windowForm checks every member), so its
+          // table word is fixed; the relation's tables are read-only for the launch.
+          if(base && memory.distinctRows(*window_of(i),*window_of(j))) {
+            ++base_relations;++distinct_row_relations;return;
+          }
           std::optional<FamilyOverlap> window;
           if(base) {
             window=ClassifyFamilyOverlap(first,within_window(i),second,within_window(j));
             if(!window->unknown.empty()) {window.reset();base=false;}
-            // Distinct rows (docs/design/distinct-rows.md): a trusted relation makes t1 == t2
-            // impossible, so only the case t1 != t2 remains, whose windows share no byte: R is
-            // empty. Each family has one atom (windowForm checks every member), so its table
-            // word is fixed; the relation's tables are read-only for the launch.
-            else if(memory.distinctRows(*window_of(i),*window_of(j))) {window->overlap.clear();++distinct_row_relations;}
           }
           auto overlap=window?std::move(*window):ClassifyFamilyOverlap(first,footprints[i],second,footprints[j]);
           if(base)++base_relations;
