@@ -197,10 +197,13 @@ not wrap. Unknown or failed: refuse.
 
 1. Make the trip-count atom `T` (its facts global) and an iteration atom `k` (identity: header line,
    CTA, warp, lane, visit) with the local fact set `0 <= k < T`.
-2. One iteration `k` (its accesses carry the local set): the header prefix (test block before the exit branch),
-   then the body and latch, IVs at their `U` per program point, other carried registers havocked
-   at iteration start. One atom covers the whole iteration, so values the prefix computes flow into
-   the body consistently (R8).
+2. One iteration `k` (its accesses carry the local set): the iteration CFG in its concrete order,
+   from the header, IVs at their `U` per program point, other carried registers havocked at
+   iteration start. Pre-test: the header prefix (test block before the exit branch), then the body
+   and latch. Post-test: the body, then the test-block prefix (U2). One atom covers the whole
+   iteration, so values flow between program points consistently (R8). Mask definitions over an
+   IV or any value that depends on `k` add their quotient/remainder facts to the iteration's local
+   set, not the global one (U4).
 3. Pre-test only, the final failing visit: the header prefix once more with every IV at `U = T` and
    other carried registers havocked; its accesses are checked; then the exit edge.
 4. Exit: each IV at `x0 + imm*U_exit` (`U_exit = T`), exact by the no-wrap proof (which covers it);
