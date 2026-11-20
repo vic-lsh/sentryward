@@ -1,0 +1,251 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "k_sample",
+ "launch": {
+  "grid_dim": [
+   8,
+   12,
+   1
+  ],
+  "block_dim": [
+   512,
+   1,
+   1
+  ],
+  "dynamic_shared_bytes": 0
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "logits"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "hdr"
+  },
+  {
+   "parameter": 2,
+   "type": "pointer",
+   "space": "global",
+   "object": "qo_indptr"
+  },
+  {
+   "parameter": 3,
+   "type": "pointer",
+   "space": "global",
+   "object": "slot"
+  },
+  {
+   "parameter": 4,
+   "type": "pointer",
+   "space": "global",
+   "object": "emit_token_index"
+  },
+  {
+   "parameter": 5,
+   "type": "pointer",
+   "space": "global",
+   "object": "pick"
+  },
+  {
+   "parameter": 6,
+   "type": "pointer",
+   "space": "global",
+   "object": "next_tok"
+  },
+  {
+   "parameter": 7,
+   "type": "pointer",
+   "space": "global",
+   "object": "part"
+  },
+  {
+   "parameter": 8,
+   "type": "pointer",
+   "space": "global",
+   "object": "count"
+  }
+ ],
+ "arguments": [
+  {
+   "parameter": 9,
+   "type": "u32",
+   "value": 248320
+  },
+  {
+   "parameter": 10,
+   "type": "u32",
+   "value": 2048
+  },
+  {
+   "parameter": 11,
+   "type": "u32",
+   "value": 8
+  }
+ ],
+ "footprints": [
+  {
+   "object": "count",
+   "direction": "readwrite",
+   "extent_bytes": 32,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "readwrite"
+    }
+   ]
+  },
+  {
+   "object": "emit_token_index",
+   "direction": "read",
+   "extent_bytes": 32,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "hdr",
+   "direction": "read",
+   "extent_bytes": 16,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 1,
+     "stride": 16,
+     "period": 16,
+     "count": 1,
+     "width": 16,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "logits",
+   "direction": "read",
+   "extent_bytes": 3973120,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 496640,
+     "period": 496640,
+     "count": 1,
+     "width": 496640,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "next_tok",
+   "direction": "readwrite",
+   "extent_bytes": 32,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "readwrite"
+    }
+   ]
+  },
+  {
+   "object": "part",
+   "direction": "readwrite",
+   "extent_bytes": 768,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 96,
+     "period": 96,
+     "count": 1,
+     "width": 96,
+     "direction": "readwrite"
+    }
+   ]
+  },
+  {
+   "object": "pick",
+   "direction": "write",
+   "extent_bytes": 32,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "write"
+    }
+   ]
+  },
+  {
+   "object": "qo_indptr",
+   "direction": "read",
+   "extent_bytes": 36,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 8,
+     "count": 1,
+     "width": 8,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "slot",
+   "direction": "read",
+   "extent_bytes": 32,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 8,
+     "stride": 4,
+     "period": 4,
+     "count": 1,
+     "width": 4,
+     "direction": "read"
+    }
+   ]
+  }
+ ],
+ "footprint_reads": "noninterference",
+ "branch_decisions": [
+  {
+   "line": 55,
+   "taken": false
+  },
+  {
+   "line": 66,
+   "taken": true
+  },
+  {
+   "line": 93,
+   "taken": true
+  }
+ ]
+}

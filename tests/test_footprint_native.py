@@ -138,6 +138,16 @@ class FootprintNativeTest(unittest.TestCase):
         self.assertEqual(fp["reads"], "not_contained")
         self.assertEqual(fp["outside_reads"][0]["object"], "next_tok")
 
+    # k_sample folds `__syncthreads_or(bad)` (bar.red.or.pred) into its pick: a CTA barrier whose
+    # result (the same in every thread) depends on loaded data. It is checked, not refused as an
+    # unsupported collective.
+    def test_bar_red_or_is_a_barrier_with_an_unknown_uniform_result(self):
+        r = run("feed", "sample_reduce_or")
+        self.assertNotIn("shared_control_collective_variant", [str(d.get("code")) for d in r.get("diagnostics", [])])
+        fp = self.footprint(r)
+        self.assertEqual(r["result"], "race_free")
+        self.assertEqual((fp["writes"], fp["reads"]), ("contained", "contained"))
+
 
 if __name__ == "__main__":
     unittest.main()
