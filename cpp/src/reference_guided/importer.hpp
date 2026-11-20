@@ -3350,24 +3350,10 @@ struct Importer {
     const Id result = a.add(std::move(terms));
     return t.starts_with("s") ? cast(result, "u" + std::to_string(w), t) : result;
   }
-  // PTX operations that have only approximate f32 forms (ex2, lg2, sin, cos, rsqrt, tanh), and sqrt or
-  // reciprocal in their .approx forms.
-  static bool approximate_instruction(const RawNode &n) {
-    static const std::set<std::string> approximate_only{"Exp2", "PtxLog2", "PtxSin", "PtxCos",
-                                                        "PtxReciprocalSqrt", "Rsqrt", "Tanh"};
-    if (approximate_only.contains(n.name)) return true;
-    return (n.name == "PtxSqrt" || n.name == "Reciprocal" || n.name == "Divide") &&
-           n.attributes.find(".approx") != std::string::npos;
-  }
   Id make(const RawNode &n, const std::vector<Id> &x, const Env &ctx,
           const Env &body) {
     const std::string &k = n.kind, &t = n.type, &attr = n.attributes;
     std::string name = n.name;
-    // A PTX approximate instruction is read as the exact function it approximates (ex2.approx as exp2,
-    // lg2.approx as log2, ...): its error is that instruction's rounding, not a different real function.
-    // Each import is counted (comparison report `approximate_instructions`) so a verdict names them.
-    if (hardware_values && k == "Operation" && approximate_instruction(n))
-      ++a.stats["approximate_instruction:" + name];
     if (k == "Constant")
       return literal(name, t);
     if (k == "Index") {

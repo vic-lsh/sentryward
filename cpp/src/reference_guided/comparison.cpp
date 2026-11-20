@@ -617,12 +617,6 @@ ComparisonResult rg::compare(Document left, Document right, J mapping, const Com
                                       {"replaced", rule.replaced}, {"denotes", rule.denotes}, {"uses", it->second}});
     }
   }
-  // Approximate PTX instructions read as their exact function (Importer::approximate_instruction): not a
-  // replaced constant but the instruction's own rounding; listed so a verdict names every one it read.
-  r["approximate_instructions"] = J::object();
-  for (const auto &[counter, uses] : a.stats)
-    if (counter.starts_with("approximate_instruction:") && uses)
-      r["approximate_instructions"][counter.substr(std::string("approximate_instruction:").size())] = uses;
   r["input_contract_applied_reads"] = J::array();
   for(const auto &[side,object,type]:(prepared ? prepared->contract.applied : contract.applied))
     r["input_contract_applied_reads"].push_back(J{{"side",side},{"object",object},{"element_type",type}});

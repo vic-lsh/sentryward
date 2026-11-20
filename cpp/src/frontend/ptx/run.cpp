@@ -1146,12 +1146,30 @@ struct CtaAccount {
   std::uint64_t records = 0, assumed_assertions = 0;
   std::uint64_t representative_branch_uses = 0, bounded_loop_uses = 0;
   std::uint64_t election_uses = 0, clc_uses = 0, atomic_uses = 0;
+  // Executions of approximate floating instructions (ApproximateInstruction), by mnemonic.
+  std::map<std::string, std::uint64_t> approximate_instructions;
   std::map<std::uint64_t, std::uint64_t> opaque_regions;
   std::map<std::uint64_t, ptx::DataBranchDecision> data_branch_decisions;
   std::set<std::uint32_t> static_choice_lines;
   // Whether the CTA executed one of `atomic_sites` (class mode's unit-independence precondition).
   bool executes_atomic_site = false;
 };
+// The full mnemonic of a PTX approximate floating instruction: ex2, lg2, sin, cos, rsqrt and tanh (no
+// exactly rounded form), and rcp, sqrt or div in their .approx (and div's .full) forms. The reference
+// comparison reads each as the exact function it approximates: the instruction's rounding of the same
+// real function (reported per verdict, equivalence.approximate_instructions). None otherwise.
+std::optional<std::string> ApproximateInstruction(const ptx::Instruction &instruction) {
+  static const std::set<std::string> approximate_only{"ex2", "lg2", "sin", "cos", "rsqrt", "tanh"};
+  const auto &op = instruction.opcode;
+  const auto &m = instruction.modifiers;
+  const auto has = [&](const char *modifier) { return std::find(m.begin(), m.end(), modifier) != m.end(); };
+  if (!approximate_only.contains(op) &&
+      !((op == "rcp" || op == "sqrt" || op == "div") && has("approx")) && !(op == "div" && has("full")))
+    return std::nullopt;
+  std::string mnemonic = op;
+  for (const auto &modifier : m) mnemonic += "." + modifier;
+  return mnemonic;
+}
 // Adds a later decision at one branch line to its summary: the counts add up, and the
 // assumption and rule become the later one's.
 void AddDecision(ptx::DataBranchDecision &summary, const ptx::DataBranchDecision &decision) {
@@ -1185,6 +1203,9 @@ CtaAccount SummarizeCta(const ptx::CtaFacts &cta_facts, const ptx::Function &fun
     if (op == "elect") account.election_uses += count;
     if (op == "clusterlaunchcontrol") account.clc_uses += count;
     if (op == "atom" || op == "red") account.atomic_uses += count;
+    if (count != 0)
+      if (auto mnemonic = ApproximateInstruction(function.instructions[id]))
+        account.approximate_instructions[*mnemonic] += count;
   }
   for (const auto id : atomic_sites)
     if (id < static_counts.size() && static_counts[id] != 0) account.executes_atomic_site = true;
@@ -1490,6 +1511,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               config.fixed_input["cluster_launch_cancellation"] == false},
           {"assertion_uses",0}, {"election_uses",0}, {"clc_uses",0},
           {"representative_branch_uses",0}, {"bounded_loop_uses",0}, {"atomic_uses",0},
+          {"approximate_instructions",Json::object()},
           {"data_branch_decisions",Json::array()},
           {"opaque_compute_regions",Json::array()}};
       alg::OverridePtxAssumptions(effective_assumptions,
@@ -1673,6 +1695,9 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               add("election_uses", cta_account.election_uses);
               add("clc_uses", cta_account.clc_uses);
               add("atomic_uses", cta_account.atomic_uses);
+              for (const auto &[mnemonic, count] : cta_account.approximate_instructions)
+                facts["approximate_instructions"][mnemonic] =
+                    facts["approximate_instructions"].value(mnemonic, std::uint64_t(0)) + count;
               // Unit independence forbids an executed global atomic: restart if this CTA executes one.
               if (unit_plan.class_mode && cta_account.executes_atomic_site)
                 throw alg::UnitClassRestart{"executed_global_atomic"};
@@ -2493,6 +2518,11 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           constants_used = Json(false);
       }
     }
+    // The approximate PTX instructions the analyzed CTAs executed, which the comparison read as exact
+    // functions: named in the equivalence report beside the idealizations (not an idealization).
+    if (auto equivalence = result.find("equivalence"); equivalence != result.end() && equivalence->is_object())
+      (*equivalence)["approximate_instructions"] = input_metadata.value("frontend_assumptions", Json::object())
+          .value("approximate_instructions", Json::object());
     if (!result.contains("assumptions")) {
       result["assumptions"] = Json::array();
       for (const auto& entry : alg::AssumptionPool()) {

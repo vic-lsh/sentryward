@@ -312,9 +312,12 @@ Not part of this premise: a PTX approximate instruction (`ex2.approx`,
 `.approx` forms of `sqrt`, `rcp` and `div`) is read as the exact function it
 approximates. Its error is that instruction's own rounding of the same real
 function, not a different function, so it belongs with rounding in the
-hardware value model. The comparison still names each one it read:
-`equivalence.approximate_instructions` maps the instruction's node name to its
-number of imports.
+hardware value model. The report still names each one:
+`equivalence.approximate_instructions` maps the full PTX mnemonic (e.g.
+`ex2.approx.ftz.f32`, `div.full.f32`) to its executions in the analyzed CTAs,
+taken from the PTX instructions themselves, not from the lowered expression
+(where a software exp2 sequence and `ex2.approx` look alike, and `rcp`/`div`
+lose their modifiers).
 
 ## Duplicate TMA stores
 

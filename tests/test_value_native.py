@@ -84,9 +84,12 @@ class ValueNativeTest(unittest.TestCase):
                            "denotes": "-log2(e)", "uses": 1}])
 
     def test_approximate_instructions_listed(self):
-        # ex2.approx (read as exp2) is named in the report, apart from the idealizations.
+        # ex2.approx (read as exp2) is named by its PTX mnemonic, apart from the idealizations; the kernel's
+        # div.rn (exactly rounded) is not an approximate instruction.
         r = run("sact", "k_sact_split")
-        self.assertEqual(r["internal"]["equivalence"]["approximate_instructions"], {"Exp2": 1})
+        approximate = r["internal"]["equivalence"]["approximate_instructions"]
+        self.assertEqual(sorted(approximate), ["ex2.approx.ftz.f32"])
+        self.assertGreater(approximate["ex2.approx.ftz.f32"], 0)
 
     def test_mixed_literal_signs_not_proven(self):
         r = run("sact", "k_sact_split_sm121a_mixed_sign")
