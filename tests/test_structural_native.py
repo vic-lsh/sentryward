@@ -5,7 +5,9 @@ SENTRYWARD_PTX_NATIVE names a built sentryward-ptx.
 
 Covers the role boundary (a body argument's transcendental role is checked from its producer's
 bound output; an input argument's from its loads, over every path including through a producer)
-and producer binding (an unstored inner node's element binds one value at every use).
+producer binding (an unstored inner node's element, identified by its coordinate, binds one value
+at every use; an unstored primitive producer is refused, its operation would go unchecked) and the
+Multiplicand role (no path from the argument bypasses the multiply).
 """
 import json
 import os
@@ -49,6 +51,20 @@ class StructuralNativeTest(unittest.TestCase):
         r = run("unstored_neg_two", "unstored")
         self.assertEqual((r["result"], r["reason"]), ("refused", "producer_binding"))
 
+
+    def test_unstored_primitive_producer_refused(self):
+        # add(mul(a, b), c) with mul unstored, computed as (a - b) + c: same leaves, other op.
+        r = run("unstored_neg_sub", "unstored_prim")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "unstored_primitive_producer"))
+
+    def test_multiplicand_matches(self):
+        self.assertEqual(run("mult_pos", "mult")["result"], "matched")
+
+    def test_multiplicand_bypass_refused(self):
+        # a * b + a: a is a factor of an independent product on one path and bypasses it on another.
+        r = run("mult_neg_bypass", "mult")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "role"))
+        self.assertEqual(r["detail"]["role"], "multiplicand")
 
 if __name__ == "__main__":
     unittest.main()

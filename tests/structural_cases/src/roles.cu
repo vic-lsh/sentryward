@@ -31,4 +31,21 @@ __global__ void unstored_neg_two(const float* a, const float* b, const float* c,
   y1[i] = (a[i] * a[i] + 1.f) + b[i];
   y2[i] = (a[i] * a[i] + 2.f) + c[i];
 }
+// add(mul(a, b), c) with mul unstored, computed as (a - b) + c. Must be refused
+// (unstored_primitive_producer): an unstored primitive's operation is not checked.
+__global__ void unstored_neg_sub(const float* a, const float* b, const float* c, float* y) {
+  const int i = threadIdx.x;
+  y[i] = (a[i] - b[i]) + c[i];
+}
+
+// scale(a, b), multiplicand role on a: y = a * b.
+__global__ void mult_pos(const float* a, const float* b, float* y) {
+  const int i = threadIdx.x;
+  y[i] = a[i] * b[i];
+}
+// y = a * b + a: one path from a bypasses the multiply. Must be refused (role, multiplicand).
+__global__ void mult_neg_bypass(const float* a, const float* b, float* y) {
+  const int i = threadIdx.x;
+  y[i] = a[i] * b[i] + a[i];
+}
 }

@@ -310,6 +310,21 @@ class Checker {
     return normalize(std::move(xs));
   }
 
+  // The one coordinate pattern `at` names at output element (row, col), or none when it names a
+  // range (All, Block).
+  static std::optional<std::array<std::uint64_t, 2>> coordinate(const Pattern& at, std::uint64_t row, std::uint64_t col) {
+    const std::array<std::uint64_t, 2> out{row, col};
+    std::array<std::uint64_t, 2> x{};
+    for (std::size_t d = 0; d < 2; ++d) {
+      const auto& c = at[d];
+      if (c.kind == Index::Out) x[d] = out[c.value];
+      else if (c.kind == Index::Const) x[d] = c.value;
+      else if (c.kind == Index::Mod) x[d] = out[c.value] % c.size;
+      else return std::nullopt;
+    }
+    return x;
+  }
+
   // The term object holding byte `offset` of allocation `allocation` and that byte's element
   // index (row * (stride / bytes) + column, from the object's base), or none.
   std::optional<std::pair<std::size_t, std::uint64_t>> elementAt(const std::string& allocation,
@@ -549,6 +564,38 @@ class Checker {
     });
   }
 
+  // The leaves of k that x reaches on some path that passes no product whose other factor reaches
+  // no leaf of k (a path that bypasses the multiply).
+  Set bypassLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
+    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
+      const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+      const bool product = (b && b->opcode() == v::BinaryOpcode::Multiply) || dynamic_cast<const v::FmaOp*>(&op);
+      Set s;
+      std::size_t from = 0;
+      if (product && xs.size() >= 2) {
+        const auto l0 = meet(leaves(xs[0], d + 1), k), l1 = meet(leaves(xs[1], d + 1), k);
+        // The covered factor's paths pass the product; the other factor's are its own.
+        if (l1.empty() && !l0.empty()) s = unite(s, bypassLeaves(xs[1], k, memo, d + 1));
+        else if (l0.empty() && !l1.empty()) s = unite(s, bypassLeaves(xs[0], k, memo, d + 1));
+        else for (std::size_t i = 0; i < 2; ++i) s = unite(s, operandBypass(xs[i], k, memo, d + 1));
+        from = 2;  // an fma's addend is not a factor
+      }
+      for (std::size_t i = from; i < xs.size(); ++i) s = unite(s, operandBypass(xs[i], k, memo, d + 1));
+      return s;
+    });
+  }
+  // An operand's bypass leaves: a leaf of k itself, else its own walk.
+  Set operandBypass(const v::Value& a, const Set& k, Memo& memo, unsigned depth) {
+    auto y = resolve(a);
+    while (y.conversion()) y = resolve(y.conversion()->source);
+    if (const auto* ld = dynamic_cast<const v::LoadOp*>(&g_.definingNode(y).operation())) {
+      (void)ld;
+      const auto* rep = m_.readReplacement({y.nodeId(), y.instanceIndex()});
+      if (!rep || !std::get_if<v::Value>(rep)) return meet(leaves(a, depth), k);
+    }
+    return bypassLeaves(a, k, memo, depth);
+  }
+
   // The leaves of k that x reaches by some path other than adds, an fma's addend, conversions and
   // bit operations with constant operands, or as both operands of one add.
   Set nonAddendLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
@@ -654,11 +701,17 @@ class Checker {
             ok = reached.empty();
             name = "addend";
             break;
-          case RoleKind::Multiplicand:
+          case RoleKind::Multiplicand: {
+            // Every leaf of the argument is reached as a factor of a product whose other factor
+            // is independent of it, and no path reaches one without passing such a product.
             reached = factorLeaves(root, e, memo);
-            ok = reached == e;
+            Memo bmemo;
+            const auto bypass = bypassLeaves(root, e, bmemo);
+            ok = reached == e && bypass.empty();
+            if (!bypass.empty()) reached = bypass;
             name = "multiplicand";
             break;
+          }
         }
         if (!ok) {
           auto d = where;
@@ -1011,12 +1064,21 @@ class Checker {
               }
               // The cut: a value whose leaves are the inner node's operands at that element. The
               // inner node's element is one node of the graph: every use binds the same value.
+              // An unstored primitive producer is not supported: only its leaves would be checked,
+              // not its operation (add(mul(a, b), c) could bind sub(a, b)).
+              if (inner.primitive) {
+                auto dc = d;
+                dc["inner_node"] = a.ref;
+                refuse("unstored_primitive_producer", "an unstored primitive inner node: its operation is not checked", dc);
+              }
               const auto at = a.reads[0];
               std::vector<SpacePattern> ps;
               for (const auto& q : patterns(t_, a.ref, false)) ps.push_back({q.space, compose(q.at, at)});
               if (leaves(y) != materialize(ps, r, c)) return false;
-              const auto elem = materialize({{t_.objects.size() + a.ref, at}}, r, c).front().begin & kElementMask;
-              const std::pair<std::size_t, std::uint64_t> slot_key{a.ref, elem};
+              // The element's identity is its coordinate (an unstored node has no layout object).
+              const auto coord = coordinate(at, r, c);
+              if (!coord) unsupported("producer_element", "an unstored inner node read at more than one element", where);
+              const std::pair<std::size_t, std::uint64_t> slot_key{a.ref, ((*coord)[0] << 32) | (*coord)[1]};
               const Key value{y.nodeId(), y.resultIndex(), y.instanceIndex()};
               if (auto it = bound_.find(slot_key); it != bound_.end() && !(it->second == value)) {
                 conflict = slot_key;
