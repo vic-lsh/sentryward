@@ -1,6 +1,6 @@
 # Relational path conditions and loop summaries for footprint containment
 
-Status: design, revision 3, for review before implementation (Coral D253 follow-up 3). Fork branch
+Status: design, revision 4, for review before implementation (Coral D253 follow-up 3). Fork branch
 `claude/sw-loop-summaries`, based on `claude/sw-path-conds` (bfcdd5a). Revision 1 drew R1..R10
 (Codex review 1); revision 2 drew S1..S6 (Codex re-check). Each is cited where it is addressed.
 
@@ -26,23 +26,38 @@ block Coral rows:
 Stage A closes gap 1 and is a prerequisite of stage B (loops), whose trip counts and tails are
 relations between masked values.
 
-## Shared mechanism: constrained accesses (R7)
+## Shared mechanism: a global fact set (R7)
 
-- Each lane carries a path constraint set: formulas over atoms (exact integers). Each recorded
-  access stores a handle to the set current at the access (sets are persistent, so a prefix is
-  shared, and are normalized for hashing).
-- Containment query: Z3 searches for atom values within their bounds, satisfying the access's
-  constraints, with the address outside every declared piece of the access's direction. Unsat is
-  contained; sat is a violation with a witness satisfying the constraints; unknown is undecided
-  (never a pass). Before using a set, its satisfiability is checked on its own; an unsat set (an
-  infeasible path) marks the leaf `infeasible_path`, which a consumer treats as no evidence (never a
-  pass) (S2).
-- `Instantiate` includes atoms that occur only in constraints. The extrema cache is keyed by
-  (offset, constraint set). `BoxOnly`, the free-atom and constant-offset shortcuts may pass a
-  constrained access only when the unconstrained hull is inside; they never report a violation for
-  it. Accesses with different constraint sets never share a family; constrained accesses are not
-  aggregated into representative CTA classes (`footprint_checker.cpp`). Each of these gets a native
-  control.
+Revision 4 replaces per-access constraint sets with one fact set per run, which the address model
+adds to every query (an extension of the existing `address_invariants`, which are per-term only).
+
+- A fact is a formula over atoms that is true of every concrete execution the run stands for (an
+  execution following the leaf's branch choices). Atoms that denote one lane's values carry that
+  lane's identity (CTA, warp, lane, visit), so facts from different lanes share only atoms that
+  denote the same value in every lane (tensor-property elements, coordinates of the same thread).
+  The conjunction of all recorded facts is then true of each such execution, under the assignment
+  of every atom to its concrete value: one global environment is sound, and no fact needs to be
+  attached to an access.
+- Stage B adds iteration atoms (a summarized loop's `k`, havocked registers of an iteration). Their
+  facts (`0 <= k < T`, ...) mention only that loop visit's atoms, so for any concrete iteration `j`
+  the assignment `k = j` (and the iteration's concrete register values) satisfies them together with
+  every other fact at its concrete values.
+- Query: Z3 searches for atom values within their bounds, satisfying the facts that share atoms with
+  the address (closure over shared atoms), with the address outside every declared piece of the
+  access's direction. Unsat is contained; sat is a violation with a witness; unknown is undecided
+  (never a pass). The fact set is checked satisfiable once per run; an unsat set (an infeasible
+  leaf) reports `infeasible_path`, which a consumer treats as no evidence (never a pass) (S2).
+- The environment is fixed for the run, so the extrema cache stays keyed by offset. `Instantiate`
+  adds atoms that occur only in facts. The `BoxOnly`, free-atom and constant-offset shortcuts may
+  still pass an access whose unconstrained hull is inside (sound: facts only shrink the set); they
+  may not report a violation for an access whose atoms occur in a fact. Family extraction is
+  unchanged (lane-identity atoms already differ per member, so such accesses do not merge).
+  Representative CTA classes (`footprint_checker.cpp`) are disabled for a run with any fact, since
+  a member's facts are not its representative's shifted. Each rule gets a native control.
+- Atoms for loaded values: in a run with `branch_decisions` or a summarized loop, an integer load
+  whose value would otherwise be unknown yields a fresh lane atom bounded by its type's range (exact
+  identity: load line, CTA, warp, lane, visit), so values derived from it (`cvt`, `add`, `shl`)
+  keep affine forms that later facts can constrain. Runs without choices and loops are unchanged.
 
 ## Stage A: relational path conditions
 
@@ -131,7 +146,7 @@ Trip count `T` (body executions) is an integer atom with constraints, never a di
   `U` at the hitting test, `T = T'` pre-test or `T' + 1` post-test per phase) is used, and only then
   (S2). Monotone progress without wrap makes that test the first hit.
 
-No wrap (S1, S4): the solver proves, under the entry path constraints and `T`'s constraints, that
+No wrap (S1, S4): the solver proves, under the facts recorded so far and `T`'s facts, that
 for every executed update (pre-test: `U` in `[0, T]`, the final failing header visit included;
 post-test: `U` in `[0, T]`), every IV value `x0 + imm*U` lies in its type's range in each reading the
 code uses (signed or unsigned), and every `w`-bit address operation inside `L` built from IVs does
@@ -140,14 +155,14 @@ not wrap. Unknown or failed: refuse.
 ### B4. Summary execution (per lane)
 
 1. Make an iteration atom `k >= 0` (identity: header line, CTA, warp, lane, visit) and the trip-count
-   atom `T`, with `T`'s constraints added to the lane's path set.
+   atom `T`, with `T`'s facts added to the run's fact set.
 2. Header prefix (test block before the exit branch): executed with IVs at `U = k`, constraint
    `0 <= k <= T` (pre-test: it also runs on the failing visit) (R8).
 3. Body and latch: IVs at their `U` per program point, constraint `0 <= k < T`, other carried
    registers havocked.
 4. Exit: each IV at `x0 + imm*U_exit` (`U_exit = T`), exact by the no-wrap proof (which covers it);
    any IV the proof does not cover is havocked instead (S4). Every other carried register havocked.
-   `T` stays in the lane's path set, so a remainder loop starting from the main loop's exit counter
+   `T`'s facts stay in the fact set, so a remainder loop starting from the main loop's exit counter
    keeps the relation (R9).
 
 The template executor falls back to per-lane execution before grouping any instruction of `L`.
@@ -207,8 +222,9 @@ Stage A:
    forced not taken bounds neither.
 4. Mask quotient: a read at `n & -16` with `n` bounded is contained; control with `n & -15` is unknown.
 5. Infeasible leaf (contradictory choices) reports `infeasible_path`, never contained.
-6. Address-model controls: a cached extremum under one constraint set is not reused under another; a
-   representative CTA class is not used for a constrained access.
+6. Address-model controls: a run with a fact does not use representative CTA classes; a shortcut
+   never reports a violation for an access whose atoms occur in a fact; an atom that occurs only in
+   a fact is instantiated.
 
 Stage B:
 1. `k_copy_n` (`i < n`, `n` bounded by a premise): contained (unrolled 16/8/4/1 shape).
