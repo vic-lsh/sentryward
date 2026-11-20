@@ -73,6 +73,7 @@ struct Options {
   std::string ptx, config, report, dump_source, dump_value_ir, dump_output_expressions, dump_scalar_fold;
   // Structural mode (docs/structural-mode.md): the binding term's file and the report's path.
   std::string structural_term, structural_report;
+  bool structural_reference = false;  // tests only: the reference role verdicts in the report
   std::string cache_correctness, resume_correctness;
   std::string dump_branch_scope;
   std::string equivalence_mapping;
@@ -170,6 +171,7 @@ Options Arguments(int argc, char **argv) {
       o.analyze_values = true;
     else if (a == "--structural-term") { o.structural_term = value(); o.analyze_values = true; }
     else if (a == "--structural-report") o.structural_report = value();
+    else if (a == "--structural-reference") o.structural_reference = true;
 
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
 #include "sentryward/development/runner/expression_options.inc"
@@ -1370,7 +1372,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         std::stringstream term_text;
         term_text << term_file.rdbuf();
         structural_text = sentryward::value_analysis::checkStructuralTerm(
-            semantic_program->values, *eliminated, term_text.str(), class_lifting() ? &*unit_lifting : nullptr);
+            semantic_program->values, *eliminated, term_text.str(), class_lifting() ? &*unit_lifting : nullptr,
+            options.structural_reference);
       }
       value_analysis = {{"status", eliminated->complete ? "expressions_ready" : "unsupported"},
           {"passes", Json::array({

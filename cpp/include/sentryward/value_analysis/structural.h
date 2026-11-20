@@ -27,8 +27,11 @@ namespace sentryward::value_analysis {
 // lifting): the check covers the representatives' elements, and each member by its per-allocation
 // offset, which must be one whole row shift of every row-indexed object and zero for the others
 // (the term's leaf patterns then shift with it). Null: every CTA is in the graph. Never throws on a term or graph mismatch: those are refusals
-// in the report ("result": "matched" | "refused" | "unsupported").
+// in the report ("result": "matched" | "refused" | "unsupported"). `reference` (tests only): after a
+// match, also report the role predicates' verdicts by a separate plain-reachability
+// implementation ("reference": checks, holds, fails, undecided), for the differential test.
 std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryEliminationResult& memory,
-                                const std::string& term_json, const UnitLifting* lifting);
+                                const std::string& term_json, const UnitLifting* lifting,
+                                bool reference = false);
 
 }  // namespace sentryward::value_analysis

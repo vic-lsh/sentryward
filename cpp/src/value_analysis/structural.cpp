@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1296,17 +1297,318 @@ class Checker {
   std::map<std::size_t, std::map<std::string, std::uint64_t>> sources_;  // body sources per producer
  public:
   // Stored values per output object element, and per unstored inner node and element the one
-  // value its uses bind (`producer_binding`; identity and value).
+  // value its uses bind (`producer_binding`; identity and value). Read by the reference.
   std::map<std::size_t, std::vector<std::optional<v::Value>>> stored_;
   std::map<std::pair<std::size_t, std::uint64_t>, std::pair<std::string, v::Value>> bound_;
  private:
   std::vector<std::string> foreign_;
 };
 
+// ---- Reference (tests only, --structural-reference): the role predicates by plain reachability. ----
+// Written apart from the checker's traversal: its own successor relation over the value DAG, its
+// own structural value equality (resolved at every level), a fresh graph and search per (output
+// element, argument, role, source element), no memo shared across queries and no cut. Shared with
+// the checker: the term's expected elements (argLeaves, argCut), which term elements an initial
+// load reads (loadLeaves), the stored values and the producer bindings the checker made.
+// Verdicts: holds, fails, undecided (a step it cannot follow), unsupported (a role the checker
+// refuses by construction: addend or multiplicand on a body argument, a role on a body argument
+// of an unstored producer).
+class Reference {
+ public:
+  Reference(Checker& c, const v::Graph& g, const MemoryEliminationResult& m, const Term& t, bool lifting)
+      : c_(c), g_(g), m_(m), t_(t), spec_(g, lifting) {}
+
+  Json run() {
+    Json fails = Json::array(), undecided = Json::array();
+    std::size_t checks = 0, holds = 0, unsupported_roles = 0;
+    const auto at = Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}};
+    const auto check = [&](std::size_t m, const v::Value& root, std::uint64_t r, std::uint64_t c) {
+      const auto& tn = t_.nodes[m];
+      for (std::size_t k = 0; k < tn.args.size(); ++k)
+        for (const auto role : tn.roles[k]) {
+          ++checks;
+          const Json where = {{"node", m}, {"element", {r, c}}, {"argument", k}, {"role", int(role)}};
+          try {
+            const auto v = decide(m, k, role, root, at, r, c);
+            if (v == "holds") ++holds;
+            else if (v == "unsupported") ++unsupported_roles;
+            else if (fails.size() < 32) fails.push_back(where);
+            else fails.push_back("...");
+          } catch (const Undecided& u) {
+            auto d = where;
+            d["why"] = u.why;
+            if (undecided.size() < 32) undecided.push_back(d);
+          }
+        }
+    };
+    for (std::size_t m = 0; m < t_.nodes.size(); ++m) {
+      const auto& tn = t_.nodes[m];
+      if (tn.primitive || !tn.out) continue;
+      const auto& o = t_.objects[*tn.out];
+      const auto per = o.stride / o.bytes;
+      const auto& values = c_.stored_.at(*tn.out);
+      for (std::size_t e = 0; e < values.size(); ++e)
+        if (values[e] && e % per < o.cols) check(m, *values[e], e / per, e % per);
+    }
+    for (const auto& [key, value] : c_.bound_) check(key.first, value.second, key.second >> 32, key.second & 0xffffffffu);
+    return {{"checks", checks}, {"holds", holds}, {"unsupported", unsupported_roles},
+            {"fails", fails}, {"undecided", undecided}};
+  }
+
+ private:
+  struct Undecided {
+    std::string why;
+  };
+  enum class Kind { Other, Add, Mul, Fma, Bits, Conv, Load, Leaf };
+  struct N {
+    v::Value x;
+    Kind kind = Kind::Other;
+    bool trans = false, initial = false;
+    std::size_t indices = 0;  // succ[0, indices): index values
+    std::vector<std::size_t> succ;
+    Set reads;  // an initial load's elements
+  };
+
+  v::Value res(v::Value x) { return spec_.selected(g_.canonicalInterpretation(x)); }
+  bool same(v::Value a, v::Value b) {
+    a = res(a);
+    b = res(b);
+    if (a.threadSelector() || b.threadSelector()) throw Undecided{"thread selector"};
+    if (a.graphIdentity() != b.graphIdentity() || a.nodeId() != b.nodeId() || a.resultIndex() != b.resultIndex() ||
+        a.instanceIndex() != b.instanceIndex())
+      return false;
+    if (bool(a.pointer()) != bool(b.pointer()) || (a.pointer() && !(*a.pointer() == *b.pointer()))) return false;
+    if (a.indices().size() != b.indices().size()) return false;
+    for (std::size_t i = 0; i < a.indices().size(); ++i)
+      if (!same(a.indices()[i], b.indices()[i])) return false;
+    if (bool(a.conversion()) != bool(b.conversion())) return false;
+    if (!a.conversion()) return true;
+    return *a.conversion()->spec == *b.conversion()->spec && same(a.conversion()->source, b.conversion()->source);
+  }
+
+  // The successors of resolved x: index values, then the conversion source, the stored value a
+  // load reads, or the operation's operands.
+  std::vector<v::Value> successors(const v::Value& x, N& n) {
+    std::vector<v::Value> out(x.indices().begin(), x.indices().end());
+    n.indices = out.size();
+    if (x.conversion()) {
+      n.kind = Kind::Conv;
+      out.push_back(x.conversion()->source);
+      return out;
+    }
+    const auto& op = g_.definingNode(x).operation();
+    if (dynamic_cast<const v::LoadOp*>(&op)) {
+      const MemoryInstance key{x.nodeId(), x.instanceIndex()};
+      n.kind = Kind::Leaf;
+      n.initial = true;
+      if (m_.symbolic_initial_reads.contains(key)) return out;
+      if (m_.symbolic_read_positions.contains(key)) throw Undecided{"symbolic read position"};
+      if (const auto* r = m_.readReplacement(key)) {
+        if (const auto* value = std::get_if<v::Value>(r)) {
+          n.kind = Kind::Load;
+          n.initial = false;
+          out.push_back(x.indices().empty() ? *value : g_.component(*value, {x.indices().begin(), x.indices().end()}));
+          return out;
+        }
+        if (std::get_if<InitialMemorySymbol>(r)) return out;
+        const auto* p = std::get_if<ReinterpretedRead>(r);
+        if (p && !std::get_if<v::Value>(&p->source)) return out;
+        if (!p) {
+          bool initial = true;
+          for (const auto& q : std::get<AssembledRead>(*r).pieces) initial &= !std::get_if<v::Value>(&q.source);
+          if (initial) return out;
+        }
+        throw Undecided{"read reassembled from stored values"};
+      }
+      if (m_.initialRead(key)) return out;
+      throw Undecided{"unresolved load"};
+    }
+    if (dynamic_cast<const v::ConstantOp*>(&op) || dynamic_cast<const v::InputParameterOp*>(&op) ||
+        dynamic_cast<const v::CoordinateOp*>(&op)) {
+      n.kind = Kind::Leaf;
+      return out;
+    }
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op)) {
+      using B = v::BinaryOpcode;
+      const auto c = b->opcode();
+      n.kind = c == B::Add ? Kind::Add : c == B::Multiply ? Kind::Mul
+             : (c == B::ShiftLeft || c == B::ShiftRight || c == B::BitAnd || c == B::BitOr) ? Kind::Bits : Kind::Other;
+    } else if (dynamic_cast<const v::FmaOp*>(&op)) {
+      n.kind = Kind::Fma;
+    } else if (dynamic_cast<const v::IdealExp2Op*>(&op)) {
+      n.trans = true;
+    } else if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      const auto c = p->opcode();
+      n.trans = c == O::Exp2 || c == O::Log2 || c == O::Sin || c == O::Cos || c == O::Tanh;
+    } else if (!(dynamic_cast<const v::UnaryOp*>(&op) || dynamic_cast<const v::ConvertOp*>(&op) ||
+                 dynamic_cast<const v::BitcastOp*>(&op) || dynamic_cast<const v::CompareOp*>(&op) ||
+                 dynamic_cast<const v::SelectOp*>(&op) || dynamic_cast<const v::ThreadForwardOp*>(&op))) {
+      throw Undecided{"operation " + std::string(op.name())};
+    }
+    for (const auto& a : g_.instanceOperands(x)) out.push_back(a);
+    return out;
+  }
+
+  // The DAG below root, values interned by structural equality (root is node 0).
+  std::vector<N> graph(const v::Value& root) {
+    std::vector<N> ns;
+    std::vector<std::size_t> todo;
+    const auto intern = [&](const v::Value& x) {
+      for (std::size_t i = 0; i < ns.size(); ++i)
+        if (same(ns[i].x, x)) return i;
+      if (ns.size() > 100000) throw Undecided{"graph budget"};
+      N n;
+      n.x = res(x);
+      ns.push_back(std::move(n));
+      todo.push_back(ns.size() - 1);
+      return ns.size() - 1;
+    };
+    intern(root);
+    while (!todo.empty()) {
+      const auto i = todo.back();
+      todo.pop_back();
+      N n;
+      const auto xs = successors(ns[i].x, n);
+      n.x = ns[i].x;
+      if (n.initial) n.reads = *c_.loadLeaves(n.x, false);
+      for (const auto& y : xs) n.succ.push_back(intern(y));
+      ns[i] = std::move(n);
+    }
+    return ns;
+  }
+
+  static bool contains(const Set& s, std::uint64_t e) {
+    for (const auto& x : s)
+      if (x.begin <= e && e < x.end) return true;
+    return false;
+  }
+
+  std::string decide(std::size_t m, std::size_t k, Role role, const v::Value& root, const Pattern& at,
+                     std::uint64_t r, std::uint64_t c) {
+    const auto& arg = t_.nodes[m].args[k];
+    const bool trans_role = role == RoleKind::ThroughTranscendental || role == RoleKind::AvoidsTranscendental;
+    if (arg.body && (!trans_role || !t_.nodes[arg.ref].out)) return "unsupported";
+    const auto ek = arg.body ? c_.argCut(m, k, at, r, c) : c_.argLeaves(m, k, at, r, c);
+    std::vector<std::uint64_t> elements;
+    for (const auto& x : ek)
+      for (auto e = x.begin; e < x.end; ++e) elements.push_back(e);
+    const auto ns = graph(root);
+    const auto n = ns.size();
+    // reach[e][i]: a path from node i reaches source element e (a fresh search per element).
+    std::vector<std::vector<char>> reach;
+    for (const auto e : elements) {
+      std::vector<char> src(n, 0);
+      for (std::size_t i = 0; i < n; ++i) {
+        if (arg.body) {
+          const auto& sv = c_.stored_.at(*t_.nodes[arg.ref].out).at(e & kElementMask);
+          src[i] = sv && same(ns[i].x, *sv);
+        } else {
+          src[i] = ns[i].initial && contains(ns[i].reads, e);
+        }
+      }
+      std::vector<signed char> memo(n, -1);
+      std::function<bool(std::size_t)> go = [&](std::size_t i) -> bool {
+        if (memo[i] >= 0) return memo[i];
+        bool hit = src[i];
+        for (const auto j : ns[i].succ) hit = go(j) || hit;
+        return memo[i] = hit;
+      };
+      std::vector<char> row(n);
+      for (std::size_t i = 0; i < n; ++i) row[i] = go(i);
+      reach.push_back(std::move(row));
+      if (!reach.back()[0]) return "fails";  // the element does not reach the output
+    }
+    const auto any = [&](std::size_t j) {
+      for (const auto& row : reach) if (row[j]) return true;
+      return false;
+    };
+    switch (role) {
+      case RoleKind::ThroughTranscendental:
+      case RoleKind::AvoidsTranscendental: {
+        for (const auto& row : reach) {
+          bool through = false;
+          for (std::size_t i = 0; i < n && !through; ++i)
+            if (ns[i].trans)
+              for (const auto j : ns[i].succ) through |= bool(row[j]);
+          if (through != (role == RoleKind::ThroughTranscendental)) return "fails";
+        }
+        return "holds";
+      }
+      case RoleKind::Addend: {
+        // Every path reaches the element through addend edges only, and no add has the element
+        // below both operands.
+        std::vector<char> live(n, 0);  // reaches some initial load
+        std::vector<signed char> lm(n, -1);
+        std::function<bool(std::size_t)> lv = [&](std::size_t i) -> bool {
+          if (lm[i] >= 0) return lm[i];
+          bool h = ns[i].initial;
+          for (const auto j : ns[i].succ) h = lv(j) || h;
+          return lm[i] = h;
+        };
+        for (std::size_t i = 0; i < n; ++i) live[i] = lv(i);
+        for (const auto& row : reach)
+          for (std::size_t i = 0; i < n; ++i) {
+            const auto& x = ns[i];
+            const auto ops = x.succ.size() - x.indices;
+            std::size_t live_ops = 0;
+            for (std::size_t q = x.indices; q < x.succ.size(); ++q) live_ops += live[x.succ[q]];
+            if (x.kind == Kind::Add && ops == 2 && row[x.succ[x.indices]] && row[x.succ[x.indices + 1]]) return "fails";
+            for (std::size_t q = 0; q < x.succ.size(); ++q) {
+              if (!row[x.succ[q]]) continue;
+              const bool idx = q < x.indices;
+              bool addend = false;
+              if (!idx) {
+                if (x.kind == Kind::Add && ops == 2) addend = true;
+                else if (x.kind == Kind::Fma && ops == 3) addend = (q - x.indices) == 2;
+                else if (x.kind == Kind::Conv || x.kind == Kind::Load) addend = true;
+                else if (x.kind == Kind::Bits) addend = live_ops == 1;
+              }
+              if (!addend) return "fails";
+            }
+          }
+        return "holds";
+      }
+      case RoleKind::Multiplicand: {
+        // No path reaches the element without an edge from a product to a factor whose other
+        // factor reaches no element of the argument.
+        const auto guard = [&](std::size_t i, std::size_t q) {
+          const auto& x = ns[i];
+          if (!(x.kind == Kind::Mul || x.kind == Kind::Fma) || q < x.indices || q - x.indices > 1 ||
+              x.succ.size() - x.indices < 2)
+            return false;
+          const auto other = x.succ[x.indices + (1 - (q - x.indices))];
+          return any(x.succ[q]) && !any(other);
+        };
+        for (std::size_t ei = 0; ei < elements.size(); ++ei) {
+          // unguarded[i]: some path from i reaches the element using no guard edge.
+          std::vector<signed char> um(n, -1);
+          std::function<bool(std::size_t)> ug = [&](std::size_t i) -> bool {
+            if (um[i] >= 0) return um[i];
+            bool h = ns[i].initial && contains(ns[i].reads, elements[ei]);
+            for (std::size_t q = 0; q < ns[i].succ.size(); ++q)
+              if (!guard(i, q)) h = ug(ns[i].succ[q]) || h;
+            return um[i] = h;
+          };
+          if (ug(0)) return "fails";
+        }
+        return "holds";
+      }
+    }
+    return "fails";
+  }
+
+  Checker& c_;
+  const v::Graph& g_;
+  const MemoryEliminationResult& m_;
+  const Term& t_;
+  ScalarSpecialization spec_;
+};
+
 }  // namespace
 
 std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryEliminationResult& memory,
-                                const std::string& term_json, const UnitLifting* lifting) {
+                                const std::string& term_json, const UnitLifting* lifting, bool reference) {
   Json report{{"schema", "sentryward.structural-report/v1"}};
   try {
     const auto term = parseTerm(Json::parse(term_json));
@@ -1314,6 +1616,7 @@ std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryElimin
     if (!memory.complete) unsupported("memory_elimination", "memory elimination is not complete");
     Checker checker(graph, memory, term, lifting);
     report.update(checker.run());
+    if (reference) report["reference"] = Reference(checker, graph, memory, term, lifting != nullptr).run();
   } catch (const Stop& s) {
     report["result"] = s.result;
     report["reason"] = s.code;
