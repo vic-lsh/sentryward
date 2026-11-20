@@ -1496,13 +1496,14 @@ struct Importer {
   // Whether raw Exp2 node `n` is nvcc's expf core: ex2.approx of fma(v, L_lo, fma(v, L_hi, t)), each fma a
   // round-to-nearest PTX instruction image (no other rounding mode, not contractible or synthesized), with
   // L_hi = 0f3FB8AA3B and L_lo = 0f32A57060 (the binary32 split of log2 e) as literals and the same raw v in
-  // both. A different literal, rounding mode or operand fails it, and no idealization applies.
+  // both; or with both literals negated (-L_hi, -L_lo: nvcc folds expf(-x)'s negation into them on sm_121a).
+  // A different literal, a mixed sign, another rounding mode or operand fails it, and no idealization applies.
   bool split_log2e_exp2(const RawNode &n) const {
     namespace im = sentryward::scalar_fold::instruction_mode;
     static const Q hi(12102203, 8388608), lo(338819, Z("17592186044416"));
     if (n.kind != "Operation" || n.name != "Exp2" || n.type != "f32" || n.operands.size() != 1 ||
         !n.operands[0].conversion.empty()) return false;
-    const auto fma = [&](Id id, const Q &c, Id &v, Id &addend) {
+    const auto fma = [&](Id id, const Q &c, const Edge *&v, Id &addend, int &sign) {
       const auto &f = ns.at(id);
       const auto m = f.instruction;
       if (f.kind != "Operation" || f.name != "Fma" || f.type != "f32" || f.operands.size() != 3 ||
@@ -1512,17 +1513,23 @@ struct Importer {
       for (unsigned side = 0; side != 2; ++side) {
         const auto &lit = f.operands[side], &other = f.operands[1-side];
         const auto &k = ns.at(lit.node);
-        if (lit.conversion.empty() && other.conversion.empty() && k.kind == "Constant" && k.type == "f32" &&
-            decimal(k.name) == c) {
-          v = other.node;
+        if (!lit.conversion.empty() || k.kind != "Constant" || k.type != "f32") continue;
+        const Q value = decimal(k.name);
+        sign = value == c ? 1 : value == -c ? -1 : 0;
+        if (sign) {
+          v = &other;
           addend = f.operands[2].node;
           return f.operands[2].conversion.empty();
         }
       }
       return false;
     };
-    Id v_lo = 0, v_hi = 0, inner = 0, rest = 0;
-    return fma(n.operands[0].node, lo, v_lo, inner) && fma(inner, hi, v_hi, rest) && v_lo == v_hi;
+    // v is the same raw node read through the same conversion (e.g. a bf16 input widened to f32) in both.
+    const Edge *v_lo = nullptr, *v_hi = nullptr;
+    Id inner = 0, rest = 0;
+    int s_lo = 0, s_hi = 0;
+    return fma(n.operands[0].node, lo, v_lo, inner, s_lo) && fma(inner, hi, v_hi, rest, s_hi) &&
+           v_lo->node == v_hi->node && v_lo->conversion == v_hi->conversion && s_lo == s_hi;
   }
   Id numerical_product(Id x, Id y) {
     Id product = a.mul({x, y});

@@ -5,8 +5,9 @@ silu(x) = x / (1 + expf(-x)). expf(-x) is the compiler's split-log2(e) sequence 
 -c * x with c = RN32(log2 e)_hi + _lo (the negation folds into the coefficient). Reading exp2(-c * x)
 as exp(-x) is the named assumption compiler_constant_transcendentals (an approximation, not real
 equality): the verdict lists it with the constant it replaced, and without it the kernel is not
-proven. The matcher checks the raw PTX (both split literals, round-to-nearest fmas, one operand):
-a kernel without the negation, with an fma.rz, or with either literal changed is not proven, as are
+proven. The matcher checks the raw PTX (both split literals, round-to-nearest fmas, one operand; on
+sm_121a nvcc negates both literals instead of the operand): a kernel without the negation, with an
+fma.rz, with either literal changed or with mixed literal signs is not proven, as are
 a kernel whose product is an add and a wrong op term (silu(g) + u). The reference is Coral's
 generated term of the canonical op silu_mul. Skipped unless SENTRYWARD_PTX_NATIVE names a built
 sentryward-ptx and PyTorch is installed.
@@ -47,6 +48,17 @@ class ValueNativeTest(unittest.TestCase):
                            "replaced": "25380159564675/17592186044416", "denotes": "log2(e)", "uses": 1}])
         a = self.idealization(r)
         self.assertEqual((a["enabled"], a["triggered"]), (True, True))
+
+    def test_sm121a_folded_negation_verified(self):
+        # sm_121a: nvcc folds the negation into both literals (-L_hi, -L_lo), no neg.f32.
+        r = run("sact", "k_sact_split_sm121a")
+        self.assertEqual(r["result"], "verified")
+        self.assertEqual([i["rule"] for i in r["internal"]["equivalence"]["idealizations"]], ["split_log2e_exp"])
+
+    def test_mixed_literal_signs_not_proven(self):
+        r = run("sact", "k_sact_split_sm121a_mixed_sign")
+        self.assertEqual(r["result"], "equivalence_not_proven")
+        self.assertEqual(r["internal"]["equivalence"]["idealizations"], [])
 
     def test_without_the_assumption_not_proven(self):
         r = run("sact", "k_sact_split", "--no-assume", "compiler_constant_transcendentals")
