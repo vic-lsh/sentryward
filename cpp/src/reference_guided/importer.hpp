@@ -179,6 +179,13 @@ struct Importer {
   std::unordered_map<Id,Id> power_bit_values;
   std::unordered_set<Id> encoded_powers;
   bool ideal;
+  // Compiler-constant idealizations (assumption compiler_constant_transcendentals, docs/assumptions.md): a
+  // recognized compiler expansion of exp, log or log2 through a rounded binary32 constant reads as the exact
+  // transcendental. An approximation, not real equality; set by the comparison, reported per rule.
+  bool idealize_constants = true;
+  bool idealize() const { return ideal && idealize_constants; }
+  // Results of ex2.approx whose operand is nvcc's split-log2(e) expf sequence (split_log2e_exp2).
+  std::unordered_set<Id> split_exp2;
   // The floating range premise of in_range (assumption floating_values_in_range); set by the comparison.
   bool range_premise = true;
   // The hardware value rule applies to this side (hardware_value); set by the comparison for the PTX
@@ -1208,7 +1215,7 @@ struct Importer {
       // Import the complete recognized numerical operation's input first.
       // Its bit decomposition is not a numeric cast; only a finite positive
       // input under ideal_real permits this complete compiler approximation.
-      if(ideal)if(Id input=fp_idioms.log2_input(f.i);input!=invalid) {
+      if(idealize())if(Id input=fp_idioms.log2_input(f.i);input!=invalid) {
         const auto input_key=key(input,f.env);
         if(!cache.contains(input_key)) {
           todo.push_back({f.i,f.env,false});todo.push_back({input,f.env,false});continue;
@@ -1223,7 +1230,7 @@ struct Importer {
       }
       // The same contract for the complete log1pf expansion: ideal log(1 + u) on a finite u >= 0.
       // There log1p is finite and the expansion returns its main path (-0 for u = -0).
-      if(ideal)if(Id input=fp_idioms.log1p_input(f.i);input!=invalid) {
+      if(idealize())if(Id input=fp_idioms.log1p_input(f.i);input!=invalid) {
         const auto input_key=key(input,f.env);
         if(!cache.contains(input_key)) {
           todo.push_back({f.i,f.env,false});todo.push_back({input,f.env,false});continue;
@@ -1378,7 +1385,7 @@ struct Importer {
   // coefficients nor unrelated ln(2)/log2(e) literals are changed.
   // The raw scan has fixed depth and arity (at most four orientations).
   std::optional<Id> compiler_lse(const RawNode &root, const Env &env) {
-    if (!ideal) return {};
+    if (!idealize()) return {};
     auto operation = [](const RawNode &node, const char *name, size_t arity) {
       return node.kind == "Operation" && node.name == name && node.type == "f32" &&
              (node.attributes.empty() || node.attributes == "ideal_arithmetic") &&
@@ -1464,7 +1471,7 @@ struct Importer {
   // same ideal_real contract as the lg2 LSE tail; only this witnessed RN32(ln 2) literal is
   // idealized, other lg2 uses keep base two. O(1).
   std::optional<Id> compiler_log(const RawNode &root, const std::vector<Id> &x, const Env &env) {
-    if (!ideal || root.type != "f32" || root.operands.size() != 2 || x.size() != 2 ||
+    if (!idealize() || root.type != "f32" || root.operands.size() != 2 || x.size() != 2 ||
         (!root.attributes.empty() && root.attributes != "ideal_arithmetic")) return {};
     static const Q compiler_ln2(1453635, 2097152);
     for (unsigned side = 0; side != 2; ++side) {
@@ -1486,11 +1493,44 @@ struct Importer {
     }
     return {};
   }
+  // Whether raw Exp2 node `n` is nvcc's expf core: ex2.approx of fma(v, L_lo, fma(v, L_hi, t)), each fma a
+  // round-to-nearest PTX instruction image (no other rounding mode, not contractible or synthesized), with
+  // L_hi = 0f3FB8AA3B and L_lo = 0f32A57060 (the binary32 split of log2 e) as literals and the same raw v in
+  // both. A different literal, rounding mode or operand fails it, and no idealization applies.
+  bool split_log2e_exp2(const RawNode &n) const {
+    namespace im = sentryward::scalar_fold::instruction_mode;
+    static const Q hi(12102203, 8388608), lo(338819, Z("17592186044416"));
+    if (n.kind != "Operation" || n.name != "Exp2" || n.type != "f32" || n.operands.size() != 1 ||
+        !n.operands[0].conversion.empty()) return false;
+    const auto fma = [&](Id id, const Q &c, Id &v, Id &addend) {
+      const auto &f = ns.at(id);
+      const auto m = f.instruction;
+      if (f.kind != "Operation" || f.name != "Fma" || f.type != "f32" || f.operands.size() != 3 ||
+          !im::instruction(m) || !(m & im::nearest) ||
+          (m & (im::toward_zero | im::toward_negative | im::toward_positive | im::contractible)))
+        return false;
+      for (unsigned side = 0; side != 2; ++side) {
+        const auto &lit = f.operands[side], &other = f.operands[1-side];
+        const auto &k = ns.at(lit.node);
+        if (lit.conversion.empty() && other.conversion.empty() && k.kind == "Constant" && k.type == "f32" &&
+            decimal(k.name) == c) {
+          v = other.node;
+          addend = f.operands[2].node;
+          return f.operands[2].conversion.empty();
+        }
+      }
+      return false;
+    };
+    Id v_lo = 0, v_hi = 0, inner = 0, rest = 0;
+    return fma(n.operands[0].node, lo, v_lo, inner) && fma(inner, hi, v_hi, rest) && v_lo == v_hi;
+  }
   Id numerical_product(Id x, Id y) {
     Id product = a.mul({x, y});
-    if (!ideal || a.nodes[x].op != "exp2" || a.nodes[y].op != "exp2" ||
-        encoded_powers.empty() ||
-        (!encoded_powers.contains(x) && !encoded_powers.contains(y)))
+    // One factor is the power of the checked fma.rm/bit idiom, the other the ex2.approx of nvcc's split
+    // log2(e) sequence, checked on the raw PTX (split_log2e_exp2: literals and RN provenance).
+    if (!idealize() || a.nodes[x].op != "exp2" || a.nodes[y].op != "exp2" ||
+        !((encoded_powers.contains(x) && split_exp2.contains(y)) ||
+          (encoded_powers.contains(y) && split_exp2.contains(x))))
       return product;
     // Ideal exp contract for the recognized split-log2(e) exponent encoding.
     // This is intentionally NOT a global approximate-constant equality rule.
@@ -1500,7 +1540,8 @@ struct Importer {
     const auto &e = a.nodes[node.args[0]];
     static const Q log2e_split(Z("25380159564675"), Z("17592186044416"));
     Id argument = invalid;
-    // exp(x) = exp2(x * log2(e)); expf(-y) folds the negation into the coefficient.
+    // exp2(c * v) with c = RN32(log2 e)_hi + RN32(...)_lo reads as exp(v) (the idealization); expf(-y)
+    // folds the negation into the coefficient, -c.
     if (e.op == "mul" && e.args.size() == 1 && (e.data[0] == log2e_split || e.data[0] == -log2e_split))
       argument = e.data[0] > 0 ? e.args[0] : a.neg(e.args[0]);
     else if (e.op == "add" && e.args.size() == 2 &&
@@ -2494,7 +2535,7 @@ struct Importer {
   // skeleton; imported leaves (including large reductions) stay opaque.
   std::optional<Id> additive_compiler_exp(const RawNode &n, Id exponent,
                                         const Env &ctx) {
-    if (!ideal || n.kind != "Operation" || n.name != "Exp2" || n.type != "f32" ||
+    if (!idealize() || n.kind != "Operation" || n.name != "Exp2" || n.type != "f32" ||
         (n.attributes != "" && n.attributes != "ideal_arithmetic") ||
         n.operands.size() != 1 || !n.operands[0].conversion.empty() ||
         !a.nodes[exponent].facts.finite) return {};
@@ -3572,7 +3613,7 @@ struct Importer {
       // coefficient, not arbitrary nearby constants or unrelated arithmetic.
       const auto &exponent = a.nodes[x.at(0)];
       static const Q compiler_log2e(12102203,8388608);
-      if (ideal && exponent.facts.finite && n.operands.size()==1 && n.operands[0].conversion.empty()) {
+      if (idealize() && exponent.facts.finite && n.operands.size()==1 && n.operands[0].conversion.empty()) {
         // Preserve recognition when other literal factors have already merged
         // into the canonical coefficient (e.g. -5*log2(e)). Walk only a bounded
         // raw multiplication tree and require the explicit compiler constant.
@@ -3615,7 +3656,7 @@ struct Importer {
           return a.exp(a.mul({a.constant(Q(1)/compiler_log2e),x[0]}));
         }
       }
-      if (ideal && exponent.op == "mul" && exponent.facts.finite &&
+      if (idealize() && exponent.op == "mul" && exponent.facts.finite &&
           (exponent.data[0] == compiler_log2e || exponent.data[0] == -compiler_log2e)) {
         auto factors = exponent.args;
         bool negative = exponent.data[0] < 0;
@@ -3624,7 +3665,9 @@ struct Importer {
         ++a.stats["ideal_single_constant_exp_sequences"];
         return a.exp(argument);
       }
-      return a.exp2(x[0]);
+      Id power = a.exp2(x[0]);
+      if (idealize() && split_log2e_exp2(n)) split_exp2.insert(power);
+      return power;
     }
     if (name == "Reciprocal")
       return a.recip(x.at(0));

@@ -16,6 +16,9 @@ struct ComparisonOptions {
   // The documented floating range premise (assumption floating_values_in_range,
   // docs/assumptions.md); without it the importers drop no range bound.
   bool floating_range_premise=true;
+  // The compiler-constant idealizations (assumption compiler_constant_transcendentals,
+  // docs/assumptions.md); without it no rounded constant is read as a transcendental.
+  bool constant_idealizations=true;
   // The right document is a PTX kernel's expression: import it with the hardware value rule
   // (Importer::hardware_value), which reads the PTX instruction images of its nodes.
   bool kernel_hardware_values=false;

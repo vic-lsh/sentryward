@@ -275,6 +275,34 @@ value sets of the [numerical model](reference-binding-json.md#equivalence-contra
 - **Disabled:** keep them. An equality that depends on the premise is then not
   proven.
 
+## Compiler constants of transcendentals
+
+Configuration key: `compiler_constant_transcendentals` (default `true`).
+
+This premise belongs to the numerical (equivalence) model. nvcc expands `expf`,
+`logf`, `log2f` and similar functions into PTX that computes with rounded binary32
+constants (log2(e), ln 2) or minimax polynomials. Read over the ideal reals such
+a sequence is not the transcendental: for example `expf(-x)` is
+`ex2.approx(fma.rn(v, L_lo, fma.rn(v, L_hi, t))) * 2^n` with v = -x, which is
+exp2(-c x) for the rational c = L_hi + L_lo = 25380159564675/2^44, and c is not
+log2(e). The premise reads each recognized sequence as the transcendental. It is
+an approximation of the same kind as rounding, not an equality over the reals.
+
+The split-log2(e) exponential is recognized only on the raw PTX: an `ex2.approx`
+whose operand is two round-to-nearest `fma` instruction images (no other
+rounding mode, not contracted or synthesized) of the same value with the literals
+`0f3FB8AA3B` and `0f32A57060`, multiplied by the power of the checked `fma.rm`
+exponent encoding.
+
+- **Enabled:** each use is listed in `equivalence.idealizations` (`rule`, the
+  exact `replaced` constant or approximation, the transcendental it `denotes`,
+  `uses`). In the result's `assumptions` entry, `triggered` is `true` when the
+  list is nonempty, `false` when the comparison imported every output family
+  without one, and `null` when it did not run or stopped early. A verdict that
+  rests on it holds modulo the listed idealizations.
+- **Disabled:** no rounded constant is read as a transcendental; an equality
+  that depends on one is not proven.
+
 ## Duplicate TMA stores
 
 Configuration key: `duplicate_tma_store_benign`.

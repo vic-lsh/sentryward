@@ -125,6 +125,7 @@ ComparisonResult rg::compare(Document left, Document right, J mapping, const Com
     Importer l(a, std::move(left), mapping, "left", *prepared),
         o(a, std::move(right), mapping, "right", *prepared);
     l.range_premise = o.range_premise = options.floating_range_premise;
+    l.idealize_constants = o.idealize_constants = options.constant_idealizations;
     o.hardware_values = options.kernel_hardware_values;
     FiniteStateReuse piece_equalities(checker, mapping);
     UnaryReductionComposition unary_reductions(checker);
@@ -579,6 +580,27 @@ ComparisonResult rg::compare(Document left, Document right, J mapping, const Com
     r["idealizations_applied"].push_back("complete typed RN-FMA binary32 log1pf polynomial with exponent-field reduction and exceptional guards is ideal Log(1+u) on proved finite nonnegative input");
   if (counted("ideal_compiler_log_sequences"))
     r["idealizations_applied"].push_back("binary32 PTX lg2.approx times the binary32 ln(2) literal is ideal Log on proved finite positive input");
+  // The same uses as named premises (assumption compiler_constant_transcendentals): per rule, the exact
+  // rational the PTX computes with and the transcendental it is read as. Not an equality over the reals.
+  r["idealizations"] = J::array();
+  {
+    struct Rule { const char *counter, *rule, *replaced, *denotes; };
+    static const Rule rules[] = {
+      {"ideal_compiler_exp_sequences", "split_log2e_exp", "25380159564675/17592186044416", "log2(e)"},
+      {"ideal_single_constant_exp_sequences", "binary32_log2e_exp", "12102203/8388608", "log2(e)"},
+      {"ideal_additive_compiler_exp_sequences", "additive_binary32_log2e_exp", "12102203/8388608", "log2(e)"},
+      {"ideal_compiler_lse_sequences", "lg2_lse_tail", "approx lg2 (ex2/lg2.approx) and binary32 log2(e)", "log"},
+      {"ideal_compiler_log2_polynomials", "log2_polynomial", "binary32 minimax polynomial", "log2"},
+      {"ideal_compiler_log1p_polynomials", "log1p_polynomial", "binary32 minimax polynomial", "log1p"},
+      {"ideal_compiler_log_sequences", "binary32_ln2_log", "1453635/2097152", "ln(2)"},
+    };
+    for (const auto &rule : rules) {
+      const auto it = a.stats.find(rule.counter);
+      if (it != a.stats.end() && it->second)
+        r["idealizations"].push_back({{"assumption", "compiler_constant_transcendentals"}, {"rule", rule.rule},
+                                      {"replaced", rule.replaced}, {"denotes", rule.denotes}, {"uses", it->second}});
+    }
+  }
   r["input_contract_applied_reads"] = J::array();
   for(const auto &[side,object,type]:(prepared ? prepared->contract.applied : contract.applied))
     r["input_contract_applied_reads"].push_back(J{{"side",side},{"object",object},{"element_type",type}});

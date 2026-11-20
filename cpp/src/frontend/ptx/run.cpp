@@ -2396,6 +2396,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               std::move(equivalence_mapping),
               {.seconds = options.equivalence_timeout,
                .floating_range_premise = effective_assumptions.at("floating_values_in_range"),
+               .constant_idealizations = effective_assumptions.at("compiler_constant_transcendentals"),
                .kernel_hardware_values = true},
               context).report;
         });
@@ -2478,6 +2479,20 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           floating_range_used = Json(false);
       }
     }
+    // Compiler-constant idealizations: triggered when the comparison read a rounded constant as a
+    // transcendental (its `idealizations` list); unused when it finished every family without one.
+    std::optional<Json> constants_used;
+    if (effective_assumptions.at("compiler_constant_transcendentals")) {
+      constants_used = Json(nullptr);
+      if (const auto equivalence = result.find("equivalence");
+          equivalence != result.end() && equivalence->is_object() && equivalence->contains("idealizations")) {
+        if (!equivalence->at("idealizations").empty())
+          constants_used = Json(true);
+        else if (equivalence->contains("total_output_families") &&
+                 equivalence->value("finished_families", Json()) == equivalence->at("total_output_families"))
+          constants_used = Json(false);
+      }
+    }
     if (!result.contains("assumptions")) {
       result["assumptions"] = Json::array();
       for (const auto& entry : alg::AssumptionPool()) {
@@ -2491,14 +2506,18 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           if (entry.key == "order_independent_atomics") triggered = facts.value("atomic_uses", 0) > 0;
         }
         if (entry.key == "floating_values_in_range" && floating_range_used) triggered = *floating_range_used;
+        if (entry.key == "compiler_constant_transcendentals" && constants_used) triggered = *constants_used;
         result["assumptions"].push_back({{"label",entry.label},{"key",entry.key},{"text",entry.text},
             {"enabled",effective_assumptions.at(entry.key)},
             {"triggered",triggered}});
       }
     } else if (floating_range_used && result["assumptions"].is_array()) {
       // The verification report's list (source_json.cpp RenderReport) saw no comparison.
-      for (auto& entry : result["assumptions"])
+      for (auto& entry : result["assumptions"]) {
         if (entry.value("key", "") == "floating_values_in_range") entry["triggered"] = *floating_range_used;
+        if (entry.value("key", "") == "compiler_constant_transcendentals" && constants_used)
+          entry["triggered"] = *constants_used;
+      }
     }
     const auto reason = result.value("reason", "");
     if (reason == "branch_not_static" || reason == "missing_parameter_value") {
