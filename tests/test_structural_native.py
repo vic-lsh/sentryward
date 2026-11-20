@@ -97,21 +97,20 @@ class StructuralNativeTest(unittest.TestCase):
         self.assertEqual((r["result"], r["reason"]), ("refused", "role"))
         self.assertEqual(r["detail"]["role"], "avoids_transcendental")
 
-    def test_stored_operand_of_the_same_component_matches(self):
-        self.assertEqual(run("sel_pos_component", "sel", "handwritten")["result"], "matched")
+    def test_stored_operand_of_a_word_half_refused(self):
+        # p = f32(low half of a's bf16 word): the half uses part of the word's bits, so neither
+        # component is a full dependency on the word's leaves (was matched before partial_operand;
+        # identity by component is covered by the IR-level operand control).
+        for entry in ("sel_pos_component", "sel_neg_component"):
+            r = run(entry, "sel", "handwritten")
+            self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"), entry)
 
-    def test_stored_operand_of_another_component_refused(self):
-        # p = f32(low half of a's bf16 word), y = f32(high half) + b: the operand has the stored
-        # value's leaves and conversion chain, but is another value.
-        r = run("sel_neg_component", "sel", "handwritten")
-        self.assertEqual((r["result"], r["reason"]), ("refused", "primitive_operands"))
-
-    def test_partial_stored_read_refused(self):
+    def test_partial_pack_refused(self):
         # Round-5 reproducer: P stores (a & 0xffff) | (b & 0xffff0000); C reads P's low half, so y
-        # ignores b. A read of part of a stored value is refused (its bytes' dependencies are not
-        # tracked), not credited with all of the value's leaves.
+        # ignores b. P itself uses a and b only in part (partial_operand, checked first); the
+        # partial read alone is control partial_stored_half (partial.ptx).
         r = run("pack", "pack", "pack")
-        self.assertEqual((r["result"], r["reason"]), ("refused", "partial_stored_read"))
+        self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"))
 
     def test_product_with_zero_refused(self):
         # Round-5 reproducer: y = a * b + 0 * ex2(a) is not a path from a through ex2.
@@ -133,9 +132,12 @@ class StructuralNativeTest(unittest.TestCase):
         self.assertEqual((r["result"], r["reason"]), ("refused", "role"))
         self.assertEqual(r["detail"]["role"], "through_transcendental")
 
-    def test_live_mask_matches(self):
-        # and with 0x7fffffff (|ex2(a)|) keeps the path: the dead-edge rule is not a blanket refusal.
-        self.assertEqual(run("live_and", "silu_mul", "dead_paths")["result"], "matched")
+    def test_mask_on_the_only_transcendental_path_refused(self):
+        # and with 0x7fffffff (|ex2(a)|): not a dead edge, but it uses all of ex2(a)'s bits except
+        # the sign, so the only path from a through ex2 is partial and the through role does not
+        # hold in full (matched before partial_operand).
+        r = run("live_and", "silu_mul", "dead_paths")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"))
 
 
 def run_ir(case, polarity):

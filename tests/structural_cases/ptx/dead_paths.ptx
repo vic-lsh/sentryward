@@ -3,7 +3,8 @@
 // Each computes y = a * b + D(a), where D(a) passes ex2 but a constant decides D without a:
 // dead_and: and.b32 of ex2(a)'s bits with 0; dead_shl: shl.b32 of ex2(a)'s bits by 32;
 // dead_sel: selp(ex2(a), 0, tid < 0) (the condition is fixed per thread, so the select resolves to
-// 0); live_and (positive): and.b32 of ex2(a)'s bits with 0x7fffffff (|ex2(a)|, a live path).
+// 0); live_and: and.b32 of ex2(a)'s bits with 0x7fffffff (|ex2(a)|): not dead, but it uses part of
+// ex2(a)'s bits, so the only path through ex2 is partial (refused partial_operand).
 // Term silu_mul: through_transcendental on a, avoids_transcendental on b.
 //
 

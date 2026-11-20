@@ -373,7 +373,7 @@ class Checker {
 
   // Leaves of a load instance, through memory elimination's read resolution. `initial_only`:
   // a read resolved to a stored value is not a leaf (none is returned).
-  std::optional<Set> loadLeaves(const v::Value& x, bool initial_only) {
+  std::optional<Set> loadLeaves(const v::Value& x, bool initial_only, bool full = false) {
     const MemoryInstance key{x.nodeId(), x.instanceIndex()};
     const auto& type = g_.type(x.withoutSelection());
     const auto element_bytes = std::uint64_t(type.element().width() / 8);
@@ -392,7 +392,7 @@ class Checker {
         if (initial_only) return std::nullopt;
         auto source = *value;
         if (!x.indices().empty()) source = g_.component(source, {x.indices().begin(), x.indices().end()});
-        return leaves(source);
+        return full ? fullLeaves(source) : leaves(source);
       }
       if (const auto* initial = std::get_if<InitialMemorySymbol>(r))
         return narrow(initial->region.allocation, initial->region.offset, initial->region.bytes);
@@ -409,7 +409,7 @@ class Checker {
             refuse("partial_stored_read", "a read of part of a stored value (its per-byte dependencies are not decided)",
                    {{"node", key.node}, {"instance", key.instance}, {"byte_offset", p.byte_offset},
                     {"bits", p.type.bitSize()}, {"stored_bits", g_.type(*s).bitSize()}});
-          return leaves(*s);
+          return full ? fullLeaves(*s) : leaves(*s);
         }
         const auto& i = std::get<InitialMemorySymbol>(p.source);
         return regionLeaves(i.region.allocation, i.region.offset + p.byte_offset, p.type.bitSize() / 8);
@@ -459,8 +459,8 @@ class Checker {
   // not have: a*b + 0*ex2(a) is not a path from a through ex2. Decided exactly: a product (mul,
   // mad, an fma's product) with a zero factor; and with zero; or with all ones; a logical shift by
   // at least the width; bfe of length zero; a select whose condition is fixed (a fixed condition
-  // is normally resolved to its chosen operand before this step). Not decided here, and so still
-  // counted as paths: partial masks, lop3 tables, prmt selectors, copysign (see the docs).
+  // is normally resolved to its chosen operand before this step). A use of part of an operand's
+  // bits (a partial mask, a lop3 table, a prmt selector, copysign) is refused by partialOperands.
   // The constant value y the launch fixes, or none: the scalar specialization's facts (integers,
   // bits, predicates) or a floating literal or specialized parameter (exact, by its literal).
   std::optional<equivalence::ConstantValue> fixed(const v::Value& y) {
@@ -541,6 +541,449 @@ class Checker {
     }
   }
 
+  // ---- Partial operands (D263): a use of only some of an operand's bits. ----
+  // Per value, its bits as far as the structure decides them: `vary`, a superset of the bits that
+  // may differ between runs (depend on the launch's data); every other bit is fixed, with the value
+  // in `one`. `width` is 0 for a value the analysis does not track per bit (not a scalar of at most
+  // 64 bits): all of its bits vary. Rules: constants and launch-fixed values are fixed; bit
+  // operations with fixed controls, shifts by fixed amounts, integer extensions and truncations,
+  // same-width bitcasts and bfe/bfi/prmt/lop3/shf with fixed controls are followed; any other
+  // operation's result varies in every bit (its value is the op's, not decided per bit here).
+  struct Bits {
+    std::uint64_t vary = 0, one = 0;
+    unsigned width = 0;
+  };
+  static std::uint64_t ones(unsigned w) { return w >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << w) - 1; }
+  static Bits all(unsigned w) { return {ones(w), 0, w}; }
+  // The scalar bit width of a value the analysis tracks, else 0.
+  unsigned bitWidth(const v::Value& x) {
+    const auto& t = g_.type(x);
+    if (!t.isScalar() || t.element().isParameterized()) return 0;
+    const auto w = t.element().width();
+    return w <= 64 ? w : 0;
+  }
+  // A fixed integer value of width w, or none (a literal the specialization gives is decimal).
+  std::optional<std::uint64_t> fixedBits(const v::Value& y, unsigned w) {
+    const auto k = fixed(y);
+    if (!k || !w) return std::nullopt;
+    const auto& s = k->literal;
+    if (s == "true") return 1;
+    if (s == "false") return 0;
+    try {
+      std::size_t used = 0;
+      std::uint64_t u;
+      if (!s.empty() && s[0] == '-') u = std::uint64_t(std::stoll(s, &used));
+      else u = std::stoull(s, &used, 0);
+      if (used != s.size()) return std::nullopt;
+      return u & ones(w);
+    } catch (const std::exception&) {
+      return std::nullopt;
+    }
+  }
+  // An integer extension or truncation (or same-width reinterpretation) of s from `from` to `to`
+  // bits; `sign`: the source is signed (sign extension).
+  static Bits resize(const Bits& s, unsigned to, bool sign) {
+    const auto from = s.width;
+    if (!from || !to) return all(to);
+    Bits r{s.vary & ones(to), s.one & ones(to), to};
+    if (to > from && sign) {
+      const auto high = ones(to) & ~ones(from), bit = std::uint64_t{1} << (from - 1);
+      if (s.vary & bit) r.vary |= high;
+      else if (s.one & bit) r.one |= high;
+    }
+    return r;
+  }
+  // A per-bit (bitwise) operation of n <= 3 same-width operands, `table` bit (b0 | b1 << 1 | b2 << 2)
+  // its value: the result's bits and, per operand, the bits the result depends on for EVERY value
+  // of the other operands' varying bits at that position (for all, so a mask that is itself data
+  // never counts as full use).
+  struct Bitwise {
+    Bits result;
+    std::vector<std::uint64_t> used;
+  };
+  static Bitwise bitwise(const std::vector<Bits>& in, unsigned table, unsigned w) {
+    Bitwise out{{0, 0, w}, std::vector<std::uint64_t>(in.size(), 0)};
+    const auto n = in.size();
+    for (unsigned i = 0; i < w; ++i) {
+      const auto bit = std::uint64_t{1} << i;
+      // The possible combinations at bit i: a varying operand takes both values.
+      std::vector<unsigned> combos;
+      for (unsigned c = 0; c < (1u << n); ++c) {
+        bool ok = true;
+        for (std::size_t k = 0; k < n; ++k)
+          if (!(in[k].vary & bit) && bool(c >> k & 1) != bool(in[k].one & bit)) ok = false;
+        if (ok) combos.push_back(c);
+      }
+      bool v0 = false, v1 = false;
+      for (const auto c : combos) (table >> c & 1 ? v1 : v0) = true;
+      if (v0 && v1) out.result.vary |= bit;
+      else if (v1) out.result.one |= bit;
+      for (std::size_t k = 0; k < n; ++k) {
+        bool every = true;
+        for (const auto c : combos)
+          every &= (table >> c & 1) != (table >> (c ^ (1u << k)) & 1);
+        if (every) out.used[k] |= bit;
+      }
+    }
+    return out;
+  }
+
+  // The bits of value x, memoized by identity.
+  Bits bits(v::Value x, unsigned depth = 0) {
+    if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
+    x = resolve(x);
+    const auto key = ident(x);
+    if (auto it = bits_.find(key); it != bits_.end()) return it->second;
+    const auto r = bitsStep(x, depth);
+    bits_.emplace(key, r);
+    return r;
+  }
+  Bits bitsStep(const v::Value& x, unsigned depth) {
+    const auto w = bitWidth(x);
+    if (!w) return all(0);
+    const bool integer = g_.type(x).element().isBitLike();
+    if (integer)
+      if (const auto k = fixedBits(x, w)) return {0, *k, w};
+    if (!integer) return all(w);
+    if (!x.indices().empty()) return all(w);
+    if (const auto& c = x.conversion()) {
+      const auto& src = c->source;
+      const auto sw = bitWidth(src);
+      const auto& se = g_.type(src).element();
+      if (!sw || !se.isBitLike()) return all(w);
+      if (c->spec->kind == v::TypeConversionKind::Bitcast) return sw == w ? bits(src, depth + 1) : all(w);
+      if (c->spec->attributes.saturate) return all(w);
+      return resize(bits(src, depth + 1), w, se.kind() == v::ElementKind::SignedInteger);
+    }
+    const auto& op = g_.definingNode(x).operation();
+    const auto xs = g_.instanceOperands(x).toVector();
+    const auto in = [&](std::size_t i) { return bits(xs[i], depth + 1); };
+    if (dynamic_cast<const v::BitcastOp*>(&op) && xs.size() == 1)
+      return bitWidth(xs[0]) == w && g_.type(xs[0]).element().isBitLike() ? in(0) : all(w);
+    if (const auto* cv = dynamic_cast<const v::ConvertOp*>(&op); cv && xs.size() == 1) {
+      const auto& se = g_.type(xs[0]).element();
+      if (!bitWidth(xs[0]) || !se.isBitLike() || cv->attributes().saturate) return all(w);
+      return resize(in(0), w, se.kind() == v::ElementKind::SignedInteger);
+    }
+    if (const auto* u = dynamic_cast<const v::UnaryOp*>(&op); u && u->opcode() == v::UnaryOpcode::BitNot && xs.size() == 1)
+      return bitwise({in(0)}, 0b01, w).result;
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op); b && xs.size() == 2) {
+      using B = v::BinaryOpcode;
+      switch (b->opcode()) {
+        case B::BitAnd: return bitwise({in(0), in(1)}, 0b1000, w).result;
+        case B::BitOr: return bitwise({in(0), in(1)}, 0b1110, w).result;
+        case B::BitXor: return bitwise({in(0), in(1)}, 0b0110, w).result;
+        case B::ShiftLeft:
+        case B::ShiftRight: {
+          const auto k = fixedBits(xs[1], bitWidth(xs[1]));
+          if (!k) return all(w);
+          return shifted(in(0), *k, b->opcode() == B::ShiftLeft, g_.type(x).element().kind() == v::ElementKind::SignedInteger).first;
+        }
+        default: return all(w);
+      }
+    }
+    if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      if (const auto r = ptxBits(*p, xs, w, depth)) return r->first;
+    }
+    return all(w);
+  }
+  // A shift of s by fixed amount k: the result's bits and the operand bits it reads.
+  static std::pair<Bits, std::uint64_t> shifted(const Bits& s, std::uint64_t k, bool left, bool sign) {
+    const auto w = s.width;
+    if (!w) return {all(0), 0};
+    Bits r{0, 0, w};
+    std::uint64_t used = 0;
+    for (unsigned i = 0; i < w; ++i) {
+      std::optional<unsigned> from;  // the operand bit result bit i copies
+      if (left) { if (k <= i) from = unsigned(i - k); }
+      else if (k < w && i + k < w) from = unsigned(i + k);
+      else if (sign) from = w - 1;
+      if (!from) continue;
+      const auto f = std::uint64_t{1} << *from, t = std::uint64_t{1} << i;
+      used |= f;
+      if (s.vary & f) r.vary |= t;
+      else if (s.one & f) r.one |= t;
+    }
+    return {r, used};
+  }
+  // A routing of operand bits to result bits (each result bit a copy of one operand bit, or a
+  // constant): result bit i is `src[i]` = (operand, bit) or none (zero).
+  struct Route {
+    std::vector<std::optional<std::pair<std::size_t, unsigned>>> src;
+  };
+  Bits routed(const Route& rt, const std::vector<Bits>& in, unsigned w, std::vector<std::uint64_t>& used) {
+    Bits r{0, 0, w};
+    used.assign(in.size(), 0);
+    for (unsigned i = 0; i < w && i < rt.src.size(); ++i) {
+      if (!rt.src[i]) continue;
+      const auto [k, j] = *rt.src[i];
+      const auto f = std::uint64_t{1} << j, t = std::uint64_t{1} << i;
+      used[k] |= f;
+      if (in[k].vary & f) r.vary |= t;
+      else if (in[k].one & f) r.one |= t;
+    }
+    return r;
+  }
+  // bfe, bfi, prmt (default mode), lop3, shf with fixed controls: the result's bits and, per
+  // operand, the bits it reads (controls: none; they must be fixed). None when a control is not
+  // fixed or the form is not one of these.
+  std::optional<std::pair<Bits, std::vector<std::uint64_t>>> ptxBits(const v::PtxScalarOp& p, const std::vector<v::Value>& xs,
+                                                                      unsigned w, unsigned depth) {
+    using O = v::PtxScalarOpcode;
+    const auto control = [&](std::size_t i) { return i < xs.size() ? fixedBits(xs[i], bitWidth(xs[i])) : std::nullopt; };
+    const auto in = [&](std::size_t i) { return bits(xs[i], depth + 1); };
+    for (const auto& m : p.attributes().modifiers)
+      if (m != "b32" && m != "u32" && m != "s32" && m != "b64" && m != "u64" && m != "s64" &&
+          !(p.opcode() == O::FunnelShift && (m == "l" || m == "r" || m == "clamp" || m == "wrap")))
+        return std::nullopt;  // a mode (prmt.f4e, ...) this analysis does not model
+    const bool sign = p.sourceType().element().kind() == v::ElementKind::SignedInteger;
+    std::vector<std::uint64_t> used(xs.size(), 0);
+    Route rt;
+    rt.src.assign(w, std::nullopt);
+    std::vector<Bits> ins;
+    switch (p.opcode()) {
+      case O::BitExtract: {  // bfe a, pos, len: d[i] = i < len && pos + i <= msb ? a[pos + i] : sbit
+        const auto pos = control(1), len = control(2);
+        if (xs.size() != 3 || !pos || !len) return std::nullopt;
+        const auto ps = unsigned(*pos & 0xff), ln = unsigned(*len & 0xff), msb = w - 1;
+        std::optional<std::pair<std::size_t, unsigned>> sbit;
+        if (sign && ln) sbit = std::pair{std::size_t{0}, std::min(ps + ln - 1, msb)};
+        for (unsigned i = 0; i < w; ++i) rt.src[i] = i < ln && ps + i <= msb ? std::optional(std::pair{std::size_t{0}, ps + i}) : sbit;
+        ins = {in(0), Bits{0, 0, 32}, Bits{0, 0, 32}};
+        break;
+      }
+      case O::BitInsert: {  // bfi f, b, pos, len: d = b; d[pos + i] = f[i] for i < len, pos + i <= msb
+        const auto pos = control(2), len = control(3);
+        if (xs.size() != 4 || !pos || !len) return std::nullopt;
+        const auto ps = unsigned(*pos & 0xff), ln = unsigned(*len & 0xff);
+        for (unsigned i = 0; i < w; ++i)
+          rt.src[i] = i >= ps && i - ps < ln ? std::pair{std::size_t{0}, i - ps} : std::pair{std::size_t{1}, i};
+        ins = {in(0), in(1), Bits{0, 0, 32}, Bits{0, 0, 32}};
+        break;
+      }
+      case O::BytePermute: {  // prmt a, b, c: byte k of d is byte c[4k+2..4k] of {b, a}, or its sign
+        const auto c = control(2);
+        if (xs.size() != 3 || !c || w != 32) return std::nullopt;
+        for (unsigned k = 0; k < 4; ++k) {
+          const auto s = unsigned(*c >> (4 * k) & 0xf), byte = s & 7;
+          const std::size_t from = byte < 4 ? 0 : 1;
+          const unsigned base = (byte & 3) * 8;
+          for (unsigned j = 0; j < 8; ++j)
+            rt.src[8 * k + j] = std::pair{from, s & 8 ? base + 7 : base + j};
+        }
+        ins = {in(0), in(1), Bits{0, 0, 32}};
+        break;
+      }
+      case O::FunnelShift: {  // shf.{l,r}.{clamp,wrap} a, b, n over the 64-bit {b, a}
+        const auto n = control(2);
+        bool left = false, wrap = false;
+        for (const auto& m : p.attributes().modifiers) left |= m == "l", wrap |= m == "wrap";
+        if (xs.size() != 3 || !n || w != 32) return std::nullopt;
+        const auto k = unsigned(wrap ? *n & 31 : std::min<std::uint64_t>(*n, 32));
+        for (unsigned i = 0; i < 32; ++i) {
+          const int at = left ? int(i) + 32 - int(k) : int(i + k);  // a bit of {b, a}
+          if (at >= 0 && at < 64) rt.src[i] = std::pair{std::size_t(at < 32 ? 0 : 1), unsigned(at % 32)};
+        }
+        ins = {in(0), in(1), Bits{0, 0, 32}};
+        break;
+      }
+      case O::Logic3: {
+        const auto t = control(3);
+        if (xs.size() != 4 || !t) return std::nullopt;
+        // lop3's table: bit (a << 2 | b << 1 | c); bitwise() indexes b0 | b1 << 1 | b2 << 2.
+        unsigned table = 0;
+        for (unsigned c = 0; c < 8; ++c)
+          if (*t >> ((c & 1) << 2 | (c >> 1 & 1) << 1 | (c >> 2 & 1)) & 1) table |= 1u << c;
+        auto bw = bitwise({in(0), in(1), in(2)}, table, w);
+        bw.used.push_back(0);
+        return std::pair{bw.result, bw.used};
+      }
+      default:
+        return std::nullopt;
+    }
+    const auto r = routed(rt, ins, w, used);
+    return std::pair{r, used};
+  }
+
+  // Whether `used` includes every bit operand y may vary in (an untracked operand or an undecided
+  // use: no).
+  bool covers(const v::Value& y, std::optional<std::uint64_t> used) {
+    const auto ow = bitWidth(y);
+    return used && ow && (bits(y).vary & ~*used & ones(ow)) == 0;
+  }
+  // The partial uses found (the first 8, for refusal details).
+  void note(const v::Value& x, const std::string& what, std::size_t i, const v::Value& y, std::optional<std::uint64_t> used,
+            const char* why) {
+    Json d{{"operation", what}, {"operand", i}, {"node", x.nodeId()}, {"instance", x.instanceIndex()}, {"why", why}};
+    if (const auto ow = bitWidth(y)) d["operand_bits"] = ow, d["varying"] = bits(y).vary, d["used"] = used ? Json(*used) : Json(nullptr);
+    if (partial_.size() < 8 && std::find(partial_.begin(), partial_.end(), d) == partial_.end()) partial_.push_back(d);
+  }
+  // Which operands of an operation of x (operands xs) it uses in full: every bit the operand may
+  // vary in (bits()) reaches the result. A partial use (reload(p) & 0xffff depends on p's low half
+  // only) is not a full path and does not make its leaves full dependencies (partial_operand).
+  // Decided exactly: bitwise operations (per bit, for every value of the other operands' varying
+  // bits), shifts, bfe, bfi, prmt (default mode), lop3, shf with fixed controls; integer
+  // truncation; integer products, quotients and remainders with a fixed operand; float abs (no
+  // sign) and copysign (a sign, a magnitude); slct's integer selector (its sign); a component of an
+  // operation's matrix result. Any of these with a control the launch does not fix (a data-dependent
+  // mask, shift, selector or table) is partial (undecided). Full (every bit can reach the result):
+  // other float operations, integer add, sub, min, max, not, compares, selects' values and
+  // conditions. An operand that is fixed or reaches no leaf is full (nothing to credit).
+  std::vector<char> operandsFull(const v::Value& x, const v::Operation& op, const std::vector<v::Value>& xs) {
+    std::vector<char> full(xs.size(), 1);
+    const auto w = bitWidth(x);
+    const auto live = [&](std::size_t i) { return i < xs.size() && !fixed(xs[i]) && !leaves(xs[i]).empty(); };
+    const auto check = [&](std::size_t i, std::optional<std::uint64_t> used, const char* why) {
+      if (live(i) && !covers(xs[i], used)) full[i] = 0, note(x, std::string(op.name()), i, xs[i], used, why);
+    };
+    if (!x.indices().empty()) {  // a component of the operation's matrix result
+      for (std::size_t i = 0; i < xs.size(); ++i) check(i, std::nullopt, "a component of an operation's matrix result");
+      return full;
+    }
+    const auto all_used = [&](std::size_t i) -> std::optional<std::uint64_t> { return ones(bitWidth(xs[i])); };
+    const auto& elem = g_.type(x).element();
+    const bool integer = elem.isInteger();
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op); b && xs.size() == 2) {
+      using B = v::BinaryOpcode;
+      std::vector<Bits> in{bits(xs[0]), bits(xs[1])};
+      switch (b->opcode()) {
+        case B::BitAnd: case B::BitOr: case B::BitXor: {
+          if (!w) { check(0, std::nullopt, "a bit operation on an untracked value"); check(1, std::nullopt, "a bit operation on an untracked value"); return full; }
+          const unsigned table = b->opcode() == B::BitAnd ? 0b1000 : b->opcode() == B::BitOr ? 0b1110 : 0b0110;
+          const auto bw = bitwise(in, table, w);
+          check(0, bw.used[0], "a bitwise operation reads only some bits");
+          check(1, bw.used[1], "a bitwise operation reads only some bits");
+          return full;
+        }
+        case B::ShiftLeft: case B::ShiftRight: {
+          const auto k = fixedBits(xs[1], bitWidth(xs[1]));
+          check(1, std::nullopt, "a data-dependent shift amount");
+          if (!k || !w) { check(0, std::nullopt, "a shift by an amount the launch does not fix"); return full; }
+          const bool sign = elem.kind() == v::ElementKind::SignedInteger;
+          check(0, shifted(in[0], *k, b->opcode() == B::ShiftLeft, sign).second, "a shift reads only some bits");
+          return full;
+        }
+        case B::Multiply:
+          if (!integer) return full;
+          for (std::size_t i = 0; i < 2; ++i) {
+            const auto c = fixedBits(xs[1 - i], bitWidth(xs[1 - i]));
+            if (!c || !live(i)) continue;
+            const auto mode = b->attributes().multiply_mode;
+            const auto ow = bitWidth(xs[i]);
+            std::optional<std::uint64_t> used;
+            if (mode == v::IntegerMultiplyMode::Wide && *c) used = ones(ow);
+            if (mode == v::IntegerMultiplyMode::Low && *c && ow) {
+              const auto tz = unsigned(__builtin_ctzll(*c));
+              used = tz >= ow ? 0 : ones(ow - tz);
+            }
+            check(i, used, "an integer product with a fixed factor reads only some bits (or which is not decided)");
+          }
+          return full;
+        case B::Divide: case B::Remainder:
+          if (!integer) return full;
+          for (std::size_t i = 0; i < 2; ++i) {
+            const auto c = fixedBits(xs[1 - i], bitWidth(xs[1 - i]));
+            if (!c) continue;
+            const bool exact = b->opcode() == B::Divide && i == 0 && *c == 1;
+            check(i, exact ? all_used(i) : std::nullopt, "an integer quotient or remainder with a fixed operand (bits read not decided)");
+          }
+          return full;
+        default:
+          return full;
+      }
+    }
+    if (const auto* u = dynamic_cast<const v::UnaryOp*>(&op); u && xs.size() == 1) {
+      if (u->opcode() == v::UnaryOpcode::Absolute && elem.kind() == v::ElementKind::Floating && w)
+        check(0, ones(w - 1), "float abs drops the sign bit");
+      return full;
+    }
+    if (const auto* cv = dynamic_cast<const v::ConvertOp*>(&op); cv && xs.size() == 1) {
+      convertOperand(x, xs[0], cv->attributes().saturate, check);
+      return full;
+    }
+    if (dynamic_cast<const v::BitcastOp*>(&op) && xs.size() == 1) {
+      if (bitWidth(xs[0]) != w || !w) check(0, std::nullopt, "a bitcast between widths");
+      return full;
+    }
+    if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      switch (p->opcode()) {
+        case O::BitExtract: case O::BitInsert: case O::BytePermute: case O::Logic3: case O::FunnelShift: {
+          const auto r = ptxBits(*p, xs, w, 0);
+          const std::size_t data = p->opcode() == O::BitExtract ? 1 : p->opcode() == O::Logic3 ? 3 : 2;
+          for (std::size_t i = 0; i < xs.size(); ++i) {
+            if (i >= data) check(i, std::nullopt, "a data-dependent control (position, length, selector, table or amount)");
+            else check(i, r ? std::optional(r->second[i]) : std::nullopt, "a bit-field operation reads only some bits");
+          }
+          return full;
+        }
+        case O::CopySign: {  // copysign a, b: b's magnitude with a's sign
+          const auto ow = xs.empty() ? 0u : bitWidth(xs[0]);
+          if (!ow || xs.size() != 2) { check(0, std::nullopt, "copysign"); check(1, std::nullopt, "copysign"); return full; }
+          check(0, std::uint64_t{1} << (ow - 1), "copysign reads only the sign of its first operand");
+          check(1, ones(ow - 1), "copysign reads all but the sign of its second operand");
+          return full;
+        }
+        case O::SelectSign:
+          if (xs.size() == 3 && g_.type(xs[2]).element().isInteger() && bitWidth(xs[2]))
+            check(2, std::uint64_t{1} << (bitWidth(xs[2]) - 1), "slct reads only the sign of an integer selector");
+          return full;
+        case O::MultiplyAdd: case O::MultiplyAddCarry: {
+          if (!integer || xs.size() != 3) return full;
+          bool wide = false, high = false;
+          for (const auto& m : p->attributes().modifiers) wide |= m == "wide", high |= m == "hi";
+          for (std::size_t i = 0; i < 2; ++i) {
+            const auto c = fixedBits(xs[1 - i], bitWidth(xs[1 - i]));
+            if (!c || !live(i)) continue;
+            const auto ow = bitWidth(xs[i]);
+            std::optional<std::uint64_t> used;
+            if (!high && *c && ow) {
+              const auto tz = unsigned(__builtin_ctzll(*c));
+              used = wide ? ones(ow) : tz >= ow ? 0 : ones(ow - tz);
+            }
+            check(i, used, "an integer multiply-add with a fixed factor reads only some bits (or which is not decided)");
+          }
+          return full;
+        }
+        default:
+          return full;
+      }
+    }
+    return full;
+  }
+  // A conversion of `source` to x's type: an integer truncation reads the low bits only.
+  template <class Check>
+  void convertOperand(const v::Value& x, const v::Value& source, bool saturate, const Check& check) {
+    const auto w = bitWidth(x), sw = bitWidth(source);
+    const auto& se = g_.type(source).element();
+    const auto& te = g_.type(x).element();
+    if (!se.isBitLike() || !te.isBitLike() || saturate) return;  // float conversions, saturation: every bit
+    if (!w || !sw) check(0, std::nullopt, "an integer conversion of an untracked value");
+    else if (w < sw) check(0, ones(w), "an integer truncation reads only the low bits");
+  }
+  // Whether the conversion step of x (a value with a conversion) uses all of its source: not a
+  // truncation, a bitcast between widths, or a component of a reinterpreted value.
+  bool conversionFull(const v::Value& x) {
+    const auto& c = *x.conversion();
+    const auto& src = c.source;
+    bool full = true;
+    const auto check = [&](std::size_t, std::optional<std::uint64_t> used, const char* why) {
+      if (!fixed(src) && !leaves(src).empty() && !covers(src, used))
+        full = false, note(x, c.spec->kind == v::TypeConversionKind::Convert ? "convert" : "bitcast", 0, src, used, why);
+    };
+    if (!x.indices().empty()) {
+      check(0, std::nullopt, "a component of a reinterpreted value");
+      return full;
+    }
+    const auto conv = x.withoutSelection();
+    if (c.spec->kind == v::TypeConversionKind::Bitcast) {
+      if (g_.type(conv).bitSize() != g_.type(src).bitSize()) check(0, std::nullopt, "a bitcast between widths");
+      return full;
+    }
+    convertOperand(conv, src, c.spec->attributes.saturate, check);
+    return full;
+  }
+
   // One step of the complete dataflow of a resolved value x (no thread selector): its successors
   // (index values first, then the conversion source, the replaced load's stored value or the
   // operation's operands), whether x is a leaf (an initial-memory load, a constant, a parameter or
@@ -549,15 +992,17 @@ class Checker {
   // reassembled from stored values, and an operation of a kind not listed here.
   struct Flow {
     std::vector<v::Value> next;
+    std::vector<char> full;   // per next: the edge uses all of that value's bits (operandsFull)
     std::size_t indices = 0;  // next[0, indices) are x's index values
     bool leaf = false, trans = false, load = false;
   };
   Flow flow(const v::Value& x) {
     Flow f;
-    for (const auto& i : x.indices()) f.next.push_back(i);
+    for (const auto& i : x.indices()) f.next.push_back(i), f.full.push_back(1);
     f.indices = f.next.size();
     if (const auto& c = x.conversion()) {
       f.next.push_back(c->source);
+      f.full.push_back(conversionFull(x));
       return f;
     }
     const auto& op = g_.definingNode(x).operation();
@@ -570,6 +1015,7 @@ class Checker {
       if (const auto* r = m_.readReplacement(key)) {
         if (const auto* value = std::get_if<v::Value>(r)) {
           f.next.push_back(x.indices().empty() ? *value : g_.component(*value, {x.indices().begin(), x.indices().end()}));
+          f.full.push_back(1);
           return f;
         }
         if (std::get_if<InitialMemorySymbol>(r)) return f.leaf = true, f;
@@ -597,7 +1043,8 @@ class Checker {
     f.trans = transcendental(op);
     const auto operands = g_.instanceOperands(x).toVector();
     deadOperands(x, op, operands);
-    for (const auto& a : operands) f.next.push_back(a);
+    const auto full = operandsFull(x, op, operands);
+    for (std::size_t i = 0; i < operands.size(); ++i) f.next.push_back(operands[i]), f.full.push_back(full[i]);
     return f;
   }
 
@@ -629,6 +1076,39 @@ class Checker {
     }
     memo_.emplace(key, std::make_shared<const Set>(s));
     return s;
+  }
+
+  // The leaves x reaches by full uses only (flow's full edges): the dependencies that hold in full.
+  // leaves() over every edge is the dependencies that may hold at all; a leaf in leaves() and not
+  // here is reached only through partial uses (partial_operand). Memoized by identity.
+  Set fullLeaves(v::Value x, unsigned depth = 0) {
+    if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
+    x = resolve(x);
+    const auto key = ident(x);
+    if (auto it = stop_.find(key); it != stop_.end()) return {{it->second, it->second + 1}};
+    if (auto it = full_memo_.find(key); it != full_memo_.end()) return *it->second;
+    Set s;
+    const auto& op = g_.definingNode(x).operation();
+    if (!x.conversion() && dynamic_cast<const v::LoadOp*>(&op)) {
+      s = *loadLeaves(x, false, true);
+    } else {
+      leaves(x, depth);  // its refusals and unsupported steps first
+      const auto f = flow(x);
+      for (std::size_t i = 0; i < f.next.size(); ++i)
+        if (f.full[i]) s = unite(s, fullLeaves(f.next[i], depth + 1));
+    }
+    full_memo_.emplace(key, std::make_shared<const Set>(s));
+    return s;
+  }
+  // Refuses when x's leaves are not all reached by full uses.
+  void requireFull(const v::Value& x, const Set& all, const Set& full, const Json& where) {
+    if (full == all) return;
+    auto d = where;
+    d["leaves"] = render(all);
+    d["full_leaves"] = render(full);
+    d["partial_uses"] = partial_;
+    refuse("partial_operand", "a leaf is reached only through uses of part of a value's bits (or of bits not decided)", d);
+    (void)x;
   }
 
   // A short readable form of x's top operations (for refusal details).
@@ -706,9 +1186,12 @@ class Checker {
   // from the value reaches; `through`, those reached by a path that passes a transcendental
   // operation strictly above the source. No cut ends a path. A source is the argument's value:
   // for an input argument an initial-memory load (its elements), for a body argument a value the
-  // producer's output is bound to (by identity, its cut element).
+  // producer's output is bound to (by identity, its cut element). `full`, `through_full`: the same
+  // over full uses only (flow's full edges). A claim that a path exists (an element reaches the
+  // output, through a transcendental) needs a full path; a claim that none exists (avoids) counts
+  // every path, partial ones too.
   struct Reach {
-    Set all, through;
+    Set all, through, full, through_full;
   };
   using ReachMemo = std::map<std::string, std::shared_ptr<const Reach>>;
   template <class Source>
@@ -719,14 +1202,20 @@ class Checker {
     if (auto it = memo.find(key); it != memo.end()) return *it->second;
     const auto f = flow(x);
     Reach r;
-    Set below;
-    for (const auto& n : f.next) {
-      const auto& s = reach(n, memo, source, depth + 1);
+    Set below, below_full;
+    for (std::size_t i = 0; i < f.next.size(); ++i) {
+      const auto& s = reach(f.next[i], memo, source, depth + 1);
       below = unite(below, s.all);
       r.through = unite(r.through, s.through);
+      if (f.full[i]) {
+        below_full = unite(below_full, s.full);
+        r.through_full = unite(r.through_full, s.through_full);
+      }
     }
-    if (f.trans) r.through = unite(r.through, below);
-    r.all = unite(below, source(x, key, f));
+    if (f.trans) r.through = unite(r.through, below), r.through_full = unite(r.through_full, below_full);
+    const auto here = source(x, key, f);
+    r.all = unite(below, here);
+    r.full = unite(below_full, here);
     return *memo.emplace(std::move(key), std::make_shared<const Reach>(std::move(r))).first->second;
   }
   // Sources of an input argument: initial-memory loads.
@@ -773,27 +1262,30 @@ class Checker {
   // Memoized per argument set k (roles are few, so one memo per (root, k)), by value identity.
   using Memo = std::map<std::string, SetRef>;
 
-  // The leaves of k that x reaches as a factor of a multiply (or an fma's product) whose other
-  // factor reaches no leaf of k.
+  // The leaves of k that x reaches in full (fullLeaves) as a factor of a multiply (or an fma's
+  // product) whose other factor reaches no leaf of k, along full uses only.
   Set factorLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
-    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
+    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, const auto& full, unsigned d) {
       Set s;
       const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
       const bool product = (b && b->opcode() == v::BinaryOpcode::Multiply) || dynamic_cast<const v::FmaOp*>(&op);
       if (product && xs.size() >= 2) {
         const auto l0 = meet(leaves(xs[0], d + 1), k), l1 = meet(leaves(xs[1], d + 1), k);
-        if (l1.empty()) s = unite(s, l0);
-        if (l0.empty()) s = unite(s, l1);
+        if (l1.empty() && full[0]) s = unite(s, meet(fullLeaves(xs[0], d + 1), k));
+        if (l0.empty() && full[1]) s = unite(s, meet(fullLeaves(xs[1], d + 1), k));
       }
-      for (const auto& a : xs) s = unite(s, factorLeaves(a, k, memo, d + 1));
+      for (std::size_t i = 0; i < xs.size(); ++i)
+        if (full[i]) s = unite(s, factorLeaves(xs[i], k, memo, d + 1));
       return s;
-    }, [&](const v::Value& i, unsigned d) { return factorLeaves(i, k, memo, d); });
+    }, [&](const v::Value& i, unsigned d) { return factorLeaves(i, k, memo, d); },
+    [&](const v::Value&, unsigned) { return Set{}; });
   }
 
   // The leaves of k that x reaches on some path that passes no product whose other factor reaches
-  // no leaf of k (a path that bypasses the multiply). An index value is never a factor.
+  // no leaf of k (a path that bypasses the multiply). An index value is never a factor. Every path
+  // counts, partial ones too.
   Set bypassLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
-    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
+    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, const auto&, unsigned d) {
       const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
       const bool product = (b && b->opcode() == v::BinaryOpcode::Multiply) || dynamic_cast<const v::FmaOp*>(&op);
       Set s;
@@ -808,7 +1300,8 @@ class Checker {
       }
       for (std::size_t i = from; i < xs.size(); ++i) s = unite(s, operandBypass(xs[i], k, memo, d + 1));
       return s;
-    }, [&](const v::Value& i, unsigned d) { return operandBypass(i, k, memo, d); });
+    }, [&](const v::Value& i, unsigned d) { return operandBypass(i, k, memo, d); },
+    [&](const v::Value& n, unsigned d) { return bypassLeaves(n, k, memo, d); });
   }
   // An operand's bypass leaves: a leaf of k itself, else its own walk.
   Set operandBypass(const v::Value& a, const Set& k, Memo& memo, unsigned depth) {
@@ -823,9 +1316,10 @@ class Checker {
   }
 
   // The leaves of k that x reaches by some path other than adds, an fma's addend, conversions and
-  // bit operations with constant operands, or as both operands of one add.
+  // bit operations with constant operands, or as both operands of one add. A partial use is not
+  // an addend path (its leaves count here).
   Set nonAddendLeaves(v::Value x, const Set& k, Memo& memo, unsigned depth = 0) {
-    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, unsigned d) {
+    return walk(x, memo, depth, [&](const v::Operation& op, const auto& xs, const auto& full, unsigned d) {
       Set s;
       const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
       const auto code = b ? std::optional(b->opcode()) : std::nullopt;
@@ -838,23 +1332,26 @@ class Checker {
         s = unite(meet(p, k), meet(meet(p, leaves(xs[2], d + 1)), k));
         s = unite(s, nonAddendLeaves(xs[2], k, memo, d + 1));
       } else {
-        // A bit operation whose other operands are constants (no leaves) carries its one operand.
+        // A bit operation whose other operands are constants (no leaves) carries its one operand,
+        // when it uses all of that operand's bits.
         std::vector<std::size_t> live;
         for (std::size_t i = 0; i < xs.size(); ++i)
           if (!leaves(xs[i], d + 1).empty()) live.push_back(i);
         const bool bits = code == B::ShiftLeft || code == B::ShiftRight || code == B::BitAnd || code == B::BitOr;
-        if (bits && live.size() == 1) return nonAddendLeaves(xs[live[0]], k, memo, d + 1);
+        if (bits && live.size() == 1 && full[live[0]]) return nonAddendLeaves(xs[live[0]], k, memo, d + 1);
         for (const auto& a : xs) s = unite(s, meet(leaves(a, d + 1), k));
       }
       return s;
-    }, [&](const v::Value& i, unsigned d) { return meet(leaves(i, d), k); });
+    }, [&](const v::Value& i, unsigned d) { return meet(leaves(i, d), k); },
+    [&](const v::Value& n, unsigned d) { return meet(leaves(n, d), k); });
   }
 
-  // A memoized walk of x's complete dataflow (flow): through conversions and replaced loads, `f`
-  // on any other operation with its operands, `index` on each index value; a leaf gives the empty
-  // set. Undecided steps are unsupported (flow).
-  template <class F, class I>
-  Set walk(v::Value x, Memo& memo, unsigned depth, const F& f, const I& index) {
+  // A memoized walk of x's complete dataflow (flow): through conversions and replaced loads (a
+  // partial conversion: `partial` instead), `f` on any other operation with its operands and their
+  // full flags, `index` on each index value; a leaf gives the empty set. Undecided steps are
+  // unsupported (flow).
+  template <class F, class I, class P>
+  Set walk(v::Value x, Memo& memo, unsigned depth, const F& f, const I& index, const P& partial) {
     if (depth > 20000) unsupported("depth", "value DAG deeper than 20000");
     x = resolve(x);
     auto key = ident(x);
@@ -863,10 +1360,12 @@ class Checker {
     Set s;
     for (std::size_t i = 0; i < fl.indices; ++i) s = unite(s, index(fl.next[i], depth + 1));
     const std::vector<v::Value> rest(fl.next.begin() + std::ptrdiff_t(fl.indices), fl.next.end());
+    const std::vector<char> full(fl.full.begin() + std::ptrdiff_t(fl.indices), fl.full.end());
     if (x.conversion() || fl.load) {
-      for (const auto& n : rest) s = unite(s, walk(n, memo, depth + 1, f, index));
+      for (std::size_t i = 0; i < rest.size(); ++i)
+        s = unite(s, full[i] ? walk(rest[i], memo, depth + 1, f, index, partial) : partial(rest[i], depth + 1));
     } else if (!fl.leaf) {
-      s = unite(s, f(g_.definingNode(x).operation(), rest, depth));
+      s = unite(s, f(g_.definingNode(x).operation(), rest, full, depth));
     }
     memo.emplace(std::move(key), std::make_shared<const Set>(s));
     return s;
@@ -922,8 +1421,21 @@ class Checker {
               d["reached"] = render(rr.all);
               refuse("role", "an element of a role's argument does not reach the atom's output", d);
             }
-            reached = rr.through;
-            ok = role == RoleKind::ThroughTranscendental ? unite(reached, ek) == reached : disjoint(reached, ek);
+            // Reaching, and reaching through a transcendental, need a full path; avoiding counts
+            // partial paths too.
+            const bool through = role == RoleKind::ThroughTranscendental;
+            if (unite(rr.full, ek) != rr.full || (through && unite(rr.through, ek) == rr.through &&
+                                                  unite(rr.through_full, ek) != rr.through_full)) {
+              auto d = where;
+              d["argument"] = k;
+              d["role"] = name;
+              d["argument_leaves"] = render(ek);
+              d["reached_in_full"] = render(through ? rr.through_full : rr.full);
+              d["partial_uses"] = partial_;
+              refuse("partial_operand", "an element of a role's argument reaches the output only through partial uses", d);
+            }
+            reached = through ? rr.through_full : rr.through;
+            ok = through ? unite(reached, ek) == reached : disjoint(reached, ek);
             break;
           }
           case RoleKind::Addend:
@@ -1210,6 +1722,7 @@ class Checker {
             d["actual"] = render(actual);
             refuse("leaves", "the output's leaf set differs from the term's operands", d);
           }
+          requireFull(*slot, actual, fullLeaves(*slot), where);
           // 2. Primitive: the stored value (less the format clause's store conversion) is the one
           // operation on the operands, up to commutativity: an input element through its
           // conversion, an inner node's stored value, or an inner node's value (the cut) whose leaves
@@ -1325,6 +1838,7 @@ class Checker {
               std::vector<SpacePattern> ps;
               for (const auto& q : patterns(t_, a.ref, false)) ps.push_back({q.space, compose(q.at, at)});
               if (leaves(y) != materialize(ps, r, c)) return false;
+              requireFull(y, leaves(y), fullLeaves(y), d);
               // The element's identity is its coordinate (an unstored node has no layout object).
               const auto coord = coordinate(at, r, c);
               if (!coord || (*coord)[1] >> 32 || (*coord)[0] >> 32)
@@ -1375,6 +1889,7 @@ class Checker {
                 d["actual"] = cutter.render(actual_cut);
                 refuse("factorization", "with the inner nodes' stored values as leaves, the output reaches other leaves", d);
               }
+              cutter.requireFull(*slot, actual_cut, cutter.fullLeaves(*slot), where);
             }
             checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where);
           }
@@ -1399,6 +1914,9 @@ class Checker {
   // Cut values by identity (the cut checker's leaves).
   std::map<std::string, std::uint64_t> stop_;
   std::map<std::string, SetRef> memo_;
+  std::map<std::string, Bits> bits_;  // per-bit facts by identity (partial operands)
+  std::map<std::string, SetRef> full_memo_;  // fullLeaves by identity
+  std::vector<Json> partial_;
   ReachMemo reach_in_;
   std::map<std::size_t, ReachMemo> reach_body_;
   std::map<std::size_t, std::map<std::string, std::uint64_t>> sources_;  // body sources per producer

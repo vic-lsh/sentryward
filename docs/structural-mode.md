@@ -15,9 +15,9 @@ their stored values (factorization); every opaque argument's role holds (below).
 **A match is never evidence of op identity.** Which op an opaque atom computes, and its numerics,
 rest on the trusted kernel row (the caller's contract), not on this check. Roles exist only to tell
 equal-shaped operands of that trusted op apart (`silu_mul(gate, up)` versus `silu_mul(up, gate)`).
-They are syntactic facts about dataflow paths, not semantic dependence: a path through a select's
-condition, or through an operation whose result does not depend on the operand for some other
-reason (a partial mask, a lop3 table, a prmt selector, `x - x`), still counts as a path.
+They are facts about dataflow paths, not semantic dependence: a path through a select's condition,
+or through an operation whose result cancels the operand (`x - x`, `x * (y - y)`), still counts as
+a path. A use of part of an operand's bits does not (partial operands, below).
 
 ## Roles
 
@@ -45,6 +45,25 @@ of a body argument, the values its producer's stored output elements hold, by va
   the value's leaves could hide a missing dependency (a pack of `a`'s low half and `b`'s high half,
   read back as the low half, depends on `a` only). A piece that is all of a stored value's bits is
   exact. Role reachability refuses any read reassembled from stored values (`reassembled_read`).
+- **Partial operands** (`partial_operand`): an edge is full when the operation reads every bit its
+  operand may vary in. Per value, `bits()` keeps the bits that may vary (a superset) and the fixed
+  value of the others, through constants, bit operations with fixed controls, shifts by fixed
+  amounts, integer extensions and truncations and same-width bitcasts; any other result varies in
+  every bit. Partial, by the bits each reads: and/or/xor/lop3 per bit (for every value of the other
+  operands' varying bits, so a mask that is itself data is undecided), shl/shr (shr.s past the
+  width reads the sign), bfe, bfi, prmt (default mode), shf, integer truncation (cvt, a mov.b32
+  unpack), integer products, quotients and remainders with a fixed operand, float abs (no sign),
+  copysign (one operand's sign, the other's magnitude), slct's integer selector (its sign), a
+  component of an operation's matrix result; a control the launch does not fix (mask, amount,
+  position, selector, table) makes the use undecided, so partial. A partial edge counts for claims
+  that no path exists (avoids_transcendental, a multiplicand's bypass, an addend's non-addend
+  paths) and never for claims that one does: an output's leaves must all be reached by full paths
+  (`fullLeaves`), so must a factorization's cut elements and an unstored producer's operands, and
+  an argument of a role must reach the output (through a transcendental, for that role) by a full
+  path, as a factor of a multiplicand or along addend edges. `reload(p) & 0xffff` is refused; nvcc's
+  `expf` (`shl.b32` of the low 9 bits of a rounding result, whose source also reaches the output in
+  full) is not. A full-width reassembly of partial uses (`{lo, hi}` unpacked and repacked) is
+  refused too: each use is partial.
 - **Undecided steps** (`unsupported`): reads at data-dependent positions, unresolved loads,
   undetermined values, thread selectors the launch does not decide, operation kinds not listed.
 

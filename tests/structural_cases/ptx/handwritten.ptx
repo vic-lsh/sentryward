@@ -6,6 +6,7 @@
 // p reaches y through an ex2 above q's cut.
 // sel_pos_component / sel_neg_component: a stored producer's value and a primitive's operand that
 // are conversions of one node result and instance and differ only in the selected component.
+// Each half uses part of the word's bits, so both are refused (partial_operand).
 //
 
 .version 8.8
