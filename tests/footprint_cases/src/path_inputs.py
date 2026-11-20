@@ -39,7 +39,15 @@ def inp(entry, out_bytes, taken=None, premise=None, z=None):
     return d
 
 
+def rows_inp(entry):
+    d = inp(entry, 12, premise=(0, 2))
+    d["footprints"][1]["pieces"] = [{"base": 0, "rows": 2, "stride": 6, "period": 6, "count": 1, "width": 6,
+                                     "direction": "write"}]
+    return d
+
+
 CASES = {
+    "path_index_rows": rows_inp("k_index"),
     # The exit branch is taken when the guard fails; the access is on the not-taken path.
     "path_eq": inp("k_eq", 32, taken=False),
     "path_eq_past": inp("k_eq_past", 32, taken=False),

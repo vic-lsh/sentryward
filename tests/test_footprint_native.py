@@ -188,6 +188,9 @@ class FootprintNativeTest(unittest.TestCase):
     def test_path_wrapped_equality_reads_before_the_object(self):
         self.assertEqual(self.writes("path_eq16_wrapped"), "violated")
 
+    def test_piece_rows_straddling_store_not_contained(self):
+        self.assertNotEqual(self.writes("path_index_rows"), "contained")
+
     def test_path_and_pred_not_taken_bounds_neither(self):
         self.assertNotEqual(self.writes("path_and"), "contained")
 

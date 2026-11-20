@@ -300,8 +300,16 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
         bool allowed = false, held = false, decided = true;
         for (const auto& piece : decl.pieces) {
           bool in = false;
-          if (d == 0 && piece.CoversExtent(decl.extent)) {
-            in = true;  // the verdict is contained in [0, extent), which the piece covers
+          // The piece covers [0, extent), and the access cannot straddle two of its rows: one row,
+          // or a symbolic offset whose step is a multiple of the row stride and whose bytes fit in
+          // the rest of the row from its column (the declared contract is one run of one row).
+          const auto stride = piece.stride ? std::int64_t(piece.stride) : std::int64_t(1);
+          const bool one_row_access =
+              piece.rows == 1 ||
+              (!verdict.constant_offset && verdict.constant && verdict.coefficient_gcd % piece.stride == 0 &&
+               std::uint64_t((*verdict.constant % stride + stride) % stride) + *access.bytes <= piece.stride);
+          if (d == 0 && piece.CoversExtent(decl.extent) && one_row_access) {
+            in = true;  // contained in [0, extent), which the piece covers, within one row
           } else if (verdict.constant_offset) {
             in = piece.Contains(*verdict.min_byte + d, *access.bytes);
           } else if (verdict.constant && verdict.min_byte && verdict.max_byte_exclusive) {

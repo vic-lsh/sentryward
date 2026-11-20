@@ -73,4 +73,9 @@ __global__ void k_eq16_wrapped(const uint16_t* hdr16, uint32_t* out) {
   if ((uint16_t)v == 0) return;
   out[v] = 1;
 }
+// Control (re-check of stage B: rows of a piece): out[j], j in [0, 2]; with rows of 6 bytes the
+// store at byte 4 straddles two rows, so it is in no run of one row.
+__global__ void k_index(const uint32_t* hdr, uint32_t* out) {
+  out[hdr[0]] = 1;
+}
 }

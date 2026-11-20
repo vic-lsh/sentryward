@@ -1,0 +1,91 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "k_index",
+ "launch": {
+  "grid_dim": [
+   1,
+   1,
+   1
+  ],
+  "block_dim": [
+   32,
+   1,
+   1
+  ],
+  "dynamic_shared_bytes": 0
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "hdr"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "out"
+  }
+ ],
+ "arguments": [],
+ "footprints": [
+  {
+   "object": "hdr",
+   "direction": "read",
+   "extent_bytes": 8,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 1,
+     "stride": 8,
+     "period": 8,
+     "count": 1,
+     "width": 8,
+     "direction": "read"
+    }
+   ]
+  },
+  {
+   "object": "out",
+   "direction": "write",
+   "extent_bytes": 12,
+   "pieces": [
+    {
+     "base": 0,
+     "rows": 2,
+     "stride": 6,
+     "period": 6,
+     "count": 1,
+     "width": 6,
+     "direction": "write"
+    }
+   ]
+  }
+ ],
+ "footprint_reads": "noninterference",
+ "tensor_properties": [
+  {
+   "object": "hdr",
+   "element_type": "u32",
+   "property": "lower_bound",
+   "value": 0,
+   "field": {
+    "offset": 0,
+    "stride": 4,
+    "count": 1
+   }
+  },
+  {
+   "object": "hdr",
+   "element_type": "u32",
+   "property": "upper_bound",
+   "value": 2,
+   "field": {
+    "offset": 0,
+    "stride": 4,
+    "count": 1
+   }
+  }
+ ]
+}

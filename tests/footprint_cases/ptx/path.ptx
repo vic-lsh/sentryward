@@ -298,3 +298,24 @@ $L__BB10_2:
 	ret;
 
 }
+	// .globl	k_index
+.visible .entry k_index(
+	.param .u64 .ptr .align 1 k_index_param_0,
+	.param .u64 .ptr .align 1 k_index_param_1
+)
+{
+	.reg .b32 	%r<3>;
+	.reg .b64 	%rd<7>;
+
+	ld.param.u64 	%rd1, [k_index_param_0];
+	ld.param.u64 	%rd2, [k_index_param_1];
+	cvta.to.global.u64 	%rd3, %rd2;
+	cvta.to.global.u64 	%rd4, %rd1;
+	ld.global.u32 	%r1, [%rd4];
+	mul.wide.u32 	%rd5, %r1, 4;
+	add.s64 	%rd6, %rd3, %rd5;
+	mov.b32 	%r2, 1;
+	st.global.u32 	[%rd6], %r2;
+	ret;
+
+}

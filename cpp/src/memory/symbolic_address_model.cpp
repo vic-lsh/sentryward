@@ -693,12 +693,15 @@ struct SymbolicAddressModel::Impl {
   address_solver::Query Instantiate(std::set<AtomId> selected, std::map<AtomId, std::size_t>& variables) {
     address_solver::Query query;
     std::vector<bool> used(term_bounds.size());
+    // A scoped (local) invariant joins only a query that names its scope atom itself, never one that
+    // reaches the atom through closure.
+    const std::set<AtomId> named = selected;
     for (bool changed = true; changed;) {
       changed = false;
       for (std::size_t i = 0; i < term_bounds.size(); ++i) {
         if (used[i]) continue;
         const auto& terms = term_bounds[i].term.terms;
-        if (term_bounds[i].scope ? !selected.contains(*term_bounds[i].scope)
+        if (term_bounds[i].scope ? !named.contains(*term_bounds[i].scope)
                                  : !std::any_of(terms.begin(), terms.end(), [&](const auto& t) { return selected.contains(t.first); }))
           continue;
         used[i] = true;
