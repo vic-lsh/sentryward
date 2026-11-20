@@ -1,0 +1,25 @@
+.version 8.8
+.target sm_90a
+.address_size 64
+
+.visible .entry bulk(
+	.param .u64 bulk_param_0,
+	.param .u64 bulk_param_1
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .b32 	%r<8>;
+	.reg .b64 	%rd<16>;
+
+	ld.param.u64 	%rd1, [bulk_param_0];
+	ld.param.u64 	%rd2, [bulk_param_1];
+	cvta.to.global.u64 	%rd3, %rd1;
+	cvta.to.global.u64 	%rd4, %rd2;
+	mov.u32 	%r1, %ctaid.y;
+	mov.u32 	%r2, %tid.x;
+	mul.wide.u32 	%rd5, %r1, 128;
+	mul.wide.u32 	%rd6, %r2, 4;
+	add.s64 	%rd7, %rd5, %rd6;
+	cp.async.bulk.tensor.1d.shared::cluster.global.mbarrier::complete_tx::bytes [%rd7], [%rd4, {%r2}], [%rd5];
+	ret;
+}
