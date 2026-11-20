@@ -225,7 +225,8 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
   };
 
   for (const auto& access : accesses) {
-    if (access.bytes.value_or(0) == 0 || !std::holds_alternative<AddressId>(access.address)) continue;
+    // Only a known zero width has no bytes to check; an unknown width is classified below.
+    if ((access.bytes && *access.bytes == 0) || !std::holds_alternative<AddressId>(access.address)) continue;
     // The verdict without an extent names the allocation and space; global memory only.
     auto probe = model.containment(access, std::nullopt);
     // A probe that could not classify the access (no space: model error, unproved invariants,
@@ -237,6 +238,13 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
       continue;
     }
     if (probe.address_space != "global") continue;
+    if (!access.bytes) {
+      // A global access of unknown width: its bytes cannot be checked (undecided, never a pass).
+      ++report.checked;
+      current_weight = 1;
+      undecided_at(access, probe.allocation.empty() ? "<unresolved>" : probe.allocation, probe, 0);
+      continue;
+    }
     ++report.checked;
     const std::string object = probe.allocation.empty() ? "<unresolved>" : probe.allocation;
     const Shifts unshifted;

@@ -2021,7 +2021,7 @@ void Executor::RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth
         if (const auto n = ScalarInteger(s.registers[id->second])) cta += n->str() + ",";
     // An element function of its own (an atom with these bounds), so pointer arithmetic on it
     // keeps an affine offset that the footprint check bounds.
-    auto identity = "path:" + std::to_string(decoded_[pc].instruction->line) + ":" + cta + std::to_string(warp) +
+    auto identity = "path:" + std::to_string(pc) + ":" + cta + std::to_string(warp) +
                     ":" + std::to_string(lane) + ":" + std::to_string(visit);
     ElementAtom atom{"path_condition", (sign ? "s" : "u") + std::to_string(width), Integer(0), identity, lower, upper};
     s.registers[reg] = MakeBounded(lower, upper, std::move(identity), {}, AffineForm{Integer(0), {{std::move(atom), Integer(1)}}});
@@ -3009,7 +3009,8 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
         const Integer low = sign ? -(Integer(1) << (width - 1)) : Integer(0);
         const Integer high = (Integer(1) << (width - unsigned(sign))) - 1;
         const auto type = (sign ? "s" : "u") + std::to_string(width);
-        auto identity = "load:" + std::to_string(i.line) + ":" + CtaText(s) + std::to_string(warp) + ":" +
+        // The instruction id, not the line: one PTX line may hold several instructions.
+        auto identity = "load:" + std::to_string(i.id) + ":" + CtaText(s) + std::to_string(warp) + ":" +
                         std::to_string(lane) + ":" + std::to_string(occurrence);
         ElementAtom atom{"lane_load", type, Integer(0), identity, low, high};
         Set(d, s, {MakeBounded(low, high, std::move(identity), {}, AffineForm{Integer(0), {{std::move(atom), Integer(1)}}})});
