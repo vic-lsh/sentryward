@@ -126,13 +126,21 @@ def expression(rng, k, leaves, depth):
     return e
 
 
-def roles(rng, k, reg, tag):
-    """A role set for the argument tagged `tag` of the atom whose value is `reg`: mostly the
-    transcendental role the generator's model says holds, else a random set."""
-    if rng.random() < 0.6:
-        alls, thr = k.info[reg]
-        if tag in alls:
+def roles(rng, k, reg, tag, wrong=True):
+    """A role set for the argument tagged `tag` of the atom whose value is `reg`: half the time the
+    transcendental role the generator's model says holds, a quarter the opposite one (a wrong
+    role, which the checker must refuse), else a random set. Without `wrong`: the role that holds,
+    or none (producers, so that a case reaches its consumer's roles)."""
+    c = rng.random()
+    alls, thr = k.info[reg]
+    if not wrong:
+        if c < 0.6 and tag in alls:
             return ["through_transcendental" if tag in thr else "avoids_transcendental"]
+        return []
+    if c < 0.75 and tag in alls:
+        holds = "through_transcendental" if tag in thr else "avoids_transcendental"
+        wrong = "avoids_transcendental" if tag in thr else "through_transcendental"
+        return [holds if c < 0.5 else wrong]
     return rng.choice(ROLE_SETS)
 
 
@@ -162,15 +170,19 @@ def case(rng, name):
             x = k.load(o) if rng.random() < 0.5 else r
             k.info[x] = (k.info[r][0] | {o}, k.info[r][1])
             return x
-        nodes = [opaque("P", [{"input": 0, "reads": IDENT}], [roles(rng, k, p, "a")], "p")]
+        nodes = [opaque("P", [{"input": 0, "reads": IDENT}], [roles(rng, k, p, "a", wrong=False)], "p")]
         regs = {"p": p}
         if two:
             q = expression(rng, k, [reread("p", p)] + ([a] if rng.random() < 0.2 else []), rng.randint(0, 3))
             k.store("q", q)
             regs["q"] = q
-            nodes.append(opaque("Q", [{"body": 0, "reads": IDENT}], [roles(rng, k, q, "p")], "q"))
+            nodes.append(opaque("Q", [{"body": 0, "reads": IDENT}], [roles(rng, k, q, "p", wrong=False)], "q"))
         pool = [("body", 0, "p")] + ([("body", 1, "q")] if two else []) + [("input", 0, "a"), ("input", 1, "b")]
-        args = rng.sample(pool, rng.randint(1, min(3, len(pool))))
+        if two and rng.random() < 0.5:  # a consumer of both producers: a path from p behind q's cut
+            args = [pool[0], pool[1]] + rng.sample(pool[2:], rng.randint(0, 1))
+            rng.shuffle(args)
+        else:
+            args = rng.sample(pool, rng.randint(1, min(3, len(pool))))
         leaves = [reread(n, regs[n]) if kind == "body" else (a if n == "a" else b) for kind, _, n in args]
         y = expression(rng, k, leaves, rng.randint(0, 3))
         k.store("y", y)
@@ -216,7 +228,7 @@ class StructuralDifferentialTest(unittest.TestCase):
     def test_checker_never_accepts_where_the_reference_refuses(self):
         rng = random.Random(SEED)
         keep = os.environ.get("SENTRYWARD_DIFF_KEEP")
-        outcomes, role_checks, violations = Counter(), 0, []
+        outcomes, role_checks, violations, agree = Counter(), 0, [], Counter()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(keep or tmp)
             for i in range(CASES):
@@ -224,13 +236,20 @@ class StructuralDifferentialTest(unittest.TestCase):
                 term, inputs, ptx = case(rng, name)
                 r = run_case(NATIVE, root / name, term, inputs, ptx)
                 outcomes[r["result"] if r["result"] == "matched" else f'{r["result"]}:{r.get("reason")}'] += 1
+                ref = r.get("reference", {})
+                if r["result"] == "refused" and r.get("reason") == "role" and "checks" in ref:
+                    # Informational: a role refusal the reference confirms, one it holds (the checker is
+                    # stricter), or one it did not see (an unstored producer refused while matching,
+                    # before any binding was committed).
+                    agree["role refusal: reference fails" if ref["fails"] else
+                          "role refusal: reference holds" if ref["checks"] else "role refusal: not compared"] += 1
                 if r["result"] != "matched":
                     continue
-                ref = r["reference"]
                 role_checks += ref["checks"]
                 if ref["fails"] or ref["undecided"]:
                     violations.append({"case": i, "fails": ref["fails"][:3], "undecided": ref["undecided"][:3]})
-        print(f"\nseed {SEED:#x}, {CASES} cases: {dict(outcomes)}; role checks in matched cases: {role_checks}")
+        print(f"\nseed {SEED:#x}, {CASES} cases: {dict(outcomes)}; role checks in matched cases: "
+              f"{role_checks}; {dict(agree)}")
         self.assertEqual(violations, [], f"checker matched where the reference refuses (seed {SEED:#x})")
         # Not vacuous: both outcomes occur, and matched cases carry role checks.
         self.assertGreater(outcomes["matched"], CASES // 10)
