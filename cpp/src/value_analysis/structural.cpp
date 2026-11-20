@@ -1941,6 +1941,15 @@ class Checker {
 // (SentryWard's infrastructure, not the check's). The checker's producer bindings (bound_) are not
 // trusted: each is checked against the consumer's own operands at the coordinate the reference
 // computes, and every coordinate a consumer reads must be bound.
+// Partial uses: its own rule by concrete evaluation (usesAll, convertsAll; not the checker's
+// bits()): an edge into a bit operation, an integer truncation, an integer product, quotient or
+// remainder with a fixed operand, float abs, copysign or slct's integer selector is full when
+// flipping each bit of the operand that varies between probes of its bit fragment changes the
+// result. Leaves, cuts and bindings must be reached along full edges too; a role's element must
+// reach the output (through a transcendental, along addend edges, by a guard) along full edges;
+// avoids and unguarded paths count every edge. The probes (all free values zero or ones, each
+// bit flipped from either) decide a fragment's varying bits exactly when each result bit depends
+// on at most two input bits (masks, shifts, resizes, prmt, bfe, bfi); a lop3 chain could hide one.
 // Checks: leaves (every output element reaches exactly its term elements), cuts (an opaque node
 // with body arguments, with its producers' stored values as stops, reaches exactly its cut
 // elements and direct operands), bindings, and the four roles. Verdicts: holds, fails, undecided
@@ -1988,14 +1997,14 @@ class Reference {
         const auto& tn = t_.nodes[n];
         if (!tn.out || *tn.out != obj) continue;
         const Json where = {{"node", n}, {"element", {r, c}}};
-        attempt(leaves, where, [&] { return reached(value, nullptr) == expected(n, r, c, false); });
+        attempt(leaves, where, [&] { return reachedExactly(value, nullptr, expected(n, r, c, false)); });
         if (tn.primitive) {
           bindingChecks(n, value, r, c, matched, bindings);
           continue;
         }
         bool body = false, stored = true;
         for (const auto& a : tn.args) body |= a.body, stored &= !a.body || t_.nodes[a.ref].out.has_value();
-        if (body && stored) attempt(cuts, where, [&] { return reached(value, &n) == expected(n, r, c, true); });
+        if (body && stored) attempt(cuts, where, [&] { return reachedExactly(value, &n, expected(n, r, c, true)); });
         roleChecks(n, value, r, c);
       }
     }
@@ -2043,6 +2052,7 @@ class Reference {
     std::optional<El> cut;  // a stop: the cut element this value is
     std::size_t indices = 0;  // succ[0, indices): index values
     std::vector<std::size_t> succ;
+    std::vector<char> full;   // per succ: the edge reads all of that value's bits (usesAll)
     Els reads;  // an initial load's elements
   };
 
@@ -2137,6 +2147,338 @@ class Reference {
     throw Undecided{"unresolved load"};
   }
 
+  // ---- Partial uses, by concrete evaluation (the reference's own rule, not bits()). ----
+  // A value of the bit fragment (integer bit operations with fixed controls, integer resizes,
+  // same-width bitcasts) is evaluated on concrete words for its free values (any other value; a
+  // fixed one is its constant). A value's varying bits are those that differ between probes: all
+  // free values zero, all ones, and each with one bit flipped from either. An edge is full when
+  // flipping each varying bit of the operand (from zero and from ones) changes the operation's
+  // result, every control is fixed, and (and, or, lop3) no other operand varies at a bit where it
+  // does; partial otherwise.
+  __extension__ typedef unsigned __int128 U128;
+  static std::uint64_t wmask(unsigned w) { return w >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << w) - 1; }
+  unsigned widthOf(const v::Value& x) {
+    const auto& t = g_.type(x);
+    if (!t.isScalar() || t.element().isParameterized() || t.element().width() > 64) return 0;
+    return t.element().width();
+  }
+  bool bitLike(const v::Value& x) { return g_.type(x).element().isBitLike(); }
+  std::optional<std::uint64_t> word(const v::Value& x) {
+    const auto w = widthOf(x);
+    if (!w || !bitLike(x)) return std::nullopt;
+    const auto k = spec_.known(x);
+    if (!k) return std::nullopt;
+    const auto& s = k->literal;
+    if (s == "true") return 1;
+    if (s == "false") return 0;
+    if (s.empty()) return std::nullopt;
+    std::uint64_t u = 0;
+    const bool neg = s[0] == '-';
+    for (std::size_t i = neg; i < s.size(); ++i) {
+      if (s[i] < '0' || s[i] > '9') return std::nullopt;
+      u = u * 10 + std::uint64_t(s[i] - '0');
+    }
+    return (neg ? ~u + 1 : u) & wmask(w);
+  }
+  bool hasMode(const v::PtxScalarOp& p) {
+    for (const auto& m : p.attributes().modifiers)
+      if (m != "b32" && m != "u32" && m != "s32" && m != "b64" && m != "u64" && m != "s64" && m != "l" && m != "r" &&
+          m != "clamp" && m != "wrap")
+        return true;
+    return false;
+  }
+  // The control operand indices of a fragment operation (they must be fixed).
+  std::vector<std::size_t> controls(const v::Operation& op) {
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op))
+      if (b->opcode() == v::BinaryOpcode::ShiftLeft || b->opcode() == v::BinaryOpcode::ShiftRight) return {1};
+    if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      switch (p->opcode()) {
+        case O::BitExtract: return {1, 2};
+        case O::BitInsert: return {2, 3};
+        case O::BytePermute: case O::FunnelShift: return {2};
+        case O::Logic3: return {3};
+        default: break;
+      }
+    }
+    return {};
+  }
+  // Whether resolved x is a fragment value (evaluated, not free).
+  bool fragment(const v::Value& x) {
+    if (!widthOf(x) || !bitLike(x) || !x.indices().empty()) return false;
+    if (const auto& c = x.conversion()) {
+      if (!widthOf(c->source) || !bitLike(c->source)) return false;
+      if (c->spec->kind == v::TypeConversionKind::Bitcast) return widthOf(c->source) == widthOf(x);
+      return !c->spec->attributes.saturate;
+    }
+    const auto& op = g_.definingNode(x).operation();
+    const auto xs = g_.instanceOperands(x).toVector();
+    for (const auto i : controls(op))
+      if (i >= xs.size() || !word(xs[i])) return false;
+    for (const auto& a : xs)
+      if (!widthOf(a) || !bitLike(a)) return false;
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op)) {
+      using B = v::BinaryOpcode;
+      const auto c = b->opcode();
+      return c == B::BitAnd || c == B::BitOr || c == B::BitXor || c == B::ShiftLeft || c == B::ShiftRight;
+    }
+    if (const auto* u = dynamic_cast<const v::UnaryOp*>(&op)) return u->opcode() == v::UnaryOpcode::BitNot;
+    if (const auto* cv = dynamic_cast<const v::ConvertOp*>(&op)) return !cv->attributes().saturate;
+    if (dynamic_cast<const v::BitcastOp*>(&op)) return widthOf(xs.at(0)) == widthOf(x);
+    if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      const auto c = p->opcode();
+      return (c == O::BitExtract || c == O::BitInsert || c == O::BytePermute || c == O::Logic3 || c == O::FunnelShift) &&
+             !hasMode(*p);
+    }
+    return false;
+  }
+  static std::uint64_t bit(std::uint64_t x, unsigned i) { return i < 64 ? x >> i & 1 : 0; }
+  // The result word of operation `op` (result width w, signed result) on operand words xs (widths ws).
+  std::optional<std::uint64_t> apply(const v::Operation& op, unsigned w, bool sign, const std::vector<std::uint64_t>& xs,
+                                     const std::vector<unsigned>& ws) {
+    const auto m = wmask(w);
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op)) {
+      using B = v::BinaryOpcode;
+      const auto a = xs[0], c = xs[1];
+      switch (b->opcode()) {
+        case B::BitAnd: return a & c;
+        case B::BitOr: return a | c;
+        case B::BitXor: return a ^ c;
+        case B::ShiftLeft: return c >= w ? 0 : (a << c) & m;
+        case B::ShiftRight: {
+          if (!sign) return c >= w ? 0 : a >> c;
+          const bool neg = bit(a, w - 1);
+          if (c >= w) return neg ? m : 0;
+          const auto r = a >> c;
+          return neg ? (r | (m & ~(m >> c))) & m : r;
+        }
+        case B::Multiply: {
+          if (b->attributes().multiply_mode == v::IntegerMultiplyMode::Low) return (a * c) & m;
+          const auto wide = static_cast<U128>(a) * c;
+          if (b->attributes().multiply_mode == v::IntegerMultiplyMode::Wide) return std::uint64_t(wide) & m;
+          return std::uint64_t(wide >> ws[0]) & m;
+        }
+        case B::Divide: return c ? a / c : std::optional<std::uint64_t>{};
+        case B::Remainder: return c ? a % c : std::optional<std::uint64_t>{};
+        default: return std::nullopt;
+      }
+    }
+    if (const auto* u = dynamic_cast<const v::UnaryOp*>(&op)) {
+      if (u->opcode() == v::UnaryOpcode::BitNot) return ~xs[0] & m;
+      if (u->opcode() == v::UnaryOpcode::Absolute) return xs[0] & (m >> 1);  // float abs: the sign cleared
+      return std::nullopt;
+    }
+    if (dynamic_cast<const v::ConvertOp*>(&op) || dynamic_cast<const v::BitcastOp*>(&op)) return resize(xs[0], ws[0], w, sign);
+    if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      switch (p->opcode()) {
+        case O::BitExtract: {
+          const auto pos = unsigned(xs[1] & 0xff), len = unsigned(xs[2] & 0xff);
+          const bool s = p->sourceType().element().kind() == v::ElementKind::SignedInteger;
+          const auto sb = s && len ? bit(xs[0], std::min(pos + len - 1, w - 1)) : 0;
+          std::uint64_t r = 0;
+          for (unsigned i = 0; i < w; ++i) r |= (i < len && pos + i < w ? bit(xs[0], pos + i) : sb) << i;
+          return r;
+        }
+        case O::BitInsert: {
+          const auto pos = unsigned(xs[2] & 0xff), len = unsigned(xs[3] & 0xff);
+          auto r = xs[1];
+          for (unsigned i = 0; i < len && pos + i < w; ++i) r = (r & ~(std::uint64_t{1} << (pos + i))) | bit(xs[0], i) << (pos + i);
+          return r & m;
+        }
+        case O::BytePermute: {
+          const auto both = (xs[1] & 0xffffffffu) << 32 | (xs[0] & 0xffffffffu);
+          std::uint64_t r = 0;
+          for (unsigned k = 0; k < 4; ++k) {
+            const auto s = unsigned(xs[2] >> (4 * k) & 0xf);
+            auto byte = both >> (8 * (s & 7)) & 0xff;
+            if (s & 8) byte = byte & 0x80 ? 0xff : 0;
+            r |= byte << (8 * k);
+          }
+          return r;
+        }
+        case O::Logic3: {
+          std::uint64_t r = 0;
+          for (unsigned i = 0; i < w; ++i)
+            r |= bit(xs[3], unsigned(bit(xs[0], i) << 2 | bit(xs[1], i) << 1 | bit(xs[2], i))) << i;
+          return r;
+        }
+        case O::FunnelShift: {
+          bool left = false, wrap = false;
+          for (const auto& mo : p->attributes().modifiers) left |= mo == "l", wrap |= mo == "wrap";
+          const auto n = wrap ? xs[2] & 31 : std::min<std::uint64_t>(xs[2], 32);
+          const auto both = static_cast<U128>(xs[1] & 0xffffffffu) << 32 | (xs[0] & 0xffffffffu);
+          return std::uint64_t(left ? (both << n) >> 32 : both >> n) & 0xffffffffu;
+        }
+        case O::CopySign: {  // d = b with a's sign
+          const auto s = std::uint64_t{1} << (w - 1);
+          return (xs[1] & ~s) | (xs[0] & s);
+        }
+        case O::SelectSign: return bit(xs[2], ws[2] - 1) ? xs[1] : xs[0];
+        case O::MultiplyAdd: case O::MultiplyAddCarry: {
+          bool wide = false, high = false;
+          for (const auto& mo : p->attributes().modifiers) wide |= mo == "wide", high |= mo == "hi";
+          const auto prod = static_cast<U128>(xs[0]) * xs[1];
+          const auto pm = high ? std::uint64_t(prod >> ws[0]) : std::uint64_t(prod);
+          return (pm + xs[2]) & m;
+        }
+        default: return std::nullopt;
+      }
+    }
+    return std::nullopt;
+  }
+  static std::uint64_t resize(std::uint64_t x, unsigned from, unsigned to, bool sign) {
+    if (to <= from) return x & wmask(to);
+    if (sign && bit(x, from - 1)) return (x | (wmask(to) & ~wmask(from))) & wmask(to);
+    return x;
+  }
+  bool signedSource(const v::Value& x) { return g_.type(x).element().kind() == v::ElementKind::SignedInteger; }
+  // The fragment below x: its free values (by structural equality).
+  void frees(const v::Value& x0, std::vector<v::Value>& out, unsigned depth = 0) {
+    if (depth > 64) throw Undecided{"bit fragment deeper than 64"};
+    const auto x = res(x0);
+    if (word(x)) return;
+    if (!fragment(x)) {
+      for (const auto& f : out)
+        if (same(f, x)) return;
+      if (out.size() > 16) throw Undecided{"bit fragment with more than 16 free values"};
+      out.push_back(x);
+      return;
+    }
+    if (x.conversion()) return frees(x.conversion()->source, out, depth + 1);
+    for (const auto& a : g_.instanceOperands(x)) frees(a, out, depth + 1);
+  }
+  std::uint64_t eval(const v::Value& x0, const std::vector<v::Value>& fs, const std::vector<std::uint64_t>& at) {
+    const auto x = res(x0);
+    if (const auto k = word(x)) return *k;
+    if (!fragment(x)) {
+      for (std::size_t i = 0; i < fs.size(); ++i)
+        if (same(fs[i], x)) return at[i] & wmask(widthOf(x));
+      throw Undecided{"a free value outside its fragment"};
+    }
+    const auto w = widthOf(x);
+    if (const auto& c = x.conversion())
+      return resize(eval(c->source, fs, at), widthOf(c->source), w, signedSource(c->source));
+    const auto& op = g_.definingNode(x).operation();
+    std::vector<std::uint64_t> xs;
+    std::vector<unsigned> ws;
+    const auto operands = g_.instanceOperands(x).toVector();
+    for (const auto& a : operands) xs.push_back(eval(a, fs, at)), ws.push_back(widthOf(a));
+    const bool sign = dynamic_cast<const v::ConvertOp*>(&op) ? signedSource(operands[0]) : signedSource(x);
+    const auto r = apply(op, w, sign, xs, ws);
+    if (!r) throw Undecided{"an operation the bit fragment does not evaluate"};
+    return *r & wmask(w);
+  }
+  // The probes of a fragment with free values fs: the base words and each one-bit flip.
+  std::vector<std::vector<std::uint64_t>> probes(const std::vector<v::Value>& fs) {
+    std::vector<std::vector<std::uint64_t>> out;
+    for (const std::uint64_t base : {std::uint64_t{0}, ~std::uint64_t{0}}) {
+      const std::vector<std::uint64_t> b(fs.size(), base);
+      out.push_back(b);
+      for (std::size_t f = 0; f < fs.size(); ++f)
+        for (unsigned i = 0; i < std::max(1u, widthOf(fs[f])); ++i) {
+          auto p = b;
+          p[f] ^= std::uint64_t{1} << i;
+          out.push_back(std::move(p));
+        }
+    }
+    return out;
+  }
+  // The bits of x that differ between probes (all of them for a free value).
+  std::uint64_t varying(const v::Value& x0) {
+    const auto x = res(x0);
+    const auto w = widthOf(x);
+    if (word(x)) return 0;
+    if (!fragment(x)) return wmask(w);
+    std::vector<v::Value> fs;
+    frees(x, fs);
+    std::uint64_t first = 0, diff = 0;
+    bool any = false;
+    for (const auto& p : probes(fs)) {
+      const auto r = eval(x, fs, p);
+      if (any) diff |= r ^ first;
+      else first = r, any = true;
+    }
+    return diff & wmask(w);
+  }
+  // Whether operand q of x's operation (operands xs) is used in full.
+  bool usesAll(const v::Value& x, const v::Operation& op, const std::vector<v::Value>& xs, std::size_t q) {
+    if (word(xs[q])) return true;
+    if (!x.indices().empty()) return false;  // a component of an operation's matrix result
+    const auto ow = widthOf(xs[q]);
+    const auto w = widthOf(x);
+    // Which operations read part of an operand (else every bit can reach the result).
+    bool bits = false, bitwise = false;
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op)) {
+      using B = v::BinaryOpcode;
+      const auto c = b->opcode();
+      bitwise = c == B::BitAnd || c == B::BitOr;
+      const bool integer = g_.type(x).element().isInteger();
+      bits = bitwise || c == B::BitXor || c == B::ShiftLeft || c == B::ShiftRight ||
+             (integer && (c == B::Multiply || c == B::Divide || c == B::Remainder) && word(xs[1 - q]));
+    } else if (const auto* u = dynamic_cast<const v::UnaryOp*>(&op)) {
+      bits = u->opcode() == v::UnaryOpcode::Absolute && g_.type(x).element().kind() == v::ElementKind::Floating;
+    } else if (dynamic_cast<const v::ConvertOp*>(&op)) {
+      bits = bitLike(x) && bitLike(xs[0]) && !dynamic_cast<const v::ConvertOp&>(op).attributes().saturate;
+    } else if (dynamic_cast<const v::BitcastOp*>(&op)) {
+      if (widthOf(xs[0]) != w || !w) return false;
+    } else if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      const auto c = p->opcode();
+      bitwise = c == O::Logic3;
+      bits = c == O::BitExtract || c == O::BitInsert || c == O::BytePermute || c == O::Logic3 || c == O::FunnelShift ||
+             c == O::CopySign || (c == O::SelectSign && q == 2 && g_.type(xs[2]).element().isInteger()) ||
+             ((c == O::MultiplyAdd || c == O::MultiplyAddCarry) && q < 2 && g_.type(x).element().isInteger() && word(xs[1 - q]));
+      if (bits && c != O::CopySign && c != O::SelectSign && hasMode(*p)) return false;
+    }
+    if (!bits) return true;
+    if (!ow || !w) return false;
+    const auto cs = controls(op);
+    if (std::find(cs.begin(), cs.end(), q) != cs.end()) return false;  // a control that is data
+    for (const auto i : cs)
+      if (!word(xs[i])) return false;
+    const auto vq = varying(xs[q]);
+    std::vector<std::uint64_t> base;
+    std::vector<unsigned> ws;
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+      ws.push_back(widthOf(xs[i]));
+      if (i == q) { base.push_back(0); continue; }
+      if (const auto k = word(xs[i])) { base.push_back(*k); continue; }
+      // Another data operand: for and, or and lop3 it must not vary where q does; its value at
+      // the other bits does not matter (per bit). It is taken at its all-zero probe.
+      if (bitwise && (varying(xs[i]) & vq)) return false;
+      std::vector<v::Value> fs;
+      frees(xs[i], fs);
+      base.push_back(eval(xs[i], fs, std::vector<std::uint64_t>(fs.size(), 0)));
+    }
+    if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op); p && p->opcode() == v::PtxScalarOpcode::SelectSign)
+      base[0] = 0, base[1] = wmask(w);  // two distinct values, so the selector's effect shows
+    const bool sign = dynamic_cast<const v::ConvertOp*>(&op) ? signedSource(xs[0]) : signedSource(x);
+    for (unsigned i = 0; i < ow; ++i) {
+      if (!(vq >> i & 1)) continue;
+      for (const std::uint64_t from : {std::uint64_t{0}, wmask(ow)}) {
+        auto a = base, b = base;
+        a[q] = from & ~(std::uint64_t{1} << i);
+        b[q] = from | (std::uint64_t{1} << i);
+        const auto ra = apply(op, w, sign, a, ws), rb = apply(op, w, sign, b, ws);
+        if (!ra || !rb || *ra == *rb) return false;
+      }
+    }
+    return true;
+  }
+  // Whether the conversion step of x reads all of its source.
+  bool convertsAll(const v::Value& x) {
+    const auto& c = *x.conversion();
+    if (word(c.source)) return true;
+    if (!x.indices().empty()) return false;
+    const auto w = widthOf(x.withoutSelection()), sw = widthOf(c.source);
+    if (c.spec->kind == v::TypeConversionKind::Bitcast) return g_.type(x.withoutSelection()).bitSize() == g_.type(c.source).bitSize();
+    if (!bitLike(x) || !bitLike(c.source) || c.spec->attributes.saturate) return true;
+    if (!w || !sw) return false;
+    return w >= sw || (varying(c.source) & ~wmask(w)) == 0;
+  }
+
   // ---- The value DAG. ----
   v::Value res(v::Value x) { return spec_.selected(g_.canonicalInterpretation(x)); }
   bool same(v::Value a, v::Value b) {
@@ -2156,13 +2498,15 @@ class Reference {
   }
 
   // The successors of resolved x: index values, then the conversion source, the stored value a
-  // load reads, or the operation's operands.
+  // load reads, or the operation's operands; n.full, whether each edge is a full use.
   std::vector<v::Value> successors(const v::Value& x, N& n) {
     std::vector<v::Value> out(x.indices().begin(), x.indices().end());
     n.indices = out.size();
+    n.full.assign(out.size(), 1);
     if (x.conversion()) {
       n.kind = Kind::Conv;
       out.push_back(x.conversion()->source);
+      n.full.push_back(convertsAll(x));
       return out;
     }
     const auto& op = g_.definingNode(x).operation();
@@ -2172,8 +2516,21 @@ class Reference {
         const auto& value = std::get<v::Value>(*r);
         n.kind = Kind::Load;
         out.push_back(x.indices().empty() ? value : g_.component(value, {x.indices().begin(), x.indices().end()}));
+        n.full.push_back(1);
         return out;
       }
+      // A read of a whole stored value under another type (same bits): that value. A part of one
+      // is not followed (its per-byte dependencies are not decided).
+      if (const auto* r = m_.readReplacement(key); r && x.indices().empty() && !m_.symbolic_initial_reads.contains(key))
+        if (const auto* p = std::get_if<ReinterpretedRead>(r))
+          if (const auto* stored = std::get_if<v::Value>(&p->source)) {
+            if (p->byte_offset != 0 || p->type.bitSize() != g_.type(*stored).bitSize())
+              throw Undecided{"a read of part of a stored value"};
+            n.kind = Kind::Load;
+            out.push_back(*stored);
+            n.full.push_back(1);
+            return out;
+          }
       n.kind = Kind::Leaf;
       n.initial = true;
       n.reads = *loadElements(x);
@@ -2204,7 +2561,8 @@ class Reference {
                  dynamic_cast<const v::SelectOp*>(&op) || dynamic_cast<const v::ThreadForwardOp*>(&op))) {
       throw Undecided{"operation " + std::string(op.name())};
     }
-    for (const auto& a : g_.instanceOperands(x)) out.push_back(a);
+    const auto xs = g_.instanceOperands(x).toVector();
+    for (std::size_t q = 0; q < xs.size(); ++q) out.push_back(xs[q]), n.full.push_back(usesAll(x, op, xs, q));
     return out;
   }
 
@@ -2249,14 +2607,27 @@ class Reference {
     return ns;
   }
   // The elements root reaches: initial-load elements, and with `cuts` the cut elements of stops
-  // (nothing below a stop).
-  Els reached(const v::Value& root, const std::size_t* cuts) {
+  // (nothing below a stop). With `full`, along full edges only.
+  Els reached(const v::Value& root, const std::size_t* cuts, bool full = false) {
+    const auto ns = graph(root, cuts);
+    std::vector<char> seen(ns.size(), 0);
+    std::vector<std::size_t> todo{0};
+    seen[0] = 1;
     Els s;
-    for (const auto& n : graph(root, cuts)) {
+    while (!todo.empty()) {
+      const auto i = todo.back();
+      todo.pop_back();
+      const auto& n = ns[i];
       if (n.cut) s.insert(*n.cut);
       if (n.initial) s.insert(n.reads.begin(), n.reads.end());
+      for (std::size_t q = 0; q < n.succ.size(); ++q)
+        if ((!full || n.full[q]) && !seen[n.succ[q]]) seen[n.succ[q]] = 1, todo.push_back(n.succ[q]);
     }
     return s;
+  }
+  // Every element root reaches, it reaches along full edges, and those are `want`.
+  bool reachedExactly(const v::Value& root, const std::size_t* cuts, const Els& want) {
+    return reached(root, cuts) == want && reached(root, cuts, true) == want;
   }
 
   // Primitive consumer n's stored value at (r, c): each body argument of an unstored producer
@@ -2290,7 +2661,7 @@ class Reference {
           x = res(g_.instanceOperands(x).at(0));
         bool operand = false;
         for (const auto& o : g_.instanceOperands(x)) operand |= same(o, it->second.second);
-        if (operand && reached(it->second.second, nullptr) == expected(a.ref, q[0], q[1], false)) ++t.holds;
+        if (operand && reachedExactly(it->second.second, nullptr, expected(a.ref, q[0], q[1], false))) ++t.holds;
         else t.fail(where);
       } catch (const Undecided& u) {
         auto d = where;
@@ -2319,23 +2690,40 @@ class Reference {
       const auto it = stored_.find({*t_.nodes[arg.ref].out, std::get<1>(e), std::get<2>(e)});
       return it != stored_.end() && same(ns[i].x, it->second);
     };
-    // reach[e][i]: a path from node i reaches source element e (a fresh search per element).
-    std::vector<std::vector<char>> reach;
+    // reach[e][i]: a path from node i reaches source element e (a fresh search per element);
+    // reach_full[e][i]: one along full edges. Claims that a path exists use full paths; claims
+    // that none does (avoids, the multiplicand's unguarded paths) use every path.
+    std::vector<std::vector<char>> reach, reach_full;
     for (const auto& e : elements) {
       std::vector<char> src(n, 0);
       for (std::size_t i = 0; i < n; ++i) src[i] = source(i, e);
-      std::vector<signed char> memo(n, -1);
-      std::function<bool(std::size_t)> go = [&](std::size_t i) -> bool {
-        if (memo[i] >= 0) return memo[i];
-        bool hit = src[i];
-        for (const auto j : ns[i].succ) hit = go(j) || hit;
-        memo[i] = hit;
-        return hit;
-      };
-      std::vector<char> row(n);
-      for (std::size_t i = 0; i < n; ++i) row[i] = go(i);
-      reach.push_back(std::move(row));
-      if (!reach.back()[0]) return "fails";  // the element does not reach the output
+      for (const bool full : {false, true}) {
+        std::vector<signed char> memo(n, -1);
+        std::function<bool(std::size_t)> go = [&](std::size_t i) -> bool {
+          if (memo[i] >= 0) return memo[i];
+          bool hit = src[i];
+          for (std::size_t q = 0; q < ns[i].succ.size(); ++q)
+            if (!full || ns[i].full[q]) hit = go(ns[i].succ[q]) || hit;
+          memo[i] = hit;
+          return hit;
+        };
+        std::vector<char> row(n);
+        for (std::size_t i = 0; i < n; ++i) row[i] = go(i);
+        (full ? reach_full : reach).push_back(std::move(row));
+      }
+      if (!reach_full.back()[0]) return "fails";  // the element does not reach the output in full
+    }
+    // top[i]: node i is reached from the output along full edges.
+    std::vector<char> top(n, 0);
+    {
+      std::vector<std::size_t> todo{0};
+      top[0] = 1;
+      while (!todo.empty()) {
+        const auto i = todo.back();
+        todo.pop_back();
+        for (std::size_t q = 0; q < ns[i].succ.size(); ++q)
+          if (ns[i].full[q] && !top[ns[i].succ[q]]) top[ns[i].succ[q]] = 1, todo.push_back(ns[i].succ[q]);
+      }
     }
     const auto any = [&](std::size_t j) {
       for (const auto& row : reach) if (row[j]) return true;
@@ -2344,12 +2732,15 @@ class Reference {
     switch (role) {
       case RoleKind::ThroughTranscendental:
       case RoleKind::AvoidsTranscendental: {
-        for (const auto& row : reach) {
+        for (std::size_t e = 0; e < reach.size(); ++e) {
+          // through: a full path output -> transcendental -> element; avoids: no path at all.
           bool through = false;
+          const bool want = role == RoleKind::ThroughTranscendental;
           for (std::size_t i = 0; i < n && !through; ++i)
-            if (ns[i].trans)
-              for (const auto j : ns[i].succ) through |= bool(row[j]);
-          if (through != (role == RoleKind::ThroughTranscendental)) return "fails";
+            if (ns[i].trans && (!want || top[i]))
+              for (std::size_t q = 0; q < ns[i].succ.size(); ++q)
+                through |= want ? bool(ns[i].full[q] && reach_full[e][ns[i].succ[q]]) : bool(reach[e][ns[i].succ[q]]);
+          if (through != want) return "fails";
         }
         return "holds";
       }
@@ -2377,7 +2768,7 @@ class Reference {
               if (!row[x.succ[q]]) continue;
               const bool idx = q < x.indices;
               bool addend = false;
-              if (!idx) {
+              if (!idx && x.full[q]) {  // a partial use is never an addend edge
                 if (x.kind == Kind::Add && ops == 2) addend = true;
                 else if (x.kind == Kind::Fma && ops == 3) addend = (q - x.indices) == 2;
                 else if (x.kind == Kind::Conv || x.kind == Kind::Load) addend = true;
@@ -2397,7 +2788,7 @@ class Reference {
               x.succ.size() - x.indices < 2)
             return false;
           const auto other = x.succ[x.indices + (1 - (q - x.indices))];
-          return any(x.succ[q]) && !any(other);
+          return x.full[q] && any(x.succ[q]) && !any(other);
         };
         for (const auto& e : elements) {
           // unguarded[i]: some path from i reaches the element using no guard edge.
