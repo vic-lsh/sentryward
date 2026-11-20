@@ -1110,6 +1110,11 @@ RegisterTable::RegisterTable(const Module &module, const Function &function) {
     }
   }
 }
+bool RegisterTable::DeclaredOnceAtTop(std::string_view name) const {
+  const auto it = declaration_counts_.find(std::string(name));
+  return it != declaration_counts_.end() && it->second == 1 &&
+         declarations_.contains(ScopedKey(std::span<const std::uint32_t>{}, name));
+}
 std::string RegisterTable::Resolve(std::span<const std::uint32_t> scope,
                                    std::string_view name) const {
   if (name.find("@scope:") != name.npos && widths_.contains(std::string(name)))

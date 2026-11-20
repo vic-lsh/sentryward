@@ -1911,9 +1911,11 @@ void Executor::RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth
     if (!scoped_registers_) scoped_registers_ = std::make_unique<RegisterTable>(m_, f_);
     const auto declared = scoped_registers_->DeclaredWidth(scoped_registers_->Resolve(in.scope, (left ? a : b).text));
     if (!declared || *declared * 8 != width) return;  // declared widths are in bytes
-    // The bound is written to the register's name-keyed slot: the name must denote one declaration
-    // (no inline-asm scope shadows it), so the compared value and every later use are the same.
-    if (!scoped_registers_->DeclaredOnce(TrimView((left ? a : b).text))) return;
+    // The bound is written to the register's name-keyed slot, and the predicate is found by name:
+    // both names must denote one top-level declaration (no scope shadows or hides them), so the
+    // compared value, the predicate the branch reads and every later use are the same registers.
+    if (!scoped_registers_->DeclaredOnceAtTop(TrimView((left ? a : b).text)) ||
+        !scoped_registers_->DeclaredOnceAtTop(names_[predicate])) return;
     const Integer c = *ScalarInteger(left ? vb : va);
     if (cmp == "lo") cmp = "lt"; else if (cmp == "ls") cmp = "le"; else if (cmp == "hi") cmp = "gt"; else if (cmp == "hs") cmp = "ge";
     if (!left) cmp = cmp == "lt" ? "gt" : cmp == "le" ? "ge" : cmp == "gt" ? "lt" : "le";

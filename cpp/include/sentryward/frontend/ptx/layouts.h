@@ -223,11 +223,10 @@ public:
     return it->second;
   }
 
-  // The name is declared in exactly one lexical scope of the function: every use names it.
-  [[nodiscard]] bool DeclaredOnce(std::string_view name) const {
-    const auto it = declaration_counts_.find(std::string(name));
-    return it != declaration_counts_.end() && it->second == 1;
-  }
+  // The name has exactly one declaration, in the function's top-level scope: every instruction
+  // that names it (in any nested scope, or by the executor's fallback to raw names) names that one
+  // register.
+  [[nodiscard]] bool DeclaredOnceAtTop(std::string_view name) const;
 
 private:
   std::unordered_map<std::string, std::string> declarations_;
