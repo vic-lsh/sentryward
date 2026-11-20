@@ -207,12 +207,21 @@ struct SymbolicAddressModel::Impl {
   // division rounds inward. Only tightens; an empty interval is left to the consistency check.
   void PropagateBounds() {
     constexpr int kRounds = 16;
-    const auto floor_div = [](const Int& a, const Int& b) {
+    // Checked floor and ceiling division (no negation of the minimum; MIN / -1 abandoned).
+    const auto floor_div = [](const Int& a, const Int& b) -> std::optional<Int> {
+      if (b == 0 || (b == -1 && a == std::numeric_limits<Int>::min())) return std::nullopt;
       Int q = a / b;
-      if ((a % b != 0) && ((a < 0) != (b < 0))) --q;
+      const Int r = a % b;
+      if (r != 0 && ((r < 0) != (b < 0))) --q;  // q > MIN here: |a / b| < |a| unless |b| == 1
       return q;
     };
-    const auto ceil_div = [&](const Int& a, const Int& b) { return -floor_div(-a, b); };
+    const auto ceil_div = [](const Int& a, const Int& b) -> std::optional<Int> {
+      if (b == 0 || (b == -1 && a == std::numeric_limits<Int>::min())) return std::nullopt;
+      Int q = a / b;
+      const Int r = a % b;
+      if (r != 0 && ((r < 0) == (b < 0))) ++q;  // q < MAX likewise
+      return q;
+    };
     // Checked __int128 arithmetic: a deduction whose intermediate overflows is abandoned.
     const auto mul = [](const Int& a, const Int& b) -> std::optional<Int> {
       Int r;
@@ -948,7 +957,6 @@ struct SymbolicAddressModel::Impl {
     const auto unknown = [&](std::string reason) { verdict.status = ContainmentVerdict::Status::kUnknown;
                                                    verdict.reason = std::move(reason); return verdict; };
     if (error) return unknown("invalid symbolic-address model: " + error->message);
-    if (env_unproved) return unknown("address invariants (path facts) are not proved consistent");
     const auto* address = std::get_if<AddressId>(&access.address);
     if (!address) return unknown("register endpoint");
     const auto found = binding_shapes.find(address->value());
@@ -956,6 +964,8 @@ struct SymbolicAddressModel::Impl {
     const Shape& shape = shapes[found->second];
     verdict.address_space = names[shape.space];
     if (shape.base == Base::kAllocation) verdict.allocation = names[shape.identity];
+    // Classified (space, allocation) first, so a caller does not drop the access as another space.
+    if (env_unproved) return unknown("address invariants (path facts) are not proved consistent");
     if (shape.absent) { verdict.status = ContainmentVerdict::Status::kContained; return verdict; }
     if (shape.base != Base::kAllocation) return unknown("allocation is unresolved: " + Describe(shape));
     if (shape.region_bytes) return unknown("TMA region footprint is not an exact byte range");

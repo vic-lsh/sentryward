@@ -228,6 +228,14 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     if (access.bytes.value_or(0) == 0 || !std::holds_alternative<AddressId>(access.address)) continue;
     // The verdict without an extent names the allocation and space; global memory only.
     auto probe = model.containment(access, std::nullopt);
+    // A probe that could not classify the access (no space: model error, unproved invariants,
+    // missing binding) is undecided, never skipped.
+    if (probe.address_space.empty() && probe.status == ContainmentVerdict::Status::kUnknown) {
+      ++report.checked;
+      current_weight = 1;
+      undecided_at(access, "<unclassified>", probe, 0);
+      continue;
+    }
     if (probe.address_space != "global") continue;
     ++report.checked;
     const std::string object = probe.allocation.empty() ? "<unresolved>" : probe.allocation;

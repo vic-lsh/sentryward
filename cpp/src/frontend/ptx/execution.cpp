@@ -3229,9 +3229,11 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
       return found == s.pred_terms.end() ? nullptr : found->second;
     };
     const auto ta = term(1), tb = term(2);
-    // A known operand of an unknown result is the identity of the operation (true for and, false
-    // for or; otherwise the result would be known), so the result is the other operand.
-    const bool ka = !Unknown(val(1)), kb = !Unknown(val(2));
+    // An operand whose truth value is the operation's identity (true for and, false for or) makes
+    // the result the other operand.
+    const bool identity = op == "and";  // true for and, false for or
+    const auto ta1 = Truth(val(1)), tb2 = Truth(val(2));
+    const bool ka = ta1 && *ta1 == identity, kb = tb2 && *tb2 == identity;
     Set(d, s, {value});
     if (path_facts_ && Unknown(value) && op != "xor" && !d.destination_slots.empty() &&
         d.destination_slots[0] != kMissing) {
