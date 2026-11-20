@@ -1532,6 +1532,34 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           }
       if (!function)
         throw std::invalid_argument("configured entry missing from PTX");
+      // A CTA-row shard (docs/design/cta-row-shards.md): the allowlist scan admits the kernel, and
+      // the report carries the launch identity (the input as given without cta_rows, and the PTX
+      // digest) that the caller authenticates against the launch it requested.
+      std::optional<std::pair<std::uint32_t, std::uint32_t>> cta_rows;
+      if (const auto rows = config.raw.value("cta_rows", Json()); rows.is_object()) {
+        cta_rows = {rows["y"][0].get<std::uint32_t>(), rows["y"][1].get<std::uint32_t>()};
+        const auto scan = ptx::ShardScan(module, *function);
+        Json shard{{"y", rows["y"]}, {"allowlist", {{"admitted", scan.admitted}, {"scanned", scan.scanned}}}};
+        auto given = Json::parse(*inputs.File(options.config));
+        given.erase("cta_rows");
+        const auto digest = [](std::string_view bytes) {
+          unsigned char out[EVP_MAX_MD_SIZE];
+          unsigned size = 0;
+          if (!EVP_Digest(bytes.data(), bytes.size(), out, &size, EVP_sha256(), nullptr))
+            throw std::runtime_error("SHA256 failed");
+          std::string hex;
+          for (unsigned k = 0; k < size; ++k) {
+            hex.push_back("0123456789abcdef"[out[k] >> 4]);
+            hex.push_back("0123456789abcdef"[out[k] & 15]);
+          }
+          return hex;
+        };
+        shard["identity"] = {{"input", std::move(given)}, {"ptx_sha256", digest(module.text)}, {"entry", function->name}};
+        input_metadata["frontend_assumptions"]["cta_rows"] = shard;
+        if (!scan.admitted)
+          throw ptx::ExecutionError("cta_rows_not_admitted", scan.line,
+                                    "cta_rows: " + scan.function + ": " + scan.reason);
+      }
       monitor.Stage("launch_binding");
       config = alg::ProfileCall("launch_binding", [&] {
         return ptx::BindLaunchObjects(module, *function, config);
@@ -1583,6 +1611,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
       unit_gates.scalar_fold_dump = !options.dump_scalar_fold.empty();
       unit_gates.exhaustive_search = options.exhaustive_memory_search;
       unit_gates.continue_search = options.continue_memory_search;
+      unit_gates.cta_rows = cta_rows.has_value();
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
       unit_gates.development_exports = true;
 #endif
@@ -1877,7 +1906,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
 #endif
         } else
         for (std::uint32_t z = 0; z < grid[2]; ++z)
-          for (std::uint32_t y = 0; y < grid[1]; ++y)
+          for (std::uint32_t y = cta_rows ? cta_rows->first : 0; y < (cta_rows ? cta_rows->second : grid[1]); ++y)
             for (std::uint32_t x = 0; x < grid[0]; ++x) {
               ptx::Coordinates coordinates{x, y, z};
               if (emitted.contains(coordinates)) continue;
@@ -2039,7 +2068,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         if (const auto footprints = config.raw.value("footprints", Json::array()); !footprints.empty())
           lowered.artifact.footprints_json =
               Json{{"grid_dim", config.fixed_input.at("grid_dim")}, {"block_dim", config.raw.at("cta").at("block_dim")},
-                   {"objects", footprints}, {"reads", config.raw.value("footprint_reads", Json("containment"))}}.dump();
+                   {"objects", footprints}, {"reads", config.raw.value("footprint_reads", Json("containment"))},
+                   {"export_pieces", config.raw.value("cta_rows", Json()).is_object()}}.dump();
         tensor_property_inputs = config.fixed_input.value("tensor_property_inputs", Json::array());
         lowered.artifact.tensor_properties_json = tensor_property_inputs.dump();
         metadata["executed_records"] = records;

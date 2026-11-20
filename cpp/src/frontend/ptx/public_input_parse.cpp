@@ -142,7 +142,7 @@ void TensorMaps(Json &root) {
 } // namespace
 
 KernelInput ParseKernelInput(const Json &value) {
-  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints", "footprint_reads"}, "$");
+  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints", "footprint_reads", "cta_rows"}, "$");
   if (value.value("schema", Json()) != "spverify.kernel-input/v1")
     Fail("invalid_schema", "$.schema", "expected spverify.kernel-input/v1");
   Json root = value;
@@ -438,6 +438,17 @@ KernelInput ParseKernelInput(const Json &value) {
     if (rule != "containment" && rule != "noninterference")
       Fail("invalid_footprint", "$.footprint_reads", "expected containment or noninterference");
     if (!root.contains("footprints")) Fail("invalid_footprint", "$.footprint_reads", "footprint_reads requires footprints");
+  }
+  // A CTA-row shard (docs/design/cta-row-shards.md): only the CTAs with blockIdx.y in [lo, hi)
+  // execute, under the launch's true grid and words; every x and z of those rows is included.
+  if (root.contains("cta_rows")) {
+    auto &rows = root["cta_rows"];
+    Object(rows, {"y"}, "$.cta_rows");
+    Array(rows.value("y", Json()), "$.cta_rows.y");
+    if (rows["y"].size() != 2) Fail("invalid_cta_rows", "$.cta_rows.y", "expected [lo, hi)");
+    const auto lo = Natural(rows["y"][0], "$.cta_rows.y[0]"), hi = Natural(rows["y"][1], "$.cta_rows.y[1]");
+    if (lo >= hi) Fail("invalid_cta_rows", "$.cta_rows.y", "expected lo < hi");
+    if (!root.contains("footprints")) Fail("invalid_cta_rows", "$.cta_rows", "cta_rows requires footprints (the shard's pieces)");
   }
   TensorMaps(root);
   std::set<std::uint64_t> lines;

@@ -39,6 +39,7 @@ size at parameter 1. Change the ABI and launch to match the actual PTX.
 | `address_invariants` | Optional trusted address constraints; see [forms and semantics](assumptions.md#address-invariants) |
 | `tensor_properties` | Optional trusted element properties of input objects; see [Tensor properties](#tensor-properties) |
 | `footprints` | Optional declared extent and access direction per input object, checked against every access; see [Footprints](#footprints) |
+| `cta_rows` | Optional `{"y": [lo, hi)}`: check only the CTAs of grid rows `lo..hi-1` (every x and z) of the stated launch; see [CTA-row shards](#cta-row-shards) |
 | `data_branch_loop_iterations` | Optional positive iteration bound for loops under `bounded_computation_loops`; default 4; does not itself enable that assumption |
 
 Omitted record arrays are empty. Missing values needed during analysis produce
@@ -256,6 +257,29 @@ declared pieces, a symbolic offset is decided when its atoms bound a hull and th
 multiples of the piece set's row stride (a row index read from a table); otherwise it is undecided.
 Extents, pieces and directions are the declared contract; the premises in `tensor_properties` stay
 trusted. Results go under `evidence.footprint` ([output](output-json.md#footprint-check)).
+
+## CTA-row shards
+
+`cta_rows: {"y": [lo, hi]}` checks one shard of a launch (design: `docs/design/cta-row-shards.md`).
+The launch stays the stated one (grid, words, objects, premises): only the CTAs with `blockIdx.y` in
+`[lo, hi)` execute, at their own coordinates, so every address is the launch's. `hi` is at most
+`grid_dim[1]`, both are multiples of `cluster_dim[1]`, and `footprints` are required. CTA class
+mode is off for a shard (each CTA runs on its own).
+
+A kernel is sharded only when the shard allowlist scan admits its entry and every function it
+reaches by direct call: integer and predicate arithmetic, `mov` of registers, immediates and
+`%tid`, `%ntid`, `%ctaid`, `%nctaid`, `%laneid`, `bra`/`bra.uni` to a label, `ret`, `exit`, a
+direct `call`, `ld.param`, weak `ld.global`/`st.global` of a register address, and
+`cvta.to.global`. Any other opcode, modifier or operand kind refuses with diagnostic
+`cta_rows_not_admitted` (result `unsupported`), naming the instruction: placement or time registers
+(`%smid`, `%clock`, ...), atomics and reductions, generic, non-coherent, volatile or ordered
+accesses, asynchronous and bulk copies, shared memory, fences, barriers, warp operations, indirect
+calls, floating point. With the scan, a shard's execution equals the launch restricted to its CTAs.
+
+What a shard does not decide: races and overlaps between its CTAs and other shards' CTAs. The
+report lists the bytes the shard touched (`evidence.footprint.pieces`) and the launch identity
+(`frontend_assumptions.cta_rows`) so that a caller can authenticate a set of shards against the
+launch it requested and compare their pieces exactly ([output](output-json.md#cta-row-shards)).
 
 ## Tensor-map descriptors
 

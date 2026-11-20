@@ -108,6 +108,13 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
   for (unsigned i = 0; i < 3; ++i)
     if (JsonInteger(launch["grid_dim"][i]) % JsonInteger(cluster[i]) != 0)
       Fail("invalid_launch", "$.launch.grid_dim", "grid must contain complete clusters");
+  if (input.contains("cta_rows")) {
+    const auto &y = input["cta_rows"]["y"];
+    if (JsonInteger(y[1]) > JsonInteger(launch["grid_dim"][1]))
+      Fail("invalid_cta_rows", "$.cta_rows.y", "rows exceed grid_dim y");
+    if (JsonInteger(y[0]) % JsonInteger(cluster[1]) != 0 || JsonInteger(y[1]) % JsonInteger(cluster[1]) != 0)
+      Fail("invalid_cta_rows", "$.cta_rows.y", "rows must contain complete clusters");
+  }
 
   std::vector<std::uint64_t> sizes;
   Json regions = Json::object();
@@ -422,6 +429,7 @@ FrontendConfig NormalizeKernelInput(const KernelInput &supplied, const Module &m
       {"address_invariants", supplied.fields.value("address_invariants", Json::array())},
       {"footprints", footprints}, {"footprint_reads", input.value("footprint_reads", Json("containment"))},
       {"data_branch_loop_iterations", supplied.fields.value("data_branch_loop_iterations", Json(4))},
+      {"cta_rows", input.value("cta_rows", Json())},
       {"elect_lane", options.elect_lane}, {"max_steps_per_lane", options.max_steps_per_thread},
       {"compress_compute", options.compress_compute},
       {"compress_thread_records", options.compress_thread_records},
