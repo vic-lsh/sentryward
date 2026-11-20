@@ -83,6 +83,9 @@ struct Declared {
   std::string direction;  // read, write, readwrite
   std::uint64_t extent = 0;
   std::vector<Piece> pieces;  // empty: the whole extent
+  // Geometry that does not fit comfortably in int64 (the extent or a piece's reach past 2^62):
+  // every access to the object is undecided, never contained.
+  bool unrepresentable = false;
 };
 
 struct ObjectStats {
@@ -132,6 +135,14 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
       decl.pieces.push_back(Piece{q.value("base", std::uint64_t(0)), q.value("rows", std::uint64_t(1)),
                                   q.value("stride", std::uint64_t(0)), q.value("period", std::uint64_t(0)),
                                   q.value("count", std::uint64_t(1)), q.at("width"), pdir != "write", pdir != "read"});
+    }
+    // Every bound the checks compute (base, rows * stride, run reach, extent) stays below 2^62.
+    const __int128 limit = __int128(1) << 62;
+    if (__int128(decl.extent) >= limit) decl.unrepresentable = true;
+    for (const auto& p : decl.pieces) {
+      const __int128 run = __int128(p.count ? p.count - 1 : 0) * __int128(p.count > 1 ? p.period : p.width) + p.width;
+      const __int128 reach = __int128(p.base) + __int128(p.rows) * __int128(p.stride) + run;
+      if (reach >= limit || __int128(p.base) + run >= limit) decl.unrepresentable = true;
     }
     declared[item.at("object").get<std::string>()] = std::move(decl);
   }
@@ -265,6 +276,13 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
       continue;
     }
     const auto& decl = found->second;
+    if (decl.unrepresentable) {
+      auto undecided = probe;
+      undecided.status = ContainmentVerdict::Status::kUnknown;
+      undecided.reason = "declared footprint geometry past 2^62 bytes";
+      undecided_at(access, object, undecided, 0);
+      continue;
+    }
     if (access.mode == AccessMode::kWrite && decl.direction == "read")
       violation(access, "write_to_read_only", object, probe, decl.extent);
     if (access.mode == AccessMode::kRead && decl.direction == "write")
