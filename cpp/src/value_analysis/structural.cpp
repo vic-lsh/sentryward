@@ -2476,7 +2476,83 @@ class Reference {
     }
     return out;
   }
-  // The bits of x that differ between probes (all of them for a free value).
+  // Per bit of x, a superset of the free bits (free index * 64 + bit) it depends on, cut at 4
+  // entries (4 = more than 3). Bitwise operations (and, or, xor, not, lop3): bit i reads bit i of
+  // each data operand. Every other fragment operation (shifts, resizes, same-width bitcasts, bfe,
+  // bfi, prmt, shf, all with fixed controls) routes bits: each result bit is a constant or a copy
+  // of one operand bit, so flipping one operand bit from the all-zero operands shows exactly the
+  // result bits that copy it.
+  using Support = std::vector<std::vector<std::uint32_t>>;
+  static void join(std::vector<std::uint32_t>& to, const std::vector<std::uint32_t>& from) {
+    for (const auto e : from) {
+      if (to.size() > 3) return;
+      if (std::find(to.begin(), to.end(), e) == to.end()) to.push_back(e);
+    }
+  }
+  Support support(const v::Value& x0, const std::vector<v::Value>& fs, unsigned depth = 0) {
+    if (depth > 64) throw Undecided{"bit fragment deeper than 64"};
+    const auto x = res(x0);
+    const auto w = widthOf(x);
+    Support r(w);
+    if (word(x)) return r;
+    if (!fragment(x)) {
+      for (std::size_t f = 0; f < fs.size(); ++f)
+        if (same(fs[f], x)) {
+          for (unsigned i = 0; i < w; ++i) r[i] = {std::uint32_t(f * 64 + i)};
+          return r;
+        }
+      throw Undecided{"a free value outside its fragment"};
+    }
+    if (const auto& c = x.conversion()) {
+      const auto s = support(c->source, fs, depth + 1);
+      const auto sw = unsigned(s.size());
+      for (unsigned i = 0; i < w && sw; ++i)
+        if (i < sw) r[i] = s[i];
+        else if (signedSource(c->source)) r[i] = s[sw - 1];
+      return r;
+    }
+    const auto& op = g_.definingNode(x).operation();
+    const auto operands = g_.instanceOperands(x).toVector();
+    std::vector<Support> in;
+    for (const auto& a : operands) in.push_back(support(a, fs, depth + 1));
+    const auto* b = dynamic_cast<const v::BinaryOp*>(&op);
+    const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op);
+    const bool bitwise = (b && (b->opcode() == v::BinaryOpcode::BitAnd || b->opcode() == v::BinaryOpcode::BitOr ||
+                                b->opcode() == v::BinaryOpcode::BitXor)) ||
+                         dynamic_cast<const v::UnaryOp*>(&op) || (p && p->opcode() == v::PtxScalarOpcode::Logic3);
+    const auto cs = controls(op);
+    const auto data = [&](std::size_t k) { return std::find(cs.begin(), cs.end(), k) == cs.end(); };
+    if (bitwise) {
+      for (std::size_t k = 0; k < in.size(); ++k)
+        if (data(k))
+          for (unsigned i = 0; i < w && i < in[k].size(); ++i) join(r[i], in[k][i]);
+      return r;
+    }
+    std::vector<std::uint64_t> base;
+    std::vector<unsigned> ws;
+    for (std::size_t k = 0; k < operands.size(); ++k) ws.push_back(widthOf(operands[k])), base.push_back(data(k) ? 0 : *word(operands[k]));
+    const bool sign = dynamic_cast<const v::ConvertOp*>(&op) ? signedSource(operands[0]) : signedSource(x);
+    const auto r0 = apply(op, w, sign, base, ws);
+    if (!r0) throw Undecided{"an operation the bit fragment does not evaluate"};
+    for (std::size_t k = 0; k < operands.size(); ++k) {
+      if (!data(k)) continue;
+      for (unsigned j = 0; j < ws[k]; ++j) {
+        auto a = base;
+        a[k] ^= std::uint64_t{1} << j;
+        const auto rj = apply(op, w, sign, a, ws);
+        if (!rj) throw Undecided{"an operation the bit fragment does not evaluate"};
+        const auto d = (*rj ^ *r0) & wmask(w);
+        for (unsigned i = 0; i < w; ++i)
+          if (bit(d, i)) join(r[i], in[k][j]);
+      }
+    }
+    return r;
+  }
+  // The bits of x that differ between probes (all of them for a free value). Exact when every bit
+  // of x depends on at most three free bits: restricted to its support (k <= 3 bits) the probes
+  // (all zero, all one, each single flip from either) take every assignment of weight 0, 1, k - 1
+  // and k, which is all of them; a bit of a function of four (q = (c ^ d) & (a ^ b) is zero at
+  // every probe) can vary unseen, so x is undecided outside that class.
   std::uint64_t varying(const v::Value& x0) {
     const auto x = res(x0);
     const auto w = widthOf(x);
@@ -2484,6 +2560,8 @@ class Reference {
     if (!fragment(x)) return wmask(w);
     std::vector<v::Value> fs;
     frees(x, fs);
+    for (const auto& s : support(x, fs))
+      if (s.size() > 3) throw Undecided{"a fragment bit that depends on more than three free bits (probes not exact)"};
     std::uint64_t first = 0, diff = 0;
     bool any = false;
     for (const auto& p : probes(fs)) {
