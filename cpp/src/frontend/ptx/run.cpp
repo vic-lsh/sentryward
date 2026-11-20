@@ -440,6 +440,7 @@ struct Monitor {
   bool finished = false;
   std::string stage = "startup";
   Json frontend_checkpoint = Json::object();
+  Json approximate_instructions = Json::object();
   std::atomic<std::uint64_t> peak = 0;
   std::atomic<std::uint64_t> peak_footprint = 0;
   // The per-unit attempt's internal.frontend.unit_restart record, else null.
@@ -478,6 +479,12 @@ struct Monitor {
     std::lock_guard lock(mutex);
     // Merged: a per-unit attempt's checkpoint already holds the kept verdict (MemoryVerified).
     frontend_checkpoint.update(checkpoint);
+  }
+  // The approximate instructions the analyzed CTAs executed (ApproximateInstruction): a whole-pipeline
+  // timeout during the object comparison still names them in its equivalence report.
+  void ApproximateInstructions(const Json &counts) {
+    std::lock_guard lock(mutex);
+    approximate_instructions = counts;
   }
   void MemoryStrategy(const std::string &strategy, bool fallback) {
     std::lock_guard lock(mutex);
@@ -576,7 +583,8 @@ struct Monitor {
       if(options.require_equivalence || options.reference_stdin) {
         if(stage=="equivalence.object_comparison")
           result["equivalence"]={{"status",limit?"memory_limit_exceeded":"timeout"},
-            {"reason",limit?"rss_limit":"time_budget"},{"stage",stage}};
+            {"reason",limit?"rss_limit":"time_budget"},{"stage",stage},
+            {"approximate_instructions",approximate_instructions}};
         else result["equivalence"]={{"status","blocked"},{"reason","verification_prerequisite_not_satisfied"},
           {"prerequisite_status",result.value("status","timeout")},{"stage",stage}};
       }
@@ -1148,12 +1156,35 @@ struct CtaAccount {
   std::uint64_t records = 0, assumed_assertions = 0;
   std::uint64_t representative_branch_uses = 0, bounded_loop_uses = 0;
   std::uint64_t election_uses = 0, clc_uses = 0, atomic_uses = 0;
+  // Executions of approximate floating instructions (ApproximateInstruction), by mnemonic.
+  std::map<std::string, std::uint64_t> approximate_instructions;
   std::map<std::uint64_t, std::uint64_t> opaque_regions;
   std::map<std::uint64_t, ptx::DataBranchDecision> data_branch_decisions;
   std::set<std::uint32_t> static_choice_lines;
   // Whether the CTA executed one of `atomic_sites` (class mode's unit-independence precondition).
   bool executes_atomic_site = false;
 };
+// The full mnemonic of a PTX approximate floating instruction: ex2, lg2, sin, cos, rsqrt and tanh (no
+// exactly rounded form); rcp, sqrt or div in their .approx (and div's .full) forms; and f32 rcp, sqrt or
+// div with no rounding modifier, which PTX ISA before 1.4 defines as approximate (later ISAs require a
+// modifier, so the form occurs only there). The reference
+// comparison reads each as the exact function it approximates: the instruction's rounding of the same
+// real function (reported per verdict, equivalence.approximate_instructions). None otherwise.
+std::optional<std::string> ApproximateInstruction(const ptx::Instruction &instruction) {
+  static const std::set<std::string> approximate_only{"ex2", "lg2", "sin", "cos", "rsqrt", "tanh"};
+  const auto &op = instruction.opcode;
+  const auto &m = instruction.modifiers;
+  const auto has = [&](const char *modifier) { return std::find(m.begin(), m.end(), modifier) != m.end(); };
+  const bool reciprocal_family = op == "rcp" || op == "sqrt" || op == "div";
+  const bool implicit = reciprocal_family && has("f32") && !has("rn") && !has("rz") && !has("rm") &&
+                        !has("rp") && !has("approx") && !has("full");
+  if (!approximate_only.contains(op) && !(reciprocal_family && has("approx")) &&
+      !(op == "div" && has("full")) && !implicit)
+    return std::nullopt;
+  std::string mnemonic = op;
+  for (const auto &modifier : m) mnemonic += "." + modifier;
+  return mnemonic;
+}
 // Adds a later decision at one branch line to its summary: the counts add up, and the
 // assumption and rule become the later one's.
 void AddDecision(ptx::DataBranchDecision &summary, const ptx::DataBranchDecision &decision) {
@@ -1187,6 +1218,9 @@ CtaAccount SummarizeCta(const ptx::CtaFacts &cta_facts, const ptx::Function &fun
     if (op == "elect") account.election_uses += count;
     if (op == "clusterlaunchcontrol") account.clc_uses += count;
     if (op == "atom" || op == "red") account.atomic_uses += count;
+    if (count != 0)
+      if (auto mnemonic = ApproximateInstruction(function.instructions[id]))
+        account.approximate_instructions[*mnemonic] += count;
   }
   for (const auto id : atomic_sites)
     if (id < static_counts.size() && static_counts[id] != 0) account.executes_atomic_site = true;
@@ -1493,6 +1527,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               config.fixed_input["cluster_launch_cancellation"] == false},
           {"assertion_uses",0}, {"election_uses",0}, {"clc_uses",0},
           {"representative_branch_uses",0}, {"bounded_loop_uses",0}, {"atomic_uses",0},
+          {"approximate_instructions",Json::object()},
           {"data_branch_decisions",Json::array()},
           {"opaque_compute_regions",Json::array()}};
       alg::OverridePtxAssumptions(effective_assumptions,
@@ -1676,6 +1711,9 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               add("election_uses", cta_account.election_uses);
               add("clc_uses", cta_account.clc_uses);
               add("atomic_uses", cta_account.atomic_uses);
+              for (const auto &[mnemonic, count] : cta_account.approximate_instructions)
+                facts["approximate_instructions"][mnemonic] =
+                    facts["approximate_instructions"].value(mnemonic, std::uint64_t(0)) + count;
               // Unit independence forbids an executed global atomic: restart if this CTA executes one.
               if (unit_plan.class_mode && cta_account.executes_atomic_site)
                 throw alg::UnitClassRestart{"executed_global_atomic"};
@@ -2373,7 +2411,14 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         eliminated.reset();
         semantic_builder.reset();
         semantic_program.reset();
+        monitor.ApproximateInstructions(input_metadata.value("frontend_assumptions", Json::object())
+            .value("approximate_instructions", Json::object()));
         monitor.Stage("equivalence.object_comparison");
+#ifdef SENTRYWARD_TIMEOUT_TEST_HOOK
+        // Hold the real comparison boundary so the watchdog emits its timeout report.
+        if (std::getenv("SENTRYWARD_TEST_HOLD_COMPARISON"))
+          std::this_thread::sleep_for(std::chrono::seconds(60));
+#endif
         const auto started = Clock::now();
         rg::ContextBuilder context;
         context = [&](rg::Arena&, const Json& mapping,
@@ -2399,6 +2444,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               std::move(equivalence_mapping),
               {.seconds = options.equivalence_timeout,
                .floating_range_premise = effective_assumptions.at("floating_values_in_range"),
+               .constant_idealizations = effective_assumptions.at("compiler_constant_transcendentals"),
                .kernel_hardware_values = true},
               context).report;
         });
@@ -2481,6 +2527,25 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           floating_range_used = Json(false);
       }
     }
+    // Compiler-constant idealizations: triggered when the comparison read a rounded constant as a
+    // transcendental (its `idealizations` list); unused when it finished every family without one.
+    std::optional<Json> constants_used;
+    if (effective_assumptions.at("compiler_constant_transcendentals")) {
+      constants_used = Json(nullptr);
+      if (const auto equivalence = result.find("equivalence");
+          equivalence != result.end() && equivalence->is_object() && equivalence->contains("idealizations")) {
+        if (!equivalence->at("idealizations").empty())
+          constants_used = Json(true);
+        else if (equivalence->contains("total_output_families") &&
+                 equivalence->value("finished_families", Json()) == equivalence->at("total_output_families"))
+          constants_used = Json(false);
+      }
+    }
+    // The approximate PTX instructions the analyzed CTAs executed, which the comparison read as exact
+    // functions: named in the equivalence report beside the idealizations (not an idealization).
+    if (auto equivalence = result.find("equivalence"); equivalence != result.end() && equivalence->is_object())
+      (*equivalence)["approximate_instructions"] = input_metadata.value("frontend_assumptions", Json::object())
+          .value("approximate_instructions", Json::object());
     if (!result.contains("assumptions")) {
       result["assumptions"] = Json::array();
       for (const auto& entry : alg::AssumptionPool()) {
@@ -2494,14 +2559,20 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           if (entry.key == "order_independent_atomics") triggered = facts.value("atomic_uses", 0) > 0;
         }
         if (entry.key == "floating_values_in_range" && floating_range_used) triggered = *floating_range_used;
+        if (entry.key == "compiler_constant_transcendentals" && constants_used) triggered = *constants_used;
         result["assumptions"].push_back({{"label",entry.label},{"key",entry.key},{"text",entry.text},
             {"enabled",effective_assumptions.at(entry.key)},
             {"triggered",triggered}});
       }
-    } else if (floating_range_used && result["assumptions"].is_array()) {
-      // The verification report's list (source_json.cpp RenderReport) saw no comparison.
-      for (auto& entry : result["assumptions"])
-        if (entry.value("key", "") == "floating_values_in_range") entry["triggered"] = *floating_range_used;
+    } else if ((floating_range_used || constants_used) && result["assumptions"].is_array()) {
+      // The verification report's list (source_json.cpp RenderReport) saw no comparison. Each
+      // comparison-derived assumption is updated on its own (either may be disabled).
+      for (auto& entry : result["assumptions"]) {
+        if (entry.value("key", "") == "floating_values_in_range" && floating_range_used)
+          entry["triggered"] = *floating_range_used;
+        if (entry.value("key", "") == "compiler_constant_transcendentals" && constants_used)
+          entry["triggered"] = *constants_used;
+      }
     }
     const auto reason = result.value("reason", "");
     if (reason == "branch_not_static" || reason == "missing_parameter_value") {

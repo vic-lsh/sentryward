@@ -275,6 +275,50 @@ value sets of the [numerical model](reference-binding-json.md#equivalence-contra
 - **Disabled:** keep them. An equality that depends on the premise is then not
   proven.
 
+## Compiler constants of transcendentals
+
+Configuration key: `compiler_constant_transcendentals` (default `true`).
+
+This premise belongs to the numerical (equivalence) model. nvcc expands `expf`,
+`logf`, `log2f` and similar functions into PTX that computes with rounded binary32
+constants (log2(e), ln 2) or minimax polynomials. Read over the ideal reals such
+a sequence is not the transcendental: for example `expf(-x)` is
+`ex2.approx(fma.rn(v, L_lo, fma.rn(v, L_hi, t))) * 2^n` with v = -x, which is
+exp2(-c x) for the rational c = L_hi + L_lo = 25380159564675/2^44, and c is not
+log2(e). The premise reads each recognized sequence as the transcendental. It is
+an approximation of the same kind as rounding, not an equality over the reals.
+
+The split-log2(e) exponential is recognized only on the raw PTX: an `ex2.approx`
+whose operand is two round-to-nearest `fma` instruction images (no other
+rounding mode, not contracted or synthesized) of the same value with the literals
+`0f3FB8AA3B` and `0f32A57060` (L_lo outer), multiplied by the power of the checked
+`fma.rm` exponent encoding. Both factors are checked on the product's own raw
+operand edges (the power idiom node read through its `b32 -> f32` bitcast, and the
+`ex2.approx` node), not on canonical terms: another occurrence whose exponent
+canonicalizes to the same term but whose raw sequence differs is not rewritten.
+
+- **Enabled:** each use is listed in `equivalence.idealizations` (`rule`, the
+  exact `replaced` value with its sign (the PTX literals', or the canonical
+  coefficient's where the literal's sign folded into it), what it `denotes`
+  (e.g. `-log2(e)`), `uses`). In the result's `assumptions` entry, `triggered` is `true` when the
+  list is nonempty, `false` when the comparison imported every output family
+  without one, and `null` when it did not run or stopped early. A verdict that
+  rests on it holds modulo the listed idealizations.
+- **Disabled:** no rounded constant is read as a transcendental; an equality
+  that depends on one is not proven.
+
+Not part of this premise: a PTX approximate instruction (`ex2.approx`,
+`lg2.approx`, `sin`/`cos.approx`, `rsqrt.approx`, `tanh.approx`, and the
+`.approx` forms of `sqrt`, `rcp` and `div`) is read as the exact function it
+approximates. Its error is that instruction's own rounding of the same real
+function, not a different function, so it belongs with rounding in the
+hardware value model. The report still names each one:
+`equivalence.approximate_instructions` maps the full PTX mnemonic (e.g.
+`ex2.approx.ftz.f32`, `div.full.f32`) to its executions in the analyzed CTAs,
+taken from the PTX instructions themselves, not from the lowered expression
+(where a software exp2 sequence and `ex2.approx` look alike, and `rcp`/`div`
+lose their modifiers).
+
 ## Duplicate TMA stores
 
 Configuration key: `duplicate_tma_store_benign`.
