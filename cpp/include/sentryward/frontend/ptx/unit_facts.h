@@ -798,10 +798,11 @@ public:
     const std::uint64_t &assumed_assertions;
     const std::map<std::uint64_t, std::uint64_t> &opaque_regions;
     const std::map<std::uint64_t, DataBranchDecision> &data_branch_decisions;
+    const std::vector<std::string> &path_facts;
   };
   [[nodiscard]] LaneAggregates Aggregates(LaneRef lane) const {
     const auto &trace = TraceOf(lane);
-    return {trace.assumed_assertions, trace.opaque_regions, trace.data_branch_decisions};
+    return {trace.assumed_assertions, trace.opaque_regions, trace.data_branch_decisions, trace.path_facts};
   }
   [[nodiscard]] std::span<const std::uint64_t> StaticCounts() const noexcept {
     return program_->static_execution_counts;

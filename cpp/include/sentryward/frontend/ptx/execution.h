@@ -416,6 +416,9 @@ struct LaneTrace {
   std::uint64_t assumed_assertions = 0;
   std::map<std::uint64_t, DataBranchDecision> data_branch_decisions;  // by PTX line
   std::map<std::uint64_t, std::uint64_t> opaque_regions;  // multi-arm compute-only regions skipped
+  // Global facts (address-invariant JSON) this lane recorded at chosen branches on unknown
+  // predicates (relational path conditions).
+  std::vector<std::string> path_facts;
 
 };
 struct ExecutionProgram {

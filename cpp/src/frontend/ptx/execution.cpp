@@ -3,9 +3,12 @@
 #include "sentryward/frontend/ptx/shared_execution.h"
 #include "sentryward/frontend/ptx/layouts.h"
 #include "sentryward/frontend/ptx/resources.h"
+#include "sentryward/algorithm/memory/symbolic_address_model.h"
 #include "sentryward/algorithm/diagnostics/performance_profile.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <bit>
 #include <cctype>
 #include <cmath>
@@ -1155,8 +1158,60 @@ Scalar LocalLoaded(const Scalar &stored, unsigned bytes, bool sign) {
   if (const auto *b = std::get_if<BoundedInteger>(&stored); b && FitsType(*b, bytes * 8, sign)) return stored;
   return {};
 }
+// Relational path conditions (docs/design/loop-summaries.md, stage A): the exact machine meaning of
+// an unknown predicate, built when its defining instruction executes from its operand values. A
+// comparison holds affine forms whose values fit the comparison's reading, so the integer
+// comparison of the forms is the machine comparison.
+struct PredTerm {
+  enum class Kind { Compare, And, Or, Not } kind = Kind::Compare;
+  std::string relation;  // eq, ne, lt, le, gt, ge
+  AffineForm left, right;
+  std::shared_ptr<const PredTerm> a, b;
+};
+using PredTermRef = std::shared_ptr<const PredTerm>;
+PredTermRef NotTerm(PredTermRef t) {
+  return std::make_shared<const PredTerm>(PredTerm{PredTerm::Kind::Not, {}, {}, {}, std::move(t), nullptr});
+}
+PredTermRef JoinTerm(PredTerm::Kind kind, PredTermRef a, PredTermRef b) {
+  return std::make_shared<const PredTerm>(PredTerm{kind, {}, {}, {}, std::move(a), std::move(b)});
+}
+// The term of `setp.<relation>.<type> left, right`, when both operands are exact affine forms whose
+// values fit the comparison's reading (width and signedness of its type): then the machine
+// comparison is the integer comparison of the forms. Otherwise none (no fact: sound).
+PredTermRef CompareTerm(const Instruction &i, std::string relation, const Scalar &left, const Scalar &right) {
+  if (relation == "lo") relation = "lt"; else if (relation == "ls") relation = "le";
+  else if (relation == "hi") relation = "gt"; else if (relation == "hs") relation = "ge";
+  if (!In(relation, {"eq", "ne", "lt", "le", "gt", "ge"})) return nullptr;
+  unsigned width = 0;
+  bool sign = false, bits = false;
+  for (const auto &[type, w, sg, b] : {std::tuple{"u16", 16u, false, false}, std::tuple{"s16", 16u, true, false},
+                                       std::tuple{"u32", 32u, false, false}, std::tuple{"s32", 32u, true, false},
+                                       std::tuple{"u64", 64u, false, false}, std::tuple{"s64", 64u, true, false},
+                                       std::tuple{"b16", 16u, false, true}, std::tuple{"b32", 32u, false, true},
+                                       std::tuple{"b64", 64u, false, true}})
+    if (Has(i, type)) { width = w; sign = sg; bits = b; }
+  if (!width || (bits && !In(relation, {"eq", "ne"}))) return nullptr;
+  const auto fits = [&](const Scalar &v, bool sg) {
+    const Integer low = sg ? -(Integer(1) << (width - 1)) : Integer(0);
+    const Integer high = (Integer(1) << (width - unsigned(sg))) - 1;
+    if (const auto n = ScalarInteger(v)) return low <= *n && *n <= high;
+    const auto *b = std::get_if<BoundedInteger>(&v);
+    return b && (*b)->affine && FitsType(*b, width, sg);
+  };
+  const auto fl = AffineOf(left), fr = AffineOf(right);
+  if (!fl || !fr) return nullptr;
+  // An ordering reads the type's signedness. Equality compares residues mod 2^width, which equal
+  // the integers' equality when both lie in one window of 2^width values (either reading).
+  const bool exact = In(relation, {"eq", "ne"})
+      ? (fits(left, false) && fits(right, false)) || (fits(left, true) && fits(right, true))
+      : fits(left, sign) && fits(right, sign);
+  if (!exact) return nullptr;
+  return std::make_shared<const PredTerm>(PredTerm{PredTerm::Kind::Compare, relation, *fl, *fr, nullptr, nullptr});
+}
 struct State {
   std::vector<Scalar> registers;
+  // The predicate term of each predicate register that holds an unknown with a known meaning.
+  std::map<std::uint32_t, PredTermRef> pred_terms;
   std::vector<std::optional<DynamicKey>> origins;
   std::vector<std::uint64_t> occurrences, branch_visits;
   std::map<std::string, std::uint64_t> backedges;
@@ -1291,6 +1346,7 @@ public:
   Executor(const Module &m, const Function &f, const FrontendConfig &c,
            std::function<void()> poll, SpecializationPurpose purpose)
       : m_(m), f_(f), c_(c), poll_(std::move(poll)), purpose_(purpose) {
+    path_facts_ = !c_.branch_overrides.empty();
     if (purpose_ == SpecializationPurpose::BranchScopeCapture ||
         purpose_ == SpecializationPurpose::VerificationWithBranchScope) {
       const auto choices = c_.raw.value("user_branch_decisions", Json::array());
@@ -1507,6 +1563,14 @@ private:
   // path from the branch on (see the definition).
   void RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth, State &s, std::uint32_t warp,
                    std::uint32_t lane, std::uint64_t visit) const;
+  // Stage A (relational path conditions): with branch choices, unknown predicates carry their
+  // exact terms, integer loads that would be unknown become lane atoms, and a chosen branch on an
+  // unknown predicate records the conjunctive part of its meaning as global facts (address
+  // invariants). Every run with choices executes lane by lane (lane atoms are per lane).
+  bool path_facts_ = false;
+  void RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace) const;
+  // This lane's CTA coordinates, as text for an atom identity.
+  std::string CtaText(const State &s) const;
   // The index of the `setp` RefineGuard reads for the branch at `pc`, when it has that shape.
   std::optional<std::uint32_t> GuardCompare(std::uint32_t pc, std::uint32_t predicate) const;
   State Initial(const WarpContract &, std::uint32_t) const;
@@ -1520,8 +1584,10 @@ private:
   Scalar ValueText(std::string_view text, const State &s) const;
   void Set(const Decoded &, State &, std::vector<Scalar>) const;
   void Invalidate(const Decoded &d, State &s) const {
-    for (auto id : d.destinations)
+    for (auto id : d.destinations) {
       s.registers[id] = Scalar{};
+      s.pred_terms.erase(id);
+    }
   }
   void Origins(const Decoded &, State &, std::uint64_t) const;
   ExecutedInstruction Record(const Decoded &, const State &, std::uint64_t,
@@ -1936,6 +2002,77 @@ void Executor::RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth
                     ":" + std::to_string(lane) + ":" + std::to_string(visit);
     ElementAtom atom{"path_condition", (sign ? "s" : "u") + std::to_string(width), Integer(0), identity, lower, upper};
     s.registers[reg] = MakeBounded(lower, upper, std::move(identity), {}, AffineForm{Integer(0), {{std::move(atom), Integer(1)}}});
+  }
+}
+std::string Executor::CtaText(const State &s) const {
+  std::string cta;
+  for (const char *axis : {"%ctaid.x", "%ctaid.y", "%ctaid.z"})
+    if (const auto id = ids_.find(axis); id != ids_.end())
+      if (const auto n = ScalarInteger(s.registers[id->second])) cta += n->str() + ",";
+  return cta;
+}
+namespace {
+// The address-model expression of an affine form over element atoms (as slot_resolver's
+// AffineOffsetJson; that one is file-local there): constant + coefficient x element lookups.
+std::optional<Json> FactTermJson(const AffineForm &form) {
+  const auto fits = [](const Integer &n) { return n >= INT64_MIN && n <= INT64_MAX; };
+  if (!fits(form.constant)) return std::nullopt;
+  Json operands = Json::array({form.constant.convert_to<std::int64_t>()});
+  for (const auto &[atom, coefficient] : form.terms) {
+    if (!fits(coefficient) || !fits(atom.byte_offset) || !fits(atom.lower) || !fits(atom.upper)) return std::nullopt;
+    Json lookup{{"operator", "gather"}, {"args", Json::array({atom.byte_offset.convert_to<std::int64_t>()})}};
+    if (atom.function.empty()) {
+      lookup["symbol"] = algorithm::TensorPropertySymbol(atom.object, atom.element_type);
+    } else {
+      lookup["symbol"] = algorithm::TensorPropertyFunctionSymbol(atom.object, atom.element_type, atom.function);
+      lookup["object"] = atom.object;
+      lookup["lower"] = atom.lower.convert_to<std::int64_t>();
+      lookup["upper"] = atom.upper.convert_to<std::int64_t>();
+    }
+    operands.push_back({{"operator", "mul"}, {"operands", Json::array({std::move(lookup), coefficient.convert_to<std::int64_t>()})}});
+  }
+  return Json{{"operator", "add"}, {"operands", std::move(operands)}};
+}
+// The literals a term asserts with value `truth`, as far as that is a conjunction: a disjunctive
+// part asserts nothing here (fewer facts, still sound).
+void Literals(const PredTermRef &t, bool truth, std::vector<std::pair<std::string, const PredTerm *>> &out) {
+  if (!t) return;
+  switch (t->kind) {
+    case PredTerm::Kind::Compare: {
+      static const std::map<std::string, std::string> negate{
+          {"eq", "ne"}, {"ne", "eq"}, {"lt", "ge"}, {"ge", "lt"}, {"le", "gt"}, {"gt", "le"}};
+      out.emplace_back(truth ? t->relation : negate.at(t->relation), t.get());
+      return;
+    }
+    case PredTerm::Kind::Not: Literals(t->a, !truth, out); return;
+    case PredTerm::Kind::And:
+      if (truth) { Literals(t->a, true, out); Literals(t->b, true, out); }
+      return;
+    case PredTerm::Kind::Or:
+      if (!truth) { Literals(t->a, false, out); Literals(t->b, false, out); }
+      return;
+  }
+}
+}  // namespace
+void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace) const {
+  const auto found = s.pred_terms.find(predicate);
+  if (const char *dbg = std::getenv("SW_DEBUG_FACTS")) if (FILE *f = std::fopen(dbg, "a")) { std::fprintf(f, "facts: pred %u term %d terms %zu\n", predicate, found != s.pred_terms.end(), s.pred_terms.size()); std::fclose(f); }
+  if (found == s.pred_terms.end()) return;
+  std::vector<std::pair<std::string, const PredTerm *>> literals;
+  Literals(found->second, truth, literals);
+  for (const auto &[relation, term] : literals) {
+    // left - right in a bound (ne is a disjunction: no fact).
+    const auto difference = AffineSum(term->left, term->right, Integer(-1));
+    if (difference.terms.empty() || relation == "ne") continue;
+    const auto json = FactTermJson(difference);
+    if (!json) continue;
+    Json fact{{"term", *json}};
+    if (relation == "eq") { fact["lower_bound"] = 0; fact["upper_bound"] = 0; }
+    else if (relation == "lt") fact["upper_bound"] = -1;
+    else if (relation == "le") fact["upper_bound"] = 0;
+    else if (relation == "gt") fact["lower_bound"] = 1;
+    else fact["lower_bound"] = 0;
+    trace.path_facts.push_back(fact.dump());
   }
 }
 void Executor::PrepareControl() const {
@@ -2415,9 +2552,11 @@ Scalar Executor::ValueText(std::string_view text, const State &s) const {
 void Executor::Set(const Decoded &d, State &s,
                    std::vector<Scalar> values) const {
   for (std::size_t n = 0; n < d.destination_slots.size(); ++n)
-    if (d.destination_slots[n] != kMissing)
+    if (d.destination_slots[n] != kMissing) {
       s.registers[d.destination_slots[n]] =
           n < values.size() ? std::move(values[n]) : Scalar{};
+      s.pred_terms.erase(d.destination_slots[n]);
+    }
 }
 void Executor::Origins(const Decoded &d, State &s,
                        std::uint64_t occurrence) const {
@@ -2754,6 +2893,30 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
       Set(d, s, std::move(values));
       return;
     }
+    // Stage A: with branch choices, an integer load the frontend does not model is a lane atom:
+    // its exact value (one atom per lane visit of the instruction), bounded by the loaded type, so
+    // facts and later exact arithmetic can name it. One destination only.
+    if (path_facts_ && d.destination_slots.size() == 1 && d.destination_slots[0] != kMissing) {
+      unsigned width = 0;
+      bool sign = false;
+      for (const auto &[type, w, sg] : {std::tuple{"u8", 8u, false}, std::tuple{"s8", 8u, true},
+                                        std::tuple{"b8", 8u, false}, std::tuple{"u16", 16u, false},
+                                        std::tuple{"s16", 16u, true}, std::tuple{"b16", 16u, false},
+                                        std::tuple{"u32", 32u, false}, std::tuple{"s32", 32u, true},
+                                        std::tuple{"b32", 32u, false}, std::tuple{"u64", 64u, false},
+                                        std::tuple{"s64", 64u, true}, std::tuple{"b64", 64u, false}})
+        if (Has(i, type)) { width = w; sign = sg; }
+      if (width) {
+        const Integer low = sign ? -(Integer(1) << (width - 1)) : Integer(0);
+        const Integer high = (Integer(1) << (width - unsigned(sign))) - 1;
+        const auto type = (sign ? "s" : "u") + std::to_string(width);
+        auto identity = "load:" + std::to_string(i.line) + ":" + CtaText(s) + std::to_string(warp) + ":" +
+                        std::to_string(lane) + ":" + std::to_string(occurrence);
+        ElementAtom atom{"lane_load", type, Integer(0), identity, low, high};
+        Set(d, s, {MakeBounded(low, high, std::move(identity), {}, AffineForm{Integer(0), {{std::move(atom), Integer(1)}}})});
+        return;
+      }
+    }
   }
   if (op == "clusterlaunchcontrol" && Has(i, "query_cancel") && Has(i, "is_canceled") &&
       c_.fixed_input.contains("cluster_launch_cancellation") &&
@@ -2958,7 +3121,20 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
     return;
   }
   if (In(op, {"and", "or", "xor"}) && Has(i, "pred") && n > 2) {
-    Set(d, s, {PredicateBinary(op, val(1), val(2))});
+    const auto value = PredicateBinary(op, val(1), val(2));
+    // Stage A: and/or of two operands with terms (an unknown result only; xor has no term).
+    const auto term = [&](std::size_t k) -> PredTermRef {
+      const auto reg = d.operands[k].reg;
+      if (reg == kMissing) return nullptr;
+      const auto found = s.pred_terms.find(reg);
+      return found == s.pred_terms.end() ? nullptr : found->second;
+    };
+    const auto ta = term(1), tb = term(2);
+    Set(d, s, {value});
+    if (path_facts_ && Unknown(value) && op != "xor" && ta && tb && !d.destination_slots.empty() &&
+        d.destination_slots[0] != kMissing)
+      s.pred_terms[d.destination_slots[0]] =
+          JoinTerm(op == "and" ? PredTerm::Kind::And : PredTerm::Kind::Or, ta, tb);
     return;
   }
   if (op == "mul" && n > 2) {
@@ -2992,11 +3168,16 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
   if (op == "not" && n > 1) {
     auto value = val(1);
     auto x = ScalarInteger(value);
+    PredTermRef term;
+    if (Has(i, "pred") && d.operands[1].reg != kMissing)
+      if (const auto found = s.pred_terms.find(d.operands[1].reg); found != s.pred_terms.end()) term = found->second;
     Set(d, s,
         {Has(i, "pred") ? NegatePredicate(value)
          : std::holds_alternative<BoundedInteger>(value) ? IntegerBinary("sub", Scalar(Integer(-1)), value, &i)
          : x            ? Scalar(Integer(~*x))
                         : Scalar{}});
+    if (path_facts_ && term && Unknown(value) && !d.destination_slots.empty() && d.destination_slots[0] != kMissing)
+      s.pred_terms[d.destination_slots[0]] = NotTerm(term);
     return;
   }
   if (op == "mad" && n > 3) {
@@ -3030,8 +3211,17 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
       Set(d, s,
           {PredicateBinary(boolean, comparison, val(3)),
            PredicateBinary(boolean, NegatePredicate(comparison), val(3))});
-    else
+    else {
       Set(d, s, {comparison, NegatePredicate(comparison)});
+      // Stage A: the unknown comparison's exact meaning, and its complement on `p|q`.
+      if (path_facts_ && Unknown(comparison))
+        if (auto term = CompareTerm(i, relation, left, right)) {
+          if (!d.destination_slots.empty() && d.destination_slots[0] != kMissing)
+            s.pred_terms[d.destination_slots[0]] = term;
+          if (d.destination_slots.size() > 1 && d.destination_slots[1] != kMissing)
+            s.pred_terms[d.destination_slots[1]] = NotTerm(term);
+        }
+    }
     return;
   }
   if (op == "selp" && n > 3) {
@@ -3184,6 +3374,7 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
     const auto &results = contract["register_results"];
     for (auto id : d.destinations) {
       auto found = results.find(names_[id]);
+      s.pred_terms.erase(id);
       s.registers[id] = found != results.end() && (found->is_number_integer() ||
                                                    found->is_boolean())
                             ? Scalar(JsonInteger(*found))
@@ -3674,6 +3865,8 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
             Error(i, warp.warp_id, lane, "assertion assumption contradicts a known value");
           state.registers[reg] = expected;
           state.registers[d.predicate] = true;
+          state.pred_terms.erase(reg);
+          state.pred_terms.erase(d.predicate);
           assumed_equality = {names_[reg], expected};
           ++trace.assumed_assertions;
         }
@@ -3739,6 +3932,7 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
         for (std::uint32_t index = pc + 1; index < join; ++index)
           for (auto reg : decoded_[index].destinations) {
             state.registers[reg] = Scalar{};
+            state.pred_terms.erase(reg);
             state.origins[reg].reset();
             probe_values.erase(reg);
           }
@@ -3785,8 +3979,11 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
         Error(i, warp.warp_id, lane,
               "known predicate disagrees with fixed-input branch contract");
       auto taken = supplied ? supplied : predicate;
-      if (override && !bound && !predicate && d.predicate != kMissing && taken)
+      if (const char *dbg = std::getenv("SW_DEBUG_FACTS")) if (FILE *f = std::fopen(dbg, "a")) { std::fprintf(f, "branch line %u override %d bound %d pred %d facts %d\n", unsigned(i.line), bool(override), bool(bound), bool(predicate), path_facts_); std::fclose(f); }
+      if (override && !bound && !predicate && d.predicate != kMissing && taken) {
         RefineGuard(pc, d.predicate, *taken != i.predicate_negated, state, warp.warp_id, lane, visit);
+        if (path_facts_) RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace);
+      }
       if (!taken && d.predicate != kMissing && target > pc + 1)
         if (const auto *arm = MergedArmAt(pc); arm && (!arm->aligned || arm->uniform)) {
           // Two-arm merge: this lane runs the fall-through arm (the superset arm); the arm's
@@ -4346,7 +4543,7 @@ TemplateTask Executor::RunTemplateTask(SharedExecution* runtime) {
   using namespace detail;
   if (!c_.compress_thread_records ||
       !c_.loop_bounds.empty() ||
-      !c_.instruction_contracts.empty()) co_return std::nullopt;
+      !c_.instruction_contracts.empty() || path_facts_) co_return std::nullopt;
   const auto supports_template=[](const Decoded& d) {
     const auto &i=*d.instruction;
     if (!In(i.control,{"none","direct_branch","indirect_branch","return","exit"})) return false;

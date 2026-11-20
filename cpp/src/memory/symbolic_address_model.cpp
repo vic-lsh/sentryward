@@ -191,7 +191,68 @@ struct SymbolicAddressModel::Impl {
   std::map<std::string, std::vector<FieldPolicy>> field_policies;
   // The bounds of atom `atom`: its symbol's whole-object bounds, tightened by every field
   // policy whose elements include the atom's offset.
+  // Atom bounds the term invariants imply (bound propagation over the linear facts, computed once
+  // when the model is built): sound, since each invariant holds of every execution the run covers.
+  std::map<AtomId, std::pair<std::optional<Int>, std::optional<Int>>> propagated;
   std::pair<std::optional<Int>, std::optional<Int>> BoundsOf(AtomId atom) const {
+    auto [lower, upper] = DeclaredBoundsOf(atom);
+    if (const auto p = propagated.find(atom); p != propagated.end()) {
+      if (p->second.first) lower = lower ? std::max(*lower, *p->second.first) : *p->second.first;
+      if (p->second.second) upper = upper ? std::min(*upper, *p->second.second) : *p->second.second;
+    }
+    return {lower, upper};
+  }
+  // Interval propagation: for each invariant c + sum k_i a_i in [L, U] and each atom a_j, the
+  // others' intervals bound k_j a_j; repeated to a fixpoint (at most kRounds rounds). Integer
+  // division rounds inward. Only tightens; an empty interval is left to the consistency check.
+  void PropagateBounds() {
+    constexpr int kRounds = 16;
+    const auto floor_div = [](const Int& a, const Int& b) {
+      Int q = a / b;
+      if ((a % b != 0) && ((a < 0) != (b < 0))) --q;
+      return q;
+    };
+    const auto ceil_div = [&](const Int& a, const Int& b) { return -floor_div(-a, b); };
+    for (int round = 0; round < kRounds; ++round) {
+      bool changed = false;
+      for (const auto& bound : term_bounds) {
+        const auto& terms = bound.term.terms;
+        for (std::size_t j = 0; j < terms.size(); ++j) {
+          // Interval of c + sum_{i != j} k_i a_i.
+          std::optional<Int> lo = bound.term.constant, hi = bound.term.constant;
+          for (std::size_t i = 0; i < terms.size() && (lo || hi); ++i) {
+            if (i == j) continue;
+            const auto [l, u] = BoundsOf(terms[i].first);
+            const auto& k = terms[i].second;
+            const auto add = [&](std::optional<Int>& acc, const std::optional<Int>& v) {
+              if (acc && v) *acc += *v; else acc.reset();
+            };
+            add(lo, k > 0 ? (l ? std::optional<Int>(k * *l) : std::nullopt) : (u ? std::optional<Int>(k * *u) : std::nullopt));
+            add(hi, k > 0 ? (u ? std::optional<Int>(k * *u) : std::nullopt) : (l ? std::optional<Int>(k * *l) : std::nullopt));
+          }
+          // k_j a_j in [L - hi, U - lo].
+          std::optional<Int> klo, khi;
+          if (bound.lower && hi) klo = *bound.lower - *hi;
+          if (bound.upper && lo) khi = *bound.upper - *lo;
+          const auto& k = terms[j].second;
+          std::optional<Int> alo, ahi;
+          if (k > 0) {
+            if (klo) alo = ceil_div(*klo, k);
+            if (khi) ahi = floor_div(*khi, k);
+          } else {
+            if (khi) alo = ceil_div(*khi, k);
+            if (klo) ahi = floor_div(*klo, k);
+          }
+          auto& slot = propagated[terms[j].first];
+          const auto [cl, cu] = BoundsOf(terms[j].first);
+          if (alo && (!cl || *alo > *cl)) { slot.first = alo; changed = true; }
+          if (ahi && (!cu || *ahi < *cu)) { slot.second = ahi; changed = true; }
+        }
+      }
+      if (!changed) break;
+    }
+  }
+  std::pair<std::optional<Int>, std::optional<Int>> DeclaredBoundsOf(AtomId atom) const {
     std::optional<Int> lower, upper;
     const auto& a = atoms[atom];
     if (a.gather.empty()) return {lower, upper};
@@ -257,6 +318,7 @@ struct SymbolicAddressModel::Impl {
         binding_shapes.emplace(binding.address.value(), shape);
       }
       CheckInvariantsConsistent();
+      PropagateBounds();
     } catch (const std::exception& failure) {
       if (!error) error = MemoryAnalysisError{
           std::string("invalid symbolic-address model: ") + failure.what(), std::nullopt, std::nullopt};

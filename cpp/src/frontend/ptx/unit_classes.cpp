@@ -295,6 +295,7 @@ StructureKey ComputeStructureKey(const CtaFacts &facts) {
     w.U64(aggregates.assumed_assertions);
     w.Put(aggregates.opaque_regions);
     w.Put(aggregates.data_branch_decisions);
+    w.Put(aggregates.path_facts);
   }
   w.Put(facts.StaticCounts());
   const auto sites = facts.SharedSitesRelative();

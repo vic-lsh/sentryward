@@ -1151,6 +1151,8 @@ struct CtaAccount {
   std::map<std::uint64_t, std::uint64_t> opaque_regions;
   std::map<std::uint64_t, ptx::DataBranchDecision> data_branch_decisions;
   std::set<std::uint32_t> static_choice_lines;
+  // The global facts its lanes recorded (relational path conditions).
+  std::set<std::string> path_facts;
   // Whether the CTA executed one of `atomic_sites` (class mode's unit-independence precondition).
   bool executes_atomic_site = false;
 };
@@ -1172,6 +1174,7 @@ CtaAccount SummarizeCta(const ptx::CtaFacts &cta_facts, const ptx::Function &fun
     account.records += cta_facts.Size(lane);
     account.assumed_assertions += aggregates.assumed_assertions;
     for (const auto &[line, count] : aggregates.opaque_regions) account.opaque_regions[line] += count;
+    account.path_facts.insert(aggregates.path_facts.begin(), aggregates.path_facts.end());
     for (const auto &[line, decision] : aggregates.data_branch_decisions) {
       AddDecision(account.data_branch_decisions[line], decision);
       (decision.assumption == "representative_branches" ? account.representative_branch_uses
@@ -1590,6 +1593,9 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
 #endif
       auto unit_plan = ptx::PlanUnits(config, *function, unit_gates);
       if (unit_restart) unit_plan.class_mode = false; // the per-unit attempt
+      // Relational path conditions: facts name each lane's atoms, so a member's facts are not its
+      // representative's shifted; runs with branch choices check every CTA.
+      if (!config.branch_overrides.empty()) unit_plan.class_mode = false;
       // Class mode's log budget, min(2 GiB, 10% of --rss-limit-mib).
       const std::uint64_t class_budget = std::min<std::uint64_t>(
           std::uint64_t(2) << 30, options.rss_mib ? *options.rss_mib * 1048576 / 10 : UINT64_MAX);
@@ -1609,6 +1615,8 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           return std::make_unique<ptx::ModelLowerer>(module, *function, poll, false,
               effective_assumptions.at("order_independent_atomics"), options.threads);
         });
+      // The global facts every executed CTA's lanes recorded (relational path conditions).
+      std::set<std::string> path_facts;
       // The classes of this launch (class mode only).
       std::unique_ptr<ptx::UnitClasses> classes;
       if (unit_plan.class_mode) {
@@ -1672,6 +1680,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
               add("bounded_loop_uses", cta_account.bounded_loop_uses);
               static_choice_lines.insert(cta_account.static_choice_lines.begin(),
                                          cta_account.static_choice_lines.end());
+              for (const auto &fact : cta_account.path_facts) path_facts.insert(fact);
               add("election_uses", cta_account.election_uses);
               add("clc_uses", cta_account.clc_uses);
               add("atomic_uses", cta_account.atomic_uses);
@@ -2036,8 +2045,14 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         metadata = std::move(lowered.metadata);
         metadata.update(input_metadata);
         lowered.artifact.frontend_assumptions_json = input_metadata["frontend_assumptions"].dump();
-        lowered.artifact.address_invariants_json =
-            config.raw.value("address_invariants", Json::array()).dump();
+        {
+          // The input's invariants and the facts the lanes recorded at chosen branches
+          // (relational path conditions), one environment for every query of the run.
+          auto invariants = config.raw.value("address_invariants", Json::array());
+          for (const auto &fact : path_facts) invariants.push_back(Json::parse(fact));
+          input_metadata["frontend_assumptions"]["path_facts"] = path_facts.size();
+          lowered.artifact.address_invariants_json = invariants.dump();
+        }
         if (const auto footprints = config.raw.value("footprints", Json::array()); !footprints.empty())
           lowered.artifact.footprints_json =
               Json{{"grid_dim", config.fixed_input.at("grid_dim")}, {"block_dim", config.raw.at("cta").at("block_dim")},
