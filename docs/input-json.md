@@ -245,6 +245,15 @@ violation: a contract that only says the outputs do not depend on bytes outside 
 a tiling that loads past it and masks the values. Writes are always checked by containment, so a
 passed write half also means every byte outside the declared pieces is unchanged.
 
+`path_conditions` (top level, optional, default false): relational path conditions and loop
+summaries (`docs/design/loop-summaries.md`) for footprint containment. They are always on in a run
+with `branch_decisions`; this key turns them on without one. Integer loads the frontend does not
+model become per-lane atoms, a chosen branch records its predicate's conjunctive meaning as facts,
+and a count-to-zero loop whose test depends on loaded data is summarized. Such runs execute lane by
+lane with CTA class mode off. A run with a summarized loop reports `unsupported`
+(`loop_summary_race_not_checked`) instead of `race_free`: its footprint verdict stands, race freedom
+is not checked.
+
 Once any record is present, a global access to an object without a record is a violation
 (`undeclared_object`). Every CTA is covered: with CTA class mode on, each class representative's
 access is checked once for every member unit, moved by that unit's offset (delta) of the object;

@@ -1377,7 +1377,8 @@ public:
   Executor(const Module &m, const Function &f, const FrontendConfig &c,
            std::function<void()> poll, SpecializationPurpose purpose)
       : m_(m), f_(f), c_(c), poll_(std::move(poll)), purpose_(purpose) {
-    path_facts_ = !c_.branch_overrides.empty();
+    // With branch choices, or when the input asks for them (path_conditions: true).
+    path_facts_ = !c_.branch_overrides.empty() || c_.raw.value("path_conditions", false);
     if (purpose_ == SpecializationPurpose::BranchScopeCapture ||
         purpose_ == SpecializationPurpose::VerificationWithBranchScope) {
       const auto choices = c_.raw.value("user_branch_decisions", Json::array());
@@ -2375,17 +2376,6 @@ const Executor::LoopPlan &Executor::PlanLoop(std::uint32_t pc) const {
   plan.ok = true;
   return loop_plans_.emplace(pc, std::move(plan)).first->second;
 }
-namespace {
-// [lower, upper] of an affine form over its atoms' bounds.
-std::pair<Integer, Integer> AffineHull(const AffineForm &f) {
-  Integer lo = f.constant, hi = f.constant;
-  for (const auto &[a, c] : f.terms) {
-    lo += c > 0 ? c * a.lower : c * a.upper;
-    hi += c > 0 ? c * a.upper : c * a.lower;
-  }
-  return {lo, hi};
-}
-}  // namespace
 std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan, std::uint32_t pc, State &s,
                                                             std::uint32_t warp, std::uint32_t lane,
                                                             std::uint64_t visit, LaneTrace &trace,
@@ -2448,8 +2438,11 @@ std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan
     const Scalar v = s.registers[r];
     const AffineForm at_k{Integer(0), {{k, c}}};
     const AffineForm at_t = AffineScale(trips, c);
-    const auto [kl, kh] = AffineHull(at_k);
-    const auto [ul, uh] = AffineHull(at_t);
+    // Ranges through AtomRange: a tensor element atom carries no bounds of its own.
+    const auto rk = AffineRange(at_k, s), rt = AffineRange(at_t, s);
+    if (!rk || !rt) continue;  // havocked
+    const auto [kl, kh] = *rk;
+    const auto [ul, uh] = *rt;
     const Scalar step_k = MakeBounded(kl, kh, "step:" + k.function + ":" + std::to_string(r), {}, at_k);
     const Scalar step_t = MakeBounded(ul, uh, "exit:" + k.function + ":" + std::to_string(r), {}, at_t);
     if (const auto fr = AffineOf(v)) {

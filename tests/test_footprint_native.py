@@ -241,6 +241,13 @@ class FootprintNativeTest(unittest.TestCase):
         statuses = [self.leaf_status(r) for _, r in self.tree("loop_chase")]
         self.assertTrue(any(isinstance(s, tuple) and s[1] != "contained" for s in statuses), statuses)
 
+    # Codex review of stage B: an exported induction variable (i == n >= 1 at exit, n a tensor-property
+    # element) guards a store past the extent; its exit range must come from the element's property.
+    def test_loop_exported_iv_guards_store_outside(self):
+        r = run("exit_iv", "loop_exit_iv")
+        self.assertEqual(r["frontend_assumptions"]["loop_summaries"], 32)
+        self.assertEqual(self.footprint(r)["writes"], "violated")
+
     def test_loop_rows_from_table_contained(self):
         for path, r in self.tree("loop_rows"):
             self.assertIn(self.leaf_status(r), [("contained", "contained"), "infeasible"], path)

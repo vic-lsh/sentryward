@@ -1597,7 +1597,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
       if (unit_restart) unit_plan.class_mode = false; // the per-unit attempt
       // Relational path conditions: facts name each lane's atoms, so a member's facts are not its
       // representative's shifted; runs with branch choices check every CTA.
-      if (!config.branch_overrides.empty()) unit_plan.class_mode = false;
+      if (!config.branch_overrides.empty() || config.raw.value("path_conditions", false)) unit_plan.class_mode = false;
       // Class mode's log budget, min(2 GiB, 10% of --rss-limit-mib).
       const std::uint64_t class_budget = std::min<std::uint64_t>(
           std::uint64_t(2) << 30, options.rss_mib ? *options.rss_mib * 1048576 / 10 : UINT64_MAX);

@@ -142,7 +142,7 @@ void TensorMaps(Json &root) {
 } // namespace
 
 KernelInput ParseKernelInput(const Json &value) {
-  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints", "footprint_reads"}, "$");
+  Object(value, {"schema", "entry", "launch", "arguments", "declarations", "shape_arrays", "tma_descriptors", "branch_decisions", "assumptions", "address_invariants", "data_branch_loop_iterations", "pointer_arrays", "tensor_properties", "footprints", "footprint_reads", "path_conditions"}, "$");
   if (value.value("schema", Json()) != "spverify.kernel-input/v1")
     Fail("invalid_schema", "$.schema", "expected spverify.kernel-input/v1");
   Json root = value;
