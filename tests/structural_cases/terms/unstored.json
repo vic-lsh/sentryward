@@ -1,0 +1,175 @@
+{
+ "schema": "sentryward.structural-term/v2",
+ "row": "test/unstored",
+ "template": "test/unstored",
+ "objects": [
+  {
+   "name": "a",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "b",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "c",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "y1",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "y2",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  }
+ ],
+ "inputs": [
+  "a",
+  "b",
+  "c"
+ ],
+ "nodes": [
+  {
+   "op": "q",
+   "atom": {
+    "kind": "opaque",
+    "roles": [
+     []
+    ]
+   },
+   "format": {
+    "compute": null,
+    "store": null
+   },
+   "args": [
+    {
+     "input": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": null
+  },
+  {
+   "op": "add",
+   "atom": {
+    "kind": "primitive",
+    "operation": "add",
+    "commutative": true
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "body": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    },
+    {
+     "input": 1,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "y1"
+  },
+  {
+   "op": "add",
+   "atom": {
+    "kind": "primitive",
+    "operation": "add",
+    "commutative": true
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "body": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    },
+    {
+     "input": 2,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "y2"
+  }
+ ]
+}

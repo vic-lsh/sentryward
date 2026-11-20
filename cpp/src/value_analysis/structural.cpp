@@ -620,7 +620,9 @@ class Checker {
                   const Json& where, Checker* boundary = nullptr) {
     const auto& tn = t_.nodes[m];
     if (tn.primitive) return;
-    std::optional<Set> through;
+    // Reached-through-transcendental sets: from the loads (input arguments: every path from the
+    // argument's loads, through producers too) and on the cut checker (body arguments).
+    std::optional<Set> through_in, through_cut;
     for (std::size_t k = 0; k < tn.args.size(); ++k) {
       if (tn.roles[k].empty()) continue;
       const auto& arg = tn.args[k];
@@ -634,7 +636,6 @@ class Checker {
           case RoleKind::ThroughTranscendental:
           case RoleKind::AvoidsTranscendental: {
             name = role == RoleKind::ThroughTranscendental ? "through_transcendental" : "avoids_transcendental";
-            Checker& on = boundary ? *boundary : *this;
             if (arg.body && (!boundary || !t_.nodes[arg.ref].out)) {
               auto d = where;
               d["argument"] = k;
@@ -642,7 +643,8 @@ class Checker {
               refuse("role_boundary", "a body argument's role needs its producer's output bound to a stored node", d);
             }
             const auto ek = arg.body ? argCut(m, k, at, r, c) : e;
-            if (!through) through = on.transLeaves(root);
+            auto& through = arg.body ? through_cut : through_in;
+            if (!through) through = arg.body ? boundary->transLeaves(root) : transLeaves(root);
             reached = *through;
             ok = role == RoleKind::ThroughTranscendental ? unite(reached, ek) == reached : disjoint(reached, ek);
             break;
@@ -961,6 +963,8 @@ class Checker {
               return !named.empty() ? named : elem == op_type ? std::string() : op_type;
             };
             const auto operands = g_.instanceOperands(x);
+            std::vector<std::pair<std::pair<std::size_t, std::uint64_t>, Key>> pending;
+            std::optional<std::pair<std::size_t, std::uint64_t>> conflict;
             const auto matches = [&](const v::Value& operand, std::size_t k) -> bool {
               const auto& a = tn.args[k];
               if (a.reads.size() != 1 || a.reads[0][0].kind == Index::All || a.reads[0][1].kind == Index::All || a.reads[0][1].kind == Index::Block)
@@ -1005,17 +1009,44 @@ class Checker {
                 return !y.conversion() && !z.conversion() && y.nodeId() == z.nodeId() &&
                        y.resultIndex() == z.resultIndex() && y.instanceIndex() == z.instanceIndex();
               }
-              // The cut: a value whose leaves are the inner node's operands at that element.
+              // The cut: a value whose leaves are the inner node's operands at that element. The
+              // inner node's element is one node of the graph: every use binds the same value.
               const auto at = a.reads[0];
               std::vector<SpacePattern> ps;
               for (const auto& q : patterns(t_, a.ref, false)) ps.push_back({q.space, compose(q.at, at)});
               if (leaves(y) != materialize(ps, r, c)) return false;
+              const auto elem = materialize({{t_.objects.size() + a.ref, at}}, r, c).front().begin & kElementMask;
+              const std::pair<std::size_t, std::uint64_t> slot_key{a.ref, elem};
+              const Key value{y.nodeId(), y.resultIndex(), y.instanceIndex()};
+              if (auto it = bound_.find(slot_key); it != bound_.end() && !(it->second == value)) {
+                conflict = slot_key;
+                return false;
+              }
+              pending.push_back({slot_key, value});
               checkRoles(a.ref, y, at, r, c, where);
               return true;
             };
-            if (!(matches(operands[0], 0) && matches(operands[1], 1)) &&
-                !(tn.commutative && matches(operands[1], 0) && matches(operands[0], 1)))
+            const auto attempt = [&](std::size_t i0, std::size_t i1) {
+              pending.clear();
+              return matches(operands[i0], 0) && matches(operands[i1], 1);
+            };
+            if (!attempt(0, 1) && !(tn.commutative && attempt(1, 0))) {
+              if (conflict) {
+                auto dc = d;
+                dc["inner_node"] = conflict->first;
+                dc["inner_element"] = conflict->second;
+                refuse("producer_binding", "an unstored inner node's element binds two values at two uses", dc);
+              }
               refuse("primitive_operands", "the primitive's operands are not the term's operands in their formats", d);
+            }
+            for (const auto& [k, v] : pending) {
+              if (auto [it, added] = bound_.emplace(k, v); !added && !(it->second == v)) {
+                auto dc = d;
+                dc["inner_node"] = k.first;
+                dc["inner_element"] = k.second;
+                refuse("producer_binding", "an unstored inner node's element binds two values at two uses", dc);
+              }
+            }
           } else {
             checkRoles(n, *slot, Pattern{Index{Index::Out, 0}, Index{Index::Out, 1}}, r, c, where,
                        has_body ? &cutter : nullptr);
@@ -1050,6 +1081,8 @@ class Checker {
   const UnitLifting* lifting_;
   ScalarSpecialization spec_;
   std::map<Key, std::uint64_t> stop_;
+  // Per unstored inner node and element: the one value its uses bind (`producer_binding`).
+  std::map<std::pair<std::size_t, std::uint64_t>, Key> bound_;
   std::map<Key, SetRef> memo_;
   std::map<Key, SetRef> trans_memo_;
   std::vector<std::string> foreign_;
