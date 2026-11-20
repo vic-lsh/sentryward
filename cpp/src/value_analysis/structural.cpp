@@ -1055,6 +1055,7 @@ class Checker {
       if (lifting_ && !cta) unsupported("writer_cta", "an output write without a writer CTA");
       by_cta[cta.value_or(0)].insert(e);
     });
+    outputs_complete_ = true;
     const auto class_mode = classMode(written, by_cta);
     Json nodes = Json::array();
     for (std::size_t n = 0; n < t_.nodes.size(); ++n) {
@@ -1302,6 +1303,7 @@ class Checker {
   // value its uses bind (`producer_binding`; identity and value). Read by the reference.
   std::map<std::size_t, std::vector<std::optional<v::Value>>> stored_;
   std::map<std::pair<std::size_t, std::uint64_t>, std::pair<std::string, v::Value>> bound_;
+  bool outputs_complete_ = false;  // stored_ holds every final output write
  private:
   std::vector<std::string> foreign_;
 };
@@ -1615,13 +1617,14 @@ class Reference {
 std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryEliminationResult& memory,
                                 const std::string& term_json, const UnitLifting* lifting, bool reference) {
   Json report{{"schema", "sentryward.structural-report/v1"}};
+  std::optional<Term> term;
+  std::optional<Checker> checker;
   try {
-    const auto term = parseTerm(Json::parse(term_json));
-    report["row"] = term.row;
+    term = parseTerm(Json::parse(term_json));
+    report["row"] = term->row;
     if (!memory.complete) unsupported("memory_elimination", "memory elimination is not complete");
-    Checker checker(graph, memory, term, lifting);
-    report.update(checker.run());
-    if (reference) report["reference"] = Reference(checker, graph, memory, term, lifting != nullptr).run();
+    checker.emplace(graph, memory, *term, lifting);
+    report.update(checker->run());
   } catch (const Stop& s) {
     report["result"] = s.result;
     report["reason"] = s.code;
@@ -1631,6 +1634,15 @@ std::string checkStructuralTerm(const value_ir::Graph& graph, const MemoryElimin
     report["result"] = "unsupported";
     report["reason"] = "term_or_internal";
     report["message"] = e.what();
+  }
+  // The reference also runs after a refusal (over the stored values and the bindings committed
+  // so far), so a test can compare refusals too; it never changes the result.
+  if (reference && checker && checker->outputs_complete_) {
+    try {
+      report["reference"] = Reference(*checker, graph, memory, *term, lifting != nullptr).run();
+    } catch (const std::exception& e) {
+      report["reference"] = {{"error", e.what()}};
+    }
   }
   return report.dump(1);
 }
