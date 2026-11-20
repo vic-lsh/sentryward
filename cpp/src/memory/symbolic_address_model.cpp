@@ -821,6 +821,18 @@ struct SymbolicAddressModel::Impl {
   // ---- Footprint containment ----
 
   // The interval of an affine offset over the declared atom bounds (nullopt when an atom is unbounded).
+  // An atom whose only constraint is its symbol's own bounds (both given).
+  bool BoxOnly(AtomId atom) const {
+    const auto& a = atoms[atom];
+    if (a.gather.empty() || pinned_gathers.contains(a.gather) || field_policies.contains(a.gather)) return false;
+    const auto p = gather_policies.find(a.gather);
+    if (p == gather_policies.end() || p->second.injective || !p->second.lower || !p->second.upper) return false;
+    for (const auto& bound : term_bounds)
+      for (const auto& [member, ignored] : bound.term.terms) { (void)ignored; if (member == atom) return false; }
+    for (const auto& group : joint_injective)
+      if (std::find(group.begin(), group.end(), a.gather) != group.end()) return false;
+    return true;
+  }
   std::optional<std::pair<Int, Int>> Hull(const Affine& offset) const {
     Int low = offset.constant, high = offset.constant;
     for (const auto& [atom, coefficient] : offset.terms) {
@@ -897,6 +909,25 @@ struct SymbolicAddressModel::Impl {
     // Interval arithmetic first: a hull inside [0, extent) needs no solver.
     if (hull && hull->first >= Int(lower) && hull->second + width <= Int(*extent)) {
       verdict.status = ContainmentVerdict::Status::kContained;
+      return verdict;
+    }
+    // Box-only atoms (bounded by their own symbol, which nothing else constrains: no injectivity,
+    // term bound, field or joint group): the environment is the box, so the hull is the range of
+    // the offset over it and decides the access without the solver. Path-condition atoms (one per
+    // lane visit) are of this kind, and a launch has many of them.
+    if (hull && std::all_of(offset.terms.begin(), offset.terms.end(),
+                            [&](const auto& term) { return BoxOnly(term.first); })) {
+      if (hull->first < Int(lower)) {
+        verdict.status = ContainmentVerdict::Status::kViolated;
+        verdict.side = "below_zero";
+        verdict.witness = "atom bounds, offset=" + ToString(hull->first);
+      } else if (hull->second + width > Int(*extent)) {
+        verdict.status = ContainmentVerdict::Status::kViolated;
+        verdict.side = "past_extent";
+        verdict.witness = "atom bounds, offset=" + ToString(hull->second);
+      } else {
+        verdict.status = ContainmentVerdict::Status::kContained;
+      }
       return verdict;
     }
     // The supremum and infimum of the symbolic part (offset without its constant) over the
