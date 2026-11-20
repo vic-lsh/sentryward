@@ -98,6 +98,26 @@ class ValueNativeTest(unittest.TestCase):
         self.assertEqual(sorted(approximate), ["ex2.approx.ftz.f32"])
         self.assertGreater(approximate["ex2.approx.ftz.f32"], 0)
 
+    # Configure with -DSENTRYWARD_TIMEOUT_TEST_HOOK=ON and set the same-named environment variable.
+    @unittest.skipUnless(os.environ.get("SENTRYWARD_TIMEOUT_TEST_HOOK"), "needs test-hook build")
+    def test_timeout_reports_approximate_instructions(self):
+        from unittest.mock import patch
+        from sentryward.frontend.ptx_native import _run_ptx
+        d = HERE / "sact"
+        captured = subprocess.run(
+            [sys.executable, "-m", "sentryward._capture_reference", str(d / "reference.py"),
+             str(d / "input.json"), str(d / "reference_binding.json")],
+            capture_output=True, check=True, timeout=120)
+        with patch.dict(os.environ, {"SENTRYWARD_TEST_HOLD_COMPARISON": "1"}):
+            r = _run_ptx(d / "k_sact_split_implicit_div.ptx", d / "input.json",
+                         reference=captured.stdout, reference_binding=d / "reference_binding.json",
+                         pipeline_timeout_seconds=20)
+        self.assertEqual(r["result"], "timeout")
+        self.assertEqual(r["internal"]["equivalence"]["stage"], "equivalence.object_comparison")
+        counts = r["internal"]["equivalence"]["approximate_instructions"]
+        self.assertEqual(sorted(counts), ["div.f32", "ex2.approx.ftz.f32"])
+        self.assertEqual(counts, {"div.f32": 512, "ex2.approx.ftz.f32": 512})
+
     def test_mixed_literal_signs_not_proven(self):
         r = run("sact", "k_sact_split_sm121a_mixed_sign")
         self.assertEqual(r["result"], "equivalence_not_proven")

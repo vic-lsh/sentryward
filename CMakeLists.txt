@@ -288,7 +288,11 @@ target_include_directories(sentryward_structural SYSTEM PRIVATE ${CMAKE_CURRENT_
 target_link_libraries(sentryward_structural PUBLIC sentryward::value_analysis)
 target_compile_options(sentryward_structural PRIVATE $<TARGET_PROPERTY:sentryward_algorithm,COMPILE_OPTIONS>)
 
+option(SENTRYWARD_TIMEOUT_TEST_HOOK "Enable the watchdog regression test hook" OFF)
 add_executable(sentryward-ptx cpp/src/frontend/ptx/run.cpp)
+if(SENTRYWARD_TIMEOUT_TEST_HOOK)
+  target_compile_definitions(sentryward-ptx PRIVATE SENTRYWARD_TIMEOUT_TEST_HOOK)
+endif()
 target_include_directories(sentryward-ptx PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(sentryward-ptx PRIVATE sentryward_ptx sentryward::value_analysis sentryward_reference_guided sentryward_structural)
 

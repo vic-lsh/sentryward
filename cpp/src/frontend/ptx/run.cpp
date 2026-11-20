@@ -2411,6 +2411,11 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         monitor.ApproximateInstructions(input_metadata.value("frontend_assumptions", Json::object())
             .value("approximate_instructions", Json::object()));
         monitor.Stage("equivalence.object_comparison");
+#ifdef SENTRYWARD_TIMEOUT_TEST_HOOK
+        // Hold the real comparison boundary so the watchdog emits its timeout report.
+        if (std::getenv("SENTRYWARD_TEST_HOLD_COMPARISON"))
+          std::this_thread::sleep_for(std::chrono::seconds(60));
+#endif
         const auto started = Clock::now();
         rg::ContextBuilder context;
         context = [&](rg::Arena&, const Json& mapping,
