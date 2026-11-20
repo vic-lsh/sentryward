@@ -43,12 +43,12 @@ __global__ void k_and(const uint32_t* hdr, uint32_t* out) {
   if (s >= 8 && !last) return;
   out[s] = 1;
 }
-// A1 mask: n <= 15 (premise) gives n & -8 in {0, 8}... with out of 16 elements: n & -8 <= 8.
+// Mask: n <= 15 (premise) gives n & -8 <= 8, inside 16 elements (interval rule for -2^m masks).
 __global__ void k_mask(const uint32_t* hdr, uint32_t* out16) {
   const uint32_t n = hdr[0];
   out16[n & 0xFFFFFFF8u] = 1;
 }
-// Control: n & -7 is not a low-bit mask: unknown, not contained.
+// Control: with n <= 63, n & ~6 reaches 57, past the 16 elements.
 __global__ void k_mask_odd(const uint32_t* hdr, uint32_t* out16) {
   const uint32_t n = hdr[0];
   out16[n & 0xFFFFFFF9u] = 1;

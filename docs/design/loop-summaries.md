@@ -293,3 +293,31 @@ Stage B:
 Constrained accesses go to Z3 with exact integer `mod` (slower than the hull); no family or CTA-class
 aggregation for them. Stage A lands first (its own review of the implementation, its controls, the
 Coral rows rerun), then stage B. Expect several days of fork work in total.
+
+## Re-check 3 (U1..U6) and stage A as implemented
+
+- U1 (P0, stage A): a `setp` with a Boolean modifier (`setp.lt.and p|q, a, b, c`) gets no predicate
+  term (only the plain form does); a control covers it in the implementation review.
+- U2 (P0, stage B): B4 executes the iteration CFG in its concrete order for each shape (post-test:
+  body before the test-block prefix); a control writes, in the post-test prefix, a register the body
+  read. To be written into B4 before stage B starts.
+- U3 (P0 conditional): the consumer establishes immutability of each reported object for the whole
+  launch independently (Coral: the image is metadata the monitor checks before the step and no
+  kernel writes; a read-only footprint declaration alone does not discharge it).
+- U4 (P1, stage B): mask definitions of an IV inside a summarized iteration are local facts.
+- U5 (P1): the consumer requires `reads == contained` (Coral's `check_verdicts.py` already does:
+  both halves contained), so the `noninterference` read mode cannot pass an outside read.
+- U6 (P2): a satisfiable query is a potential violation with a symbolic witness.
+
+Stage A implementation choices (fork commit after 798dcbb):
+- Facts on ONE atom with a lane identity are not invariants: they tighten that atom's interval
+  (the lane keeps the tightest version per atom and replaces it in every register holding it), so
+  the address model still decides such accesses by the hull. Facts over two or more atoms become
+  term invariants (`address_invariants` `term` with bounds), written with the tightest atoms.
+- The address model propagates bounds over term invariants (interval fixpoint), so the footprint
+  hull and the declared-pieces check see relational facts; a single-row piece contains any hull
+  inside it.
+- An unsigned ordering of a value just below zero (`w - 1` with `w >= 0`) against a known `c` is
+  exact as `0 <= v < c` (or `v > c || v < 0`) when every negative value wraps above `c`.
+- Choice runs execute lane by lane with class mode off (lane atoms are per lane); k_feed's leaf
+  takes about 95 s (was about 5 s).

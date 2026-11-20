@@ -48,7 +48,7 @@ CASES = {
     "path_or": inp("k_or", 32, taken=False),
     "path_and": inp("k_and", 32, taken=False),
     "path_mask": inp("k_mask", 64, premise=(0, 15)),
-    "path_mask_odd": inp("k_mask_odd", 64, premise=(0, 15)),
+    "path_mask_odd": inp("k_mask_odd", 64, premise=(0, 63)),
 }
 for name, d in CASES.items():
     (HERE / "inputs" / f"{name}.json").write_text(json.dumps(d, indent=1) + "\n")

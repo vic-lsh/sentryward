@@ -62,6 +62,8 @@ struct Piece {
     const auto top = std::int64_t(base + (rows <= 1 || stride == 0 ? (rows ? (count - 1) * (count > 1 ? period : width) + width : 0)
                                                                    : rows * stride));
     if (rows == 0 || high <= std::int64_t(base) || low >= top) return Rows3::kOut;
+    // One row of one run: the piece is the contiguous bytes [base, top), so a hull inside them is in.
+    if (rows <= 1 && count <= 1 && low >= std::int64_t(base) && high <= top) return Rows3::kIn;
     if (rows <= 1 || stride == 0 || gcd == 0 || gcd % stride != 0 || stride < RowBytes()) return Rows3::kUnknown;
     if (low < std::int64_t(base) || high > top) return Rows3::kUnknown;
     const auto s = std::int64_t(stride);

@@ -182,11 +182,11 @@ class FootprintNativeTest(unittest.TestCase):
     def test_path_and_pred_not_taken_bounds_neither(self):
         self.assertNotEqual(self.writes("path_and"), "contained")
 
-    def test_path_low_bit_mask_quotient(self):
+    def test_path_low_bit_mask_inside(self):
         self.assertEqual(self.writes("path_mask"), "contained")
 
-    def test_path_other_mask_unknown(self):
-        self.assertNotEqual(self.writes("path_mask_odd"), "contained")
+    def test_path_other_mask_past_the_end_refused(self):
+        self.assertEqual(self.writes("path_mask_odd"), "violated")
 
 if __name__ == "__main__":
     unittest.main()

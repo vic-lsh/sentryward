@@ -80,7 +80,7 @@
    "object": "hdr",
    "element_type": "u32",
    "property": "upper_bound",
-   "value": 15,
+   "value": 63,
    "field": {
     "offset": 0,
     "stride": 4,

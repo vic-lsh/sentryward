@@ -7,8 +7,6 @@
 #include "sentryward/algorithm/diagnostics/performance_profile.h"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <bit>
 #include <cctype>
 #include <cmath>
@@ -1205,13 +1203,38 @@ PredTermRef CompareTerm(const Instruction &i, std::string relation, const Scalar
   const bool exact = In(relation, {"eq", "ne"})
       ? (fits(left, false) && fits(right, false)) || (fits(left, true) && fits(right, true))
       : fits(left, sign) && fits(right, sign);
-  if (!exact) return nullptr;
+  if (!exact) {
+    // An unsigned ordering of v against a known c, where v's exact value lies in [L, U] with
+    // -2^width <= L < 0 <= U < 2^width (a value just below zero, such as w - 1 with w >= 0): the
+    // residue of a negative v is 2^width + v >= 2^width + L. When c < 2^width + L, every negative v
+    // reads above c, so `v <u c` is exactly 0 <= v < c and `v >u c` exactly v > c or v < 0.
+    if (sign || bits) return nullptr;
+    const bool c_right = ScalarInteger(right).has_value();
+    const Scalar &var = c_right ? left : right;
+    const auto c = ScalarInteger(c_right ? right : left);
+    const auto *b = std::get_if<BoundedInteger>(&var);
+    if (!c || !b || !(*b)->affine) return nullptr;
+    const Integer modulus = Integer(1) << width, L = (*b)->lower, U = (*b)->upper;
+    if (!(L >= -modulus && L < 0 && U >= 0 && U < modulus && *c >= 0 && *c < modulus + L - 1)) return nullptr;
+    // Normalize to v REL c.
+    std::string rel = relation;
+    if (!c_right) rel = rel == "lt" ? "gt" : rel == "le" ? "ge" : rel == "gt" ? "lt" : "le";
+    const AffineForm v = *(*b)->affine, k{*c, {}}, zero{Integer(0), {}};
+    const auto cmp = [](std::string r, AffineForm x, AffineForm y) {
+      return std::make_shared<const PredTerm>(PredTerm{PredTerm::Kind::Compare, std::move(r), std::move(x), std::move(y), nullptr, nullptr});
+    };
+    if (rel == "lt" || rel == "le") return JoinTerm(PredTerm::Kind::And, cmp("ge", v, zero), cmp(rel, v, k));
+    return JoinTerm(PredTerm::Kind::Or, cmp(rel, v, k), cmp("lt", v, zero));
+  }
   return std::make_shared<const PredTerm>(PredTerm{PredTerm::Kind::Compare, relation, *fl, *fr, nullptr, nullptr});
 }
 struct State {
   std::vector<Scalar> registers;
   // The predicate term of each predicate register that holds an unknown with a known meaning.
   std::map<std::uint32_t, PredTermRef> pred_terms;
+  // The tightest bounds this lane's facts give each atom, by atom function identity (lane atoms
+  // and path atoms are per lane visit, so the identity names one value).
+  std::map<std::string, ElementAtom> tight_atoms;
   std::vector<std::optional<DynamicKey>> origins;
   std::vector<std::uint64_t> occurrences, branch_visits;
   std::map<std::string, std::uint64_t> backedges;
@@ -2054,17 +2077,93 @@ void Literals(const PredTermRef &t, bool truth, std::vector<std::pair<std::strin
   }
 }
 }  // namespace
-void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace) const {
+// Replaces `from` by `to` (the same atom with tighter bounds) in the lane's integer registers,
+// recomputing each affected value's interval from its affine form.
+void TightenAtom(const ElementAtom &from, const ElementAtom &to, State &s) {
+  const auto same = [&](const ElementAtom &a) {
+    return a.object == from.object && a.element_type == from.element_type && a.byte_offset == from.byte_offset &&
+           a.function == from.function;
+  };
+  for (auto &reg : s.registers) {
+    const auto *b = std::get_if<BoundedInteger>(&reg);
+    if (!b || !(*b)->affine) continue;
+    const auto &form = *(*b)->affine;
+    if (std::none_of(form.terms.begin(), form.terms.end(), [&](const auto &t) { return same(t.first); })) continue;
+    AffineForm next{form.constant, {}};
+    Integer lower = form.constant, upper = form.constant;
+    for (const auto &[a, c] : form.terms) {
+      const auto &atom = same(a) ? to : a;
+      next.terms.emplace_back(atom, c);
+      lower += c > 0 ? c * atom.lower : c * atom.upper;
+      upper += c > 0 ? c * atom.upper : c * atom.lower;
+    }
+    auto value = *b->value;
+    value.lower = std::max(value.lower, lower);
+    value.upper = std::min(value.upper, upper);
+    value.affine = std::move(next);
+    reg = BoundedInteger{std::make_shared<const BoundedValue>(std::move(value))};
+  }
+}
+void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State &cs, LaneTrace &trace) const {
+  auto &s = const_cast<State &>(cs);
   const auto found = s.pred_terms.find(predicate);
-  if (const char *dbg = std::getenv("SW_DEBUG_FACTS")) if (FILE *f = std::fopen(dbg, "a")) { std::fprintf(f, "facts: pred %u term %d terms %zu\n", predicate, found != s.pred_terms.end(), s.pred_terms.size()); std::fclose(f); }
   if (found == s.pred_terms.end()) return;
   std::vector<std::pair<std::string, const PredTerm *>> literals;
   Literals(found->second, truth, literals);
+  // Each atom at the tightest bounds the lane knows (function atoms only carry lane facts).
+  const auto current = [&](const AffineForm &form) {
+    AffineForm out{form.constant, {}};
+    for (const auto &[a, c] : form.terms) {
+      const auto t = a.function.empty() ? s.tight_atoms.end() : s.tight_atoms.find(a.function);
+      out.terms.emplace_back(t == s.tight_atoms.end() ? a : t->second, c);
+    }
+    return out;
+  };
+  const auto fdiv = [](const Integer &x, const Integer &y) {
+    Integer q = x / y;
+    if (x % y != 0 && ((x < 0) != (y < 0))) --q;
+    return q;
+  };
+  std::vector<std::tuple<std::string, AffineForm>> relational;
+  // Pass 1: single-atom literals tighten their atom (carried by the atom itself: every register
+  // holding it is updated, so pointer arithmetic on a guarded index stays bounded and the address
+  // model keeps it a box atom decided by its hull). ne is a disjunction: no fact.
   for (const auto &[relation, term] : literals) {
-    // left - right in a bound (ne is a disjunction: no fact).
-    const auto difference = AffineSum(term->left, term->right, Integer(-1));
-    if (difference.terms.empty() || relation == "ne") continue;
-    const auto json = FactTermJson(difference);
+    if (relation == "ne") continue;
+    const auto difference = current(AffineSum(term->left, term->right, Integer(-1)));
+    if (difference.terms.empty()) continue;
+    if (difference.terms.size() > 1) { relational.emplace_back(relation, difference); continue; }
+    const auto &[atom, k] = difference.terms.front();
+    if (atom.function.empty()) { relational.emplace_back(relation, difference); continue; }
+    // k a + c REL 0 -> k a in [lo, hi].
+    std::optional<Integer> lo, hi;
+    const Integer c = difference.constant;
+    if (relation == "eq") { lo = -c; hi = -c; }
+    else if (relation == "lt") hi = -c - 1;
+    else if (relation == "le") hi = -c;
+    else if (relation == "gt") lo = -c + 1;
+    else lo = -c;
+    std::optional<Integer> alo, ahi;
+    if (k > 0) { if (lo) alo = -fdiv(-*lo, k); if (hi) ahi = fdiv(*hi, k); }
+    else { if (hi) alo = -fdiv(-*hi, k); if (lo) ahi = fdiv(*lo, k); }
+    ElementAtom tight = atom;
+    if (alo && *alo > tight.lower) tight.lower = *alo;
+    if (ahi && *ahi < tight.upper) tight.upper = *ahi;
+    if (tight.lower > tight.upper) {
+      // Contradictory choices on this lane: keep the fact as an invariant, so the model's
+      // consistency check reports the path infeasible (never a pass).
+      relational.emplace_back(relation, difference);
+      continue;
+    }
+    if (!(tight == atom)) {
+      s.tight_atoms[tight.function] = tight;
+      TightenAtom(atom, tight, s);
+    }
+  }
+  // Pass 2: facts over two or more atoms (or over atoms that carry no lane identity) are global
+  // invariants, written with the tightest atoms.
+  for (auto &[relation, difference] : relational) {
+    const auto json = FactTermJson(current(difference));
     if (!json) continue;
     Json fact{{"term", *json}};
     if (relation == "eq") { fact["lower_bound"] = 0; fact["upper_bound"] = 0; }
@@ -3979,7 +4078,6 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
         Error(i, warp.warp_id, lane,
               "known predicate disagrees with fixed-input branch contract");
       auto taken = supplied ? supplied : predicate;
-      if (const char *dbg = std::getenv("SW_DEBUG_FACTS")) if (FILE *f = std::fopen(dbg, "a")) { std::fprintf(f, "branch line %u override %d bound %d pred %d facts %d\n", unsigned(i.line), bool(override), bool(bound), bool(predicate), path_facts_); std::fclose(f); }
       if (override && !bound && !predicate && d.predicate != kMissing && taken) {
         RefineGuard(pc, d.predicate, *taken != i.predicate_negated, state, warp.warp_id, lane, visit);
         if (path_facts_) RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace);
