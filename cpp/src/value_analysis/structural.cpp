@@ -1514,7 +1514,8 @@ class Reference {
         if (memo[i] >= 0) return memo[i];
         bool hit = src[i];
         for (const auto j : ns[i].succ) hit = go(j) || hit;
-        return memo[i] = hit;
+        memo[i] = hit;
+        return hit;
       };
       std::vector<char> row(n);
       for (std::size_t i = 0; i < n; ++i) row[i] = go(i);
@@ -1546,7 +1547,8 @@ class Reference {
           if (lm[i] >= 0) return lm[i];
           bool h = ns[i].initial;
           for (const auto j : ns[i].succ) h = lv(j) || h;
-          return lm[i] = h;
+          lm[i] = h;
+          return h;
         };
         for (std::size_t i = 0; i < n; ++i) live[i] = lv(i);
         for (const auto& row : reach)
@@ -1590,7 +1592,8 @@ class Reference {
             bool h = ns[i].initial && contains(ns[i].reads, elements[ei]);
             for (std::size_t q = 0; q < ns[i].succ.size(); ++q)
               if (!guard(i, q)) h = ug(ns[i].succ[q]) || h;
-            return um[i] = h;
+            um[i] = h;
+            return h;
           };
           if (ug(0)) return "fails";
         }
