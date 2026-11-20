@@ -1,0 +1,661 @@
+//
+// Partial-operand controls (tests/test_structural_native.py; emitted by a script, kept as text).
+// Each kernel stores p = a + b, reloads p at full width as u32, applies one operation and stores
+// its bits as y. Term pack: P(a, b) -> p, C(p) -> y. A kernel whose operation uses only part of
+// p's bits must be refused (partial_operand); _full kernels use every bit and match;
+// partial_stored_half reads p's low half from memory (partial_stored_read).
+//
+
+.version 8.8
+.target sm_90a
+.address_size 64
+
+// partial_and_mask: the round-6 reproducer: and with 0xffff keeps p's low half
+.visible .entry partial_and_mask(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	and.b32 %r3, %r2, 65535;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_or_mask: or with 0xffff0000 forces the high half
+.visible .entry partial_or_mask(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	or.b32 %r3, %r2, 4294901760;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_xor_full: positive: xor with a constant uses every bit
+.visible .entry partial_xor_full(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	xor.b32 %r3, %r2, 2147483648;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_shl: shl by 16 drops the high half
+.visible .entry partial_shl(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shl.b32 %r3, %r2, 16;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_shr_u: shr.u by 16 drops the low half
+.visible .entry partial_shr_u(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shr.u32 %r3, %r2, 16;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_shr_s_past: shr.s past the width keeps only the sign
+.visible .entry partial_shr_s_past(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shr.s32 %r3, %r2, 40;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_shift_mixed: shl 8 then shr 8 clears the top byte
+.visible .entry partial_shift_mixed(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shl.b32 %r4, %r2, 8;
+	shr.u32 %r3, %r4, 8;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_bfe: bfe of 16 bits at 4
+.visible .entry partial_bfe(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	bfe.u32 %r3, %r2, 4, 16;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_bfi: bfi inserts p's low 16 bits
+.visible .entry partial_bfi(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	bfi.b32 %r3, %r2, 0, 16, 16;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_prmt: prmt 0x1010 selects bytes 0 and 1 twice
+.visible .entry partial_prmt(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	prmt.b32 %r3, %r2, 0, 4112;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_prmt_full: positive: prmt 0x3210 is the identity
+.visible .entry partial_prmt_full(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	prmt.b32 %r3, %r2, 0, 12816;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_lop3: lop3 table 0xc0 (a & b) with b = 0xffff
+.visible .entry partial_lop3(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	lop3.b32 %r3, %r2, 65535, 0, 192;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_lop3_full: positive: lop3 table 0x3c (a ^ b) uses every bit
+.visible .entry partial_lop3_full(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	lop3.b32 %r3, %r2, 4660, 0, 60;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_shf: shf.l by 16 keeps p's low half
+.visible .entry partial_shf(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shf.l.wrap.b32 %r3, 0, %r2, 16;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_cvt_narrow: cvt.u16.u32 truncates
+.visible .entry partial_cvt_narrow(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	cvt.u16.u32 %h1, %r2;
+	cvt.u32.u16 %r3, %h1;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_unpack: mov.b32 unpack, the low half used
+.visible .entry partial_unpack(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 {%h1, %h2}, %r2;
+	cvt.u32.u16 %r3, %h1;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_copysign: copysign(p, 1.0): p's sign only
+.visible .entry partial_copysign(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %f5, %r2;
+	copysign.f32 %f6, %f5, 0f3F800000;
+	mov.b32 %r3, %f6;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_selp_narrow: selp on a truncated value (its condition on the same)
+.visible .entry partial_selp_narrow(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	cvt.u16.u32 %h1, %r2;
+	setp.ne.u16 %q1, %h1, 0;
+	selp.b16 %h2, %h1, 0, %q1;
+	cvt.u32.u16 %r3, %h2;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_abs: float abs drops the sign
+.visible .entry partial_abs(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %f5, %r2;
+	abs.f32 %f6, %f5;
+	mov.b32 %r3, %f6;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_mul_even: an integer product with 2^16 drops the high half
+.visible .entry partial_mul_even(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mul.lo.u32 %r3, %r2, 65536;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_stored_half: a read of p's low half (partial_stored_read)
+.visible .entry partial_stored_half(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	ld.global.u16 %h1, [%rd8];
+	cvt.u32.u16 %r3, %h1;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_data_mask: p & (p ^ 1): a mask that is data, undecided
+.visible .entry partial_data_mask(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	xor.b32 %r5, %r2, 1;
+	and.b32 %r3, %r2, %r5;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}

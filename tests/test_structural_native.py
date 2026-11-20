@@ -25,13 +25,13 @@ IR = os.environ.get("SENTRYWARD_STRUCTURAL_IR") or (
     str(Path(NATIVE).parent / "sentryward-structural-ir-controls") if NATIVE else None)
 
 
-def run(entry, term, ptx="roles"):
+def run(entry, term, ptx="roles", reference=False):
     with tempfile.TemporaryDirectory() as tmp:
         report = Path(tmp) / "report.json"
         subprocess.run([NATIVE, "--ptx", str(HERE / "ptx" / f"{ptx}.ptx"), "--config",
                         str(HERE / "inputs" / f"{entry}.json"), "--analyze-scalar-fold",
                         "--structural-term", str(HERE / "terms" / f"{term}.json"),
-                        "--structural-report", str(report)],
+                        "--structural-report", str(report)] + (["--structural-reference"] if reference else []),
                        capture_output=True, text=True, check=False, timeout=300)
         return json.loads(report.read_text())
 
@@ -111,6 +111,34 @@ class StructuralNativeTest(unittest.TestCase):
         # partial read alone is control partial_stored_half (partial.ptx).
         r = run("pack", "pack", "pack")
         self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"))
+
+    # Partial-operand controls (ptx/partial.ptx): p = a + b stored, reloaded at full width, one
+    # operation, its bits stored as y; term P(a, b) -> p, C(p) -> y. Every negative matched at
+    # 7b4673b (before partial_operand); the reference there was undecided (it did not follow a
+    # same-width reload of a stored value) and now refutes each by its own rule.
+    PARTIAL = ["and_mask", "or_mask", "shl", "shr_u", "shr_s_past", "shift_mixed", "bfe", "bfi", "prmt", "lop3",
+               "shf", "cvt_narrow", "unpack", "copysign", "selp_narrow", "abs", "mul_even", "data_mask"]
+    FULL = ["xor_full", "prmt_full", "lop3_full"]
+
+    def test_partial_operands_refused_by_checker_and_reference(self):
+        for name in self.PARTIAL:
+            r = run(f"partial_{name}", "pack", "partial", reference=True)
+            self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"), name)
+            leaves = r["reference"]["leaves"]
+            self.assertGreater(len(leaves["fails"]), 0, name)  # the reference's own rule refutes it
+            self.assertEqual(leaves["undecided"], [], name)
+
+    def test_full_operands_match(self):
+        for name in self.FULL:
+            r = run(f"partial_{name}", "pack", "partial", reference=True)
+            self.assertEqual(r["result"], "matched", name)
+            ref = r["reference"]
+            self.assertEqual([ref[s]["fails"] + ref[s]["undecided"] for s in ("leaves", "cuts")], [[], []], name)
+
+    def test_partial_stored_read_refused(self):
+        # p = a + b stored, its low half read back as u16 (memory, not registers).
+        r = run("partial_stored_half", "pack", "partial")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "partial_stored_read"))
 
     def test_product_with_zero_refused(self):
         # Round-5 reproducer: y = a * b + 0 * ex2(a) is not a path from a through ex2.
