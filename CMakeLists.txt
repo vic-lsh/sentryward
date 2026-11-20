@@ -291,6 +291,9 @@ target_compile_options(sentryward_structural PRIVATE $<TARGET_PROPERTY:sentrywar
 add_executable(sentryward-ptx cpp/src/frontend/ptx/run.cpp)
 target_include_directories(sentryward-ptx PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_link_libraries(sentryward-ptx PRIVATE sentryward_ptx sentryward::value_analysis sentryward_reference_guided sentryward_structural)
+# Structural mode's IR-level identity controls (tests only; built on request, not by `all`).
+add_executable(sentryward-structural-ir-controls EXCLUDE_FROM_ALL tests/structural_cases/ir/index_controls.cpp)
+target_link_libraries(sentryward-structural-ir-controls PRIVATE sentryward_structural)
 
 # Python wheels (scikit-build-core) carry the verifier and configuration
 # inside the package; sentryward/_paths.py resolves them there.

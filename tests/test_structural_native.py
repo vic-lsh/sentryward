@@ -19,6 +19,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent / "structural_cases"
 NATIVE = os.environ.get("SENTRYWARD_PTX_NATIVE")
+# The IR-level controls (structural_cases/ir/index_controls.cpp, target
+# sentryward-structural-ir-controls, built on request): SENTRYWARD_STRUCTURAL_IR, else next to NATIVE.
+IR = os.environ.get("SENTRYWARD_STRUCTURAL_IR") or (
+    str(Path(NATIVE).parent / "sentryward-structural-ir-controls") if NATIVE else None)
 
 
 def run(entry, term, ptx="roles"):
@@ -133,6 +137,29 @@ class StructuralNativeTest(unittest.TestCase):
         # and with 0x7fffffff (|ex2(a)|) keeps the path: the dead-edge rule is not a blanket refusal.
         self.assertEqual(run("live_and", "silu_mul", "dead_paths")["result"], "matched")
 
+
+def run_ir(case, polarity):
+    out = subprocess.run([IR, case, polarity], capture_output=True, text=True, check=True, timeout=60).stdout
+    return json.loads(out)
+
+
+@unittest.skipUnless(IR and Path(IR).exists(), "sentryward-structural-ir-controls is not built")
+class StructuralIrIndexTest(unittest.TestCase):
+    """Pairs that differ only in one value's index (structural_cases/ir/index_controls.cpp)."""
+
+    def check(self, case, reason):
+        self.assertEqual(run_ir(case, "positive")["result"], "matched")
+        r = run_ir(case, "negative")
+        self.assertEqual((r["result"], r["reason"]), ("refused", reason))
+
+    def test_cut_identity_by_index(self):
+        self.check("factorization", "factorization")
+
+    def test_stored_operand_identity_by_index(self):
+        self.check("operand", "primitive_operands")
+
+    def test_producer_binding_identity_by_index(self):
+        self.check("binding", "producer_binding")
 
 
 if __name__ == "__main__":
