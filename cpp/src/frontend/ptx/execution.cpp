@@ -3229,11 +3229,20 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
       return found == s.pred_terms.end() ? nullptr : found->second;
     };
     const auto ta = term(1), tb = term(2);
+    // A known operand of an unknown result is the identity of the operation (true for and, false
+    // for or; otherwise the result would be known), so the result is the other operand.
+    const bool ka = !Unknown(val(1)), kb = !Unknown(val(2));
     Set(d, s, {value});
-    if (path_facts_ && Unknown(value) && op != "xor" && ta && tb && !d.destination_slots.empty() &&
-        d.destination_slots[0] != kMissing)
-      s.pred_terms[d.destination_slots[0]] =
-          JoinTerm(op == "and" ? PredTerm::Kind::And : PredTerm::Kind::Or, ta, tb);
+    if (path_facts_ && Unknown(value) && op != "xor" && !d.destination_slots.empty() &&
+        d.destination_slots[0] != kMissing) {
+      if (ta && tb)
+        s.pred_terms[d.destination_slots[0]] =
+            JoinTerm(op == "and" ? PredTerm::Kind::And : PredTerm::Kind::Or, ta, tb);
+      else if (ta && kb)
+        s.pred_terms[d.destination_slots[0]] = ta;
+      else if (tb && ka)
+        s.pred_terms[d.destination_slots[0]] = tb;
+    }
     return;
   }
   if (op == "mul" && n > 2) {

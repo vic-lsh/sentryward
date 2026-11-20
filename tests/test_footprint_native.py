@@ -179,6 +179,12 @@ class FootprintNativeTest(unittest.TestCase):
     def test_path_or_pred_not_taken_bounds_both(self):
         self.assertEqual(self.writes("path_or"), "contained")
 
+    def test_path_or_pred_with_known_operand(self):
+        self.assertEqual(self.writes("path_or_known"), "contained")
+
+    def test_path_or_pred_with_known_operand_off_by_one_refused(self):
+        self.assertEqual(self.writes("path_or_known_past"), "violated")
+
     def test_path_and_pred_not_taken_bounds_neither(self):
         self.assertNotEqual(self.writes("path_and"), "contained")
 

@@ -18,13 +18,13 @@ def piece(n, direction):
     return {"base": 0, "rows": 1, "stride": n, "period": n, "count": 1, "width": n, "direction": direction}
 
 
-def inp(entry, out_bytes, taken=None, premise=None):
+def inp(entry, out_bytes, taken=None, premise=None, z=None):
     d = {
         "schema": "spverify.kernel-input/v1", "entry": entry,
         "launch": {"grid_dim": [1, 1, 1], "block_dim": [32, 1, 1], "dynamic_shared_bytes": 0},
         "declarations": [{"parameter": 0, "type": "pointer", "space": "global", "object": "hdr"},
                          {"parameter": 1, "type": "pointer", "space": "global", "object": "out"}],
-        "arguments": [],
+        "arguments": [] if z is None else [{"parameter": 2, "type": "u32", "value": z}],
         "footprints": [{"object": "hdr", "direction": "read", "extent_bytes": 8, "pieces": [piece(8, "read")]},
                        {"object": "out", "direction": "write", "extent_bytes": out_bytes, "pieces": [piece(out_bytes, "write")]}],
         "footprint_reads": "noninterference",
@@ -47,6 +47,8 @@ CASES = {
     "path_two_past": inp("k_two_past", 32, taken=False),
     "path_or": inp("k_or", 32, taken=False),
     "path_and": inp("k_and", 32, taken=False),
+    "path_or_known": inp("k_or_known", 32, taken=False, z=0),
+    "path_or_known_past": inp("k_or_known_past", 32, taken=False, z=0),
     "path_mask": inp("k_mask", 64, premise=(0, 15)),
     "path_mask_odd": inp("k_mask_odd", 64, premise=(0, 63)),
 }
