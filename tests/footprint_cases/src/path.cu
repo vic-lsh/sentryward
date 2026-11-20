@@ -66,4 +66,11 @@ __global__ void k_or_known_past(const uint32_t* hdr, uint32_t* out, uint32_t z) 
   if (s >= 9 || z != 0) return;
   out[s] = 1;
 }
+// Control (review P0: wrapped equality): v = w - 1 can be -1 (w = 0); its 16-bit residue 0xffff
+// is not 0, so the not-taken path of (u16)v == 0 includes v = -1: out[v] reads before out.
+__global__ void k_eq16_wrapped(const uint16_t* hdr16, uint32_t* out) {
+  const int v = (int)hdr16[0] - 1;
+  if ((uint16_t)v == 0) return;
+  out[v] = 1;
+}
 }

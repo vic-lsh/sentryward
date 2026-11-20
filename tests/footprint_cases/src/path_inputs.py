@@ -49,6 +49,7 @@ CASES = {
     "path_and": inp("k_and", 32, taken=False),
     "path_or_known": inp("k_or_known", 32, taken=False, z=0),
     "path_or_known_past": inp("k_or_known_past", 32, taken=False, z=0),
+    "path_eq16_wrapped": inp("k_eq16_wrapped", 262144, taken=False),
     "path_mask": inp("k_mask", 64, premise=(0, 15)),
     "path_mask_odd": inp("k_mask_odd", 64, premise=(0, 63)),
 }

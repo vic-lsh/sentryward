@@ -1208,7 +1208,7 @@ PredTermRef CompareTerm(const Instruction &i, std::string relation, const Scalar
     // -2^width <= L < 0 <= U < 2^width (a value just below zero, such as w - 1 with w >= 0): the
     // residue of a negative v is 2^width + v >= 2^width + L. When c < 2^width + L, every negative v
     // reads above c, so `v <u c` is exactly 0 <= v < c and `v >u c` exactly v > c or v < 0.
-    if (sign || bits) return nullptr;
+    if (sign || bits || !In(relation, {"lt", "le", "gt", "ge"})) return nullptr;
     const bool c_right = ScalarInteger(right).has_value();
     const Scalar &var = c_right ? left : right;
     const auto c = ScalarInteger(c_right ? right : left);

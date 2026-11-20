@@ -213,6 +213,17 @@ struct SymbolicAddressModel::Impl {
       return q;
     };
     const auto ceil_div = [&](const Int& a, const Int& b) { return -floor_div(-a, b); };
+    // Checked __int128 arithmetic: a deduction whose intermediate overflows is abandoned.
+    const auto mul = [](const Int& a, const Int& b) -> std::optional<Int> {
+      Int r;
+      if (__builtin_mul_overflow(a, b, &r)) return std::nullopt;
+      return r;
+    };
+    const auto plus = [](const Int& a, const Int& b) -> std::optional<Int> {
+      Int r;
+      if (__builtin_add_overflow(a, b, &r)) return std::nullopt;
+      return r;
+    };
     for (int round = 0; round < kRounds; ++round) {
       bool changed = false;
       for (const auto& bound : term_bounds) {
@@ -225,15 +236,15 @@ struct SymbolicAddressModel::Impl {
             const auto [l, u] = BoundsOf(terms[i].first);
             const auto& k = terms[i].second;
             const auto add = [&](std::optional<Int>& acc, const std::optional<Int>& v) {
-              if (acc && v) *acc += *v; else acc.reset();
+              acc = acc && v ? plus(*acc, *v) : std::nullopt;
             };
-            add(lo, k > 0 ? (l ? std::optional<Int>(k * *l) : std::nullopt) : (u ? std::optional<Int>(k * *u) : std::nullopt));
-            add(hi, k > 0 ? (u ? std::optional<Int>(k * *u) : std::nullopt) : (l ? std::optional<Int>(k * *l) : std::nullopt));
+            add(lo, k > 0 ? (l ? mul(k, *l) : std::nullopt) : (u ? mul(k, *u) : std::nullopt));
+            add(hi, k > 0 ? (u ? mul(k, *u) : std::nullopt) : (l ? mul(k, *l) : std::nullopt));
           }
           // k_j a_j in [L - hi, U - lo].
           std::optional<Int> klo, khi;
-          if (bound.lower && hi) klo = *bound.lower - *hi;
-          if (bound.upper && lo) khi = *bound.upper - *lo;
+          if (bound.lower && hi && *hi != std::numeric_limits<Int>::min()) klo = plus(*bound.lower, -*hi);
+          if (bound.upper && lo && *lo != std::numeric_limits<Int>::min()) khi = plus(*bound.upper, -*lo);
           const auto& k = terms[j].second;
           std::optional<Int> alo, ahi;
           if (k > 0) {
@@ -247,6 +258,8 @@ struct SymbolicAddressModel::Impl {
           const auto [cl, cu] = BoundsOf(terms[j].first);
           if (alo && (!cl || *alo > *cl)) { slot.first = alo; changed = true; }
           if (ahi && (!cu || *ahi < *cu)) { slot.second = ahi; changed = true; }
+          const auto [nl, nu] = BoundsOf(terms[j].first);
+          if (nl && nu && *nl > *nu) { env_unproved = true; return; }  // contradiction: no pass
         }
       }
       if (!changed) break;
@@ -728,17 +741,22 @@ struct SymbolicAddressModel::Impl {
     return query;
   }
 
+  // Set when term invariants exist but their consistency is not proved (no solver, an unknown
+  // answer, or a contradiction bound propagation found): then no access is contained.
+  bool env_unproved = false;
   void CheckInvariantsConsistent() {
-    if (!solver || (term_bounds.empty() && joint_injective.empty())) return;
+    if (term_bounds.empty() && joint_injective.empty()) return;
+    if (!solver) { env_unproved = true; return; }
     std::set<AtomId> selected;
     for (const auto& bound : term_bounds)
       for (const auto& [atom, ignored] : bound.term.terms) { (void)ignored; selected.insert(atom); }
     // Unknown is not proof of consistency; each pair rechecks its own ground
     // environment before an unsat overlap is accepted.
     std::map<AtomId, std::size_t> variables;
-    if (solver->consistent(Instantiate(std::move(selected), variables), options.timeout_ms) ==
-        address_solver::Verdict::kUnsat)
+    const auto consistent = solver->consistent(Instantiate(std::move(selected), variables), options.timeout_ms);
+    if (consistent == address_solver::Verdict::kUnsat)
       throw std::invalid_argument("address invariants are unsatisfiable");
+    if (consistent != address_solver::Verdict::kSat) env_unproved = true;
   }
 
   // ---- The decision procedure (dynamic.pdf Section 4.4, layers 0 and 2) ----
@@ -930,6 +948,7 @@ struct SymbolicAddressModel::Impl {
     const auto unknown = [&](std::string reason) { verdict.status = ContainmentVerdict::Status::kUnknown;
                                                    verdict.reason = std::move(reason); return verdict; };
     if (error) return unknown("invalid symbolic-address model: " + error->message);
+    if (env_unproved) return unknown("address invariants (path facts) are not proved consistent");
     const auto* address = std::get_if<AddressId>(&access.address);
     if (!address) return unknown("register endpoint");
     const auto found = binding_shapes.find(address->value());
