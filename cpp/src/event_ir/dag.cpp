@@ -2,6 +2,8 @@
 #include "sentryward/algorithm/semantics/template_schedule.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -210,7 +212,21 @@ bool EventDagBuilder::addEdge(
     return false;
   }
   EventEdge edge{from,to,reason,std::move(source_edge)};
+  // Diagnostic (claude/sw-gdn-mem-diag): with SENTRYWARD_EDGE_CENSUS=1, every 2^22 edges print the
+  // logical edges, segments (binding templates), stored rows and the new segments per edge reason.
+  static const bool census=std::getenv("SENTRYWARD_EDGE_CENSUS")!=nullptr;
+  static std::size_t opened[64];
+  const auto before=census?edges_.bindingTemplateCount():0;
   if(edge_group_)edges_.push_back(std::move(edge));else edges_.pushBackAffine(std::move(edge));
+  if(census) {
+    opened[static_cast<std::size_t>(reason)%64]+=edges_.bindingTemplateCount()-before;
+    if((edges_.size()&((std::size_t(1)<<22)-1))==0) {
+      std::fprintf(stderr,"edge_census edges=%zu segments=%zu rows=%zu group=%d opened_by_reason:",
+          edges_.size(),edges_.bindingTemplateCount(),edges_.storedBindingCount(),int(edge_group_.has_value()));
+      for(std::size_t r=0;r<64;++r)if(opened[r])std::fprintf(stderr," %zu=%zu",r,opened[r]);
+      std::fprintf(stderr,"\n");
+    }
+  }
   return true;
 }
 
