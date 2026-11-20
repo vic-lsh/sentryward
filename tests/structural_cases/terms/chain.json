@@ -1,0 +1,155 @@
+{
+ "schema": "sentryward.structural-term/v2",
+ "row": "test/chain",
+ "template": "test/chain",
+ "objects": [
+  {
+   "name": "a",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "p",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "q",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  },
+  {
+   "name": "y",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 1024,
+   "rows": 1,
+   "cols": 256,
+   "row_indexed": false
+  }
+ ],
+ "inputs": [
+  "a"
+ ],
+ "nodes": [
+  {
+   "op": "P",
+   "atom": {
+    "kind": "opaque",
+    "roles": [
+     []
+    ]
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "input": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "p"
+  },
+  {
+   "op": "Q",
+   "atom": {
+    "kind": "opaque",
+    "roles": [
+     []
+    ]
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "body": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "q"
+  },
+  {
+   "op": "C",
+   "atom": {
+    "kind": "opaque",
+    "roles": [
+     [
+      "avoids_transcendental"
+     ],
+     []
+    ]
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "body": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    },
+    {
+     "body": 1,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "y"
+  }
+ ]
+}

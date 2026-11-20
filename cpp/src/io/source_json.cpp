@@ -1767,18 +1767,18 @@ std::string Analyze(Input&& source, bool verify, MemoryRaceOptions memory_option
             const auto cta=units->Cta(order.from.instruction);
             const auto weight=units->Weight(cta);
             failure_count+=failed*weight;
-            evidence["count"]=evidence["count"].get<std::size_t>()+failed*weight;
+            evidence["count"]=evidence["count"].template get<std::size_t>()+failed*weight;
             class_failures.emplace_back(index,cta);
             continue;
           }
           failure_count+=failed;
-          evidence["count"]=evidence["count"].get<std::size_t>()+failed;
+          evidence["count"]=evidence["count"].template get<std::size_t>()+failed;
           if(evidence["witnesses"].size()<failure_sample_limit || unresolved.size()<failure_sample_limit) {
             auto witness=failed_order_witness(index);
             if(unresolved.size()<failure_sample_limit)unresolved.push_back(witness);
             if(evidence["witnesses"].size()<failure_sample_limit)evidence["witnesses"].push_back(std::move(witness));
           }
-          evidence["witnesses_truncated"]=evidence["count"].get<std::size_t>()>evidence["witnesses"].size();
+          evidence["witnesses_truncated"]=evidence["count"].template get<std::size_t>()>evidence["witnesses"].size();
         }
       }
       if(units && !class_failures.empty()) {
@@ -1814,7 +1814,7 @@ std::string Analyze(Input&& source, bool verify, MemoryRaceOptions memory_option
             for(const auto index:found->second)if(!(more=emit(index)))break;
         for(auto& [code,diagnostic]:lifecycle_diagnostics) {
           auto& evidence=diagnostic["details"];
-          evidence["witnesses_truncated"]=evidence["count"].get<std::size_t>()>evidence["witnesses"].size();
+          evidence["witnesses_truncated"]=evidence["count"].template get<std::size_t>()>evidence["witnesses"].size();
         }
       }
       if (failure_count != 0) {
