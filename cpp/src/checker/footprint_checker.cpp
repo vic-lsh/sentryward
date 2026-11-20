@@ -222,7 +222,20 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
       undecided.push_back(sample(access, "undecided", object, v, extent));
   };
 
+  // CTA-row shards (export_pieces): the bytes every access touched, per object, in bytes from the
+  // object's pointer (the access's own verdict: a constant offset is exact; anything else is a
+  // symbolic piece, which the cross-shard check refuses for a write and widens to the object's
+  // whole interval for a read).
+  struct Exported {
+    std::vector<std::pair<std::int64_t, std::int64_t>> writes, reads;
+    std::uint64_t symbolic_writes = 0, symbolic_reads = 0;
+  };
+  const bool export_pieces = spec.value("export_pieces", false);
+  std::map<std::string, Exported> exported;
+  std::uint64_t unsized = 0;  // memory accesses without a known width (never placed)
+
   for (const auto& access : accesses) {
+    if (export_pieces && std::holds_alternative<AddressId>(access.address) && access.bytes.value_or(0) == 0) ++unsized;
     if (access.bytes.value_or(0) == 0 || !std::holds_alternative<AddressId>(access.address)) continue;
     // The verdict without an extent names the allocation and space; global memory only.
     auto probe = model.containment(access, std::nullopt);
@@ -255,6 +268,15 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     if (shift.units > 1 && !verdict.constant_offset && (!verdict.min_byte || verdict.field_bounded))
       throw UnitClassRestart{"footprint_symbolic_member:" + object};
     if (!verdict.constant_offset) st.symbolic += shift.units;
+    if (export_pieces) {
+      auto& e = exported[object];
+      const bool write = access.mode == AccessMode::kWrite;
+      if (verdict.constant_offset && verdict.min_byte)
+        for (const auto d : shift.all)
+          (write ? e.writes : e.reads).emplace_back(*verdict.min_byte + d, *verdict.min_byte + d + std::int64_t(*access.bytes));
+      else
+        (write ? e.symbolic_writes : e.symbolic_reads) += shift.units;
+    }
     if (verdict.min_byte && verdict.max_byte_exclusive) {
       const auto lo = *verdict.min_byte + shift.low, hi = *verdict.max_byte_exclusive + shift.high;
       st.min_byte = st.min_byte ? std::min(*st.min_byte, lo) : lo;
@@ -364,6 +386,38 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
            {"reads", read_violations ? "violated" : reads_outside ? "not_contained" : read_unknown ? "inconclusive" : "contained"},
            {"reads_outside_declared", reads_outside}, {"outside_reads", std::move(outside_reads)},
            {"scope", "all CTAs of the stated launch (class representatives moved by each member's delta in class mode); trusted: declared extents, directions and tensor_properties"}};
+  if (export_pieces) {
+    // Each direction's intervals, merged, then runs of equal width at a constant step joined into
+    // one piece {base, rows, stride, width} (rows r < rows: bytes [base + r*stride, + width)).
+    const auto pieces = [](std::vector<std::pair<std::int64_t, std::int64_t>> v) {
+      std::sort(v.begin(), v.end());
+      std::vector<std::pair<std::int64_t, std::int64_t>> merged;
+      for (const auto& [lo, hi] : v)
+        if (!merged.empty() && lo <= merged.back().second) merged.back().second = std::max(merged.back().second, hi);
+        else merged.emplace_back(lo, hi);
+      Json out = Json::array();
+      for (std::size_t i = 0; i < merged.size();) {
+        const auto width = merged[i].second - merged[i].first;
+        std::size_t j = i + 1;
+        std::int64_t stride = 0;
+        if (j < merged.size() && merged[j].second - merged[j].first == width) {
+          stride = merged[j].first - merged[i].first;
+          while (j < merged.size() && merged[j].second - merged[j].first == width &&
+                 merged[j].first - merged[j - 1].first == stride)
+            ++j;
+        }
+        out.push_back({{"base", merged[i].first}, {"rows", j - i}, {"stride", j - i > 1 ? stride : 0}, {"width", width}});
+        i = j;
+      }
+      return out;
+    };
+    Json objects_out = Json::object();
+    for (auto& [name, e] : exported)
+      objects_out[name] = {{"writes", pieces(std::move(e.writes))}, {"reads", pieces(std::move(e.reads))},
+                           {"symbolic_writes", e.symbolic_writes}, {"symbolic_reads", e.symbolic_reads}};
+    out["pieces"] = {{"coordinates", "bytes from the object's pointer"}, {"objects", std::move(objects_out)},
+                     {"unsized_accesses", unsized}};
+  }
   report.json = out.dump();
   return report;
 }

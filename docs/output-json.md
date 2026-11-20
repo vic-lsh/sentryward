@@ -28,6 +28,21 @@ violation sample has `kind` (`out_of_bounds`, `write_to_read_only`, `read_from_w
 `cta`, `block`, `thread`, `thread_idx`, the PTX `location`, and for `out_of_bounds` the `side`
 and the `witness` (the offset, or the solver's valuation of the table elements and the offset).
 
+## CTA-row shards
+
+With `cta_rows` in the input ([input](input-json.md#cta-row-shards)):
+
+- `frontend_assumptions.cta_rows`: `y` (the rows), `allowlist` (`admitted`, `scanned`: the entry
+  and its direct callees) and `identity`: `input` (the input as given, without `cta_rows`),
+  `ptx_sha256` (the PTX file's SHA-256) and `entry`. A refused scan reports diagnostic
+  `cta_rows_not_admitted` instead.
+- `evidence.footprint.pieces`: per object, `writes` and `reads`, the bytes the shard's global
+  accesses touched in bytes from the object's pointer, from each access's containment verdict
+  (constant offsets, exact): merged intervals, written as pieces `{base, rows, stride, width}` (row
+  `r < rows` is `[base + r*stride, + width)`); `symbolic_writes` and `symbolic_reads` count the
+  accesses whose offset depends on loaded data (no exact piece); `unsized_accesses` counts memory
+  accesses of unknown width (never placed). Pieces are only reported for a shard.
+
 ## JSON structure
 
 The CLI writes one raw JSON object to stdout; Python returns the same structure.
