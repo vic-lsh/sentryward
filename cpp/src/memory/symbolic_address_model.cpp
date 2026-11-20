@@ -826,7 +826,9 @@ struct SymbolicAddressModel::Impl {
     const auto& a = atoms[atom];
     if (a.gather.empty() || pinned_gathers.contains(a.gather) || field_policies.contains(a.gather)) return false;
     const auto p = gather_policies.find(a.gather);
-    if (p == gather_policies.end() || p->second.injective || !p->second.lower || !p->second.upper) return false;
+    // Empty intersected bounds are an unsatisfiable environment: the solver path reports it.
+    if (p == gather_policies.end() || p->second.injective || !p->second.lower || !p->second.upper ||
+        *p->second.lower > *p->second.upper) return false;
     for (const auto& bound : term_bounds)
       for (const auto& [member, ignored] : bound.term.terms) { (void)ignored; if (member == atom) return false; }
     for (const auto& group : joint_injective)

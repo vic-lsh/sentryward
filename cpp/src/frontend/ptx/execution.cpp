@@ -1871,7 +1871,10 @@ std::optional<std::uint32_t> Executor::GuardCompare(std::uint32_t pc, std::uint3
     const auto &e = decoded_[k];
     if (std::find(e.destinations.begin(), e.destinations.end(), predicate) == e.destinations.end()) continue;
     const auto &in = *e.instruction;
-    if (in.opcode != "setp" || in.predicate || e.destinations.size() != 1 || e.operands.size() != 3) return {};
+    // One plain destination: `p|q` (or `_|q`) writes q the complement, which this reading of the
+    // comparison would get backwards.
+    if (in.opcode != "setp" || in.predicate || e.destinations.size() != 1 || e.operands.size() != 3 ||
+        e.operands[0].text.find('|') != std::string::npos) return {};
     if (!(Has(in, "u32") || Has(in, "s32") || Has(in, "u64") || Has(in, "s64"))) return {};
     if (!(Has(in, "lt") || Has(in, "le") || Has(in, "gt") || Has(in, "ge") || Has(in, "lo") || Has(in, "ls") ||
           Has(in, "hi") || Has(in, "hs"))) return {};
@@ -1904,6 +1907,10 @@ void Executor::RefineGuard(std::uint32_t pc, std::uint32_t predicate, bool truth
     const bool left = Unknown(va) && a.reg != kMissing;
     if (!(left ? Unknown(va) && ScalarInteger(vb) : Unknown(vb) && b.reg != kMissing && ScalarInteger(va))) return;
     const auto reg = left ? a.reg : b.reg;
+    // The comparison constrains only its width's bits: the register must have that width.
+    if (!scoped_registers_) scoped_registers_ = std::make_unique<RegisterTable>(m_, f_);
+    const auto declared = scoped_registers_->DeclaredWidth(scoped_registers_->Resolve(in.scope, (left ? a : b).text));
+    if (!declared || *declared * 8 != width) return;  // declared widths are in bytes
     const Integer c = *ScalarInteger(left ? vb : va);
     if (cmp == "lo") cmp = "lt"; else if (cmp == "ls") cmp = "le"; else if (cmp == "hi") cmp = "gt"; else if (cmp == "hs") cmp = "ge";
     if (!left) cmp = cmp == "lt" ? "gt" : cmp == "le" ? "ge" : cmp == "gt" ? "lt" : "le";
