@@ -1,0 +1,123 @@
+{
+ "schema": "sentryward.structural-term/v2",
+ "row": "test/sel",
+ "template": "test/sel",
+ "objects": [
+  {
+   "name": "a",
+   "element": "bf16",
+   "element_bytes": 2,
+   "base_bytes": 0,
+   "row_stride_bytes": 4,
+   "rows": 256,
+   "cols": 2,
+   "row_indexed": false
+  },
+  {
+   "name": "b",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 4,
+   "rows": 256,
+   "cols": 1,
+   "row_indexed": false
+  },
+  {
+   "name": "p",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 4,
+   "rows": 256,
+   "cols": 1,
+   "row_indexed": false
+  },
+  {
+   "name": "y",
+   "element": "f32",
+   "element_bytes": 4,
+   "base_bytes": 0,
+   "row_stride_bytes": 4,
+   "rows": 256,
+   "cols": 1,
+   "row_indexed": false
+  }
+ ],
+ "inputs": [
+  "a",
+  "b"
+ ],
+ "nodes": [
+  {
+   "op": "P",
+   "atom": {
+    "kind": "opaque",
+    "roles": [
+     []
+    ]
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "input": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "all": 2
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "p"
+  },
+  {
+   "op": "add",
+   "atom": {
+    "kind": "primitive",
+    "operation": "add",
+    "commutative": true
+   },
+   "format": {
+    "compute": null,
+    "store": "f32"
+   },
+   "args": [
+    {
+     "body": 0,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    },
+    {
+     "input": 1,
+     "reads": [
+      [
+       {
+        "out": 0
+       },
+       {
+        "out": 1
+       }
+      ]
+     ]
+    }
+   ],
+   "out": "y"
+  }
+ ]
+}
