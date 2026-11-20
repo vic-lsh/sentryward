@@ -897,26 +897,17 @@ class Checker {
         case B::Multiply:
           if (!integer) return full;
           for (std::size_t i = 0; i < 2; ++i) {
-            const auto c = fixedBits(xs[1 - i], bitWidth(xs[1 - i]));
-            if (!c || !live(i)) continue;
             const auto mode = b->attributes().multiply_mode;
-            const auto ow = bitWidth(xs[i]);
-            std::optional<std::uint64_t> used;
-            if (mode == v::IntegerMultiplyMode::Wide && *c) used = ones(ow);
-            if (mode == v::IntegerMultiplyMode::Low && *c && ow) {
-              const auto tz = unsigned(__builtin_ctzll(*c));
-              used = tz >= ow ? 0 : ones(ow - tz);
-            }
-            check(i, used, "an integer product with a fixed factor reads only some bits (or which is not decided)");
+            check(i, productUses(bitWidth(xs[i]), in[1 - i], mode == v::IntegerMultiplyMode::Wide, mode == v::IntegerMultiplyMode::High),
+                  "an integer product whose other factor's trailing zeros are not decided zero (it reads only some bits, or which is not decided)");
           }
           return full;
         case B::Divide: case B::Remainder:
           if (!integer) return full;
           for (std::size_t i = 0; i < 2; ++i) {
             const auto c = fixedBits(xs[1 - i], bitWidth(xs[1 - i]));
-            if (!c) continue;
-            const bool exact = b->opcode() == B::Divide && i == 0 && *c == 1;
-            check(i, exact ? all_used(i) : std::nullopt, "an integer quotient or remainder with a fixed operand (bits read not decided)");
+            const bool exact = c && b->opcode() == B::Divide && i == 0 && *c == 1;
+            check(i, exact ? all_used(i) : std::nullopt, "an integer quotient or remainder (bits read not decided)");
           }
           return full;
         default:
@@ -963,17 +954,9 @@ class Checker {
           if (!integer || xs.size() != 3) return full;
           bool wide = false, high = false;
           for (const auto& m : p->attributes().modifiers) wide |= m == "wide", high |= m == "hi";
-          for (std::size_t i = 0; i < 2; ++i) {
-            const auto c = fixedBits(xs[1 - i], bitWidth(xs[1 - i]));
-            if (!c || !live(i)) continue;
-            const auto ow = bitWidth(xs[i]);
-            std::optional<std::uint64_t> used;
-            if (!high && *c && ow) {
-              const auto tz = unsigned(__builtin_ctzll(*c));
-              used = wide ? ones(ow) : tz >= ow ? 0 : ones(ow - tz);
-            }
-            check(i, used, "an integer multiply-add with a fixed factor reads only some bits (or which is not decided)");
-          }
+          for (std::size_t i = 0; i < 2; ++i)
+            check(i, productUses(bitWidth(xs[i]), bits(xs[1 - i]), wide, high),
+                  "an integer multiply-add whose other factor's trailing zeros are not decided zero (it reads only some bits, or which is not decided)");
           return full;
         }
         default:
@@ -981,6 +964,24 @@ class Checker {
       }
     }
     return full;
+  }
+  // The bits of a factor (width ow) an integer product reads, from the other factor's bits o, or
+  // none (undecided). Low half (mul.lo, mad.lo): flipping factor bit i changes the product by
+  // o * 2^i, which vanishes mod 2^w exactly when o has at least w - i trailing zeros; so with t the
+  // other factor's trailing-zero count the product reads the low ow - t bits, and t is decided only
+  // when o's low bits are fixed zero up to a fixed one (a low bit that may vary, as in x * (x << 1),
+  // leaves t undecided). Wide: every bit unless o is zero; decided when some bit of o is fixed one.
+  // High half: not decided. The analysis does not relate the two factors (x * (x << 1)): o is a
+  // superset of the other factor's varying bits, so a fixed bit is fixed for every value of x.
+  static std::optional<std::uint64_t> productUses(unsigned ow, const Bits& o, bool wide, bool high) {
+    if (high || !ow) return std::nullopt;
+    if (wide) return o.one & ~o.vary & ones(o.width) ? std::optional(ones(ow)) : std::nullopt;
+    for (unsigned t = 0; t < o.width; ++t) {
+      const auto b = std::uint64_t{1} << t;
+      if (o.vary & b) return std::nullopt;
+      if (o.one & b) return t >= ow ? 0 : ones(ow - t);
+    }
+    return std::nullopt;  // o is zero (a dead product) or untracked
   }
   // A conversion of `source` to x's type: an integer truncation reads the low bits only.
   template <class Check>
