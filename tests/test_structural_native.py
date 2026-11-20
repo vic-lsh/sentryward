@@ -117,8 +117,11 @@ class StructuralNativeTest(unittest.TestCase):
     # 7b4673b (before partial_operand); the reference there was undecided (it did not follow a
     # same-width reload of a stored value) and now refutes each by its own rule.
     PARTIAL = ["and_mask", "or_mask", "shl", "shr_u", "shr_s_past", "shift_mixed", "bfe", "bfi", "prmt", "lop3",
-               "shf", "cvt_narrow", "unpack", "copysign", "selp_narrow", "abs", "mul_even", "data_mask"]
-    FULL = ["xor_full", "prmt_full", "lop3_full"]
+               "shf", "cvt_narrow", "unpack", "copysign", "selp_narrow", "abs", "mul_even", "data_mask",
+               "round_low", "round_no_sign", "round_short"]
+    # round_bf16: p's own float bits truncated to their top 16 (sign, exponent, 7 mantissa bits),
+    # a rounding toward zero to bf16 (as combine's pos_store_trunc control stores its result).
+    FULL = ["xor_full", "prmt_full", "lop3_full", "round_bf16", "round_bf16_shr"]
 
     def test_partial_operands_refused_by_checker_and_reference(self):
         for name in self.PARTIAL:

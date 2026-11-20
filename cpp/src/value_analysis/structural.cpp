@@ -806,10 +806,41 @@ class Checker {
   }
 
   // Whether `used` includes every bit operand y may vary in (an untracked operand or an undecided
-  // use: no).
+  // use: no), or y is a float's own bits and the bits not used are its low mantissa bits (a
+  // rounding toward zero to a narrower float: sign, exponent and leading mantissa bits kept,
+  // `__float_as_uint(v) >> 16` storing a bf16, numerics inside the atom like cvt.rz.bf16.f32).
   bool covers(const v::Value& y, std::optional<std::uint64_t> used) {
     const auto ow = bitWidth(y);
-    return used && ow && (bits(y).vary & ~*used & ones(ow)) == 0;
+    if (!used || !ow) return false;
+    const auto unused = bits(y).vary & ~*used & ones(ow);
+    if (!unused) return true;
+    const auto e = floatExponent(y);
+    const auto low = 64u - unsigned(__builtin_clzll(unused));  // bits [0, low) hold every unused bit
+    return e && unused == ones(low) && (*used & ones(ow) & ~ones(low)) == (ones(ow) & ~ones(low)) && ow - low >= 1 + *e;
+  }
+  // The exponent width of the float whose bits y is (a chain of same-width bitcasts of an f16,
+  // bf16, f32 or f64 value), or none.
+  std::optional<unsigned> floatExponent(v::Value y) {
+    const auto w = bitWidth(y);
+    for (unsigned n = 0; n < 16; ++n) {
+      y = resolve(y);
+      if (!y.indices().empty() || bitWidth(y) != w) return std::nullopt;
+      if (g_.type(y).element().kind() == v::ElementKind::Floating) break;
+      if (const auto& c = y.conversion()) {
+        if (c->spec->kind != v::TypeConversionKind::Bitcast) return std::nullopt;
+        y = c->source;
+      } else if (dynamic_cast<const v::BitcastOp*>(&g_.definingNode(y).operation())) {
+        y = g_.instanceOperands(y).toVector().at(0);
+      } else {
+        return std::nullopt;
+      }
+    }
+    if (g_.type(y).element().kind() != v::ElementKind::Floating || bitWidth(y) != w) return std::nullopt;
+    const auto name = g_.type(y).element().toString();
+    if (name == "f16") return 5;
+    if (name == "bf16" || name == "f32") return 8;
+    if (name == "f64") return 11;
+    return std::nullopt;
   }
   // The partial uses found (the first 8, for refusal details).
   void note(const v::Value& x, const std::string& what, std::size_t i, const v::Value& y, std::optional<std::uint64_t> used,
@@ -2455,6 +2486,7 @@ class Reference {
     if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op); p && p->opcode() == v::PtxScalarOpcode::SelectSign)
       base[0] = 0, base[1] = wmask(w);  // two distinct values, so the selector's effect shows
     const bool sign = dynamic_cast<const v::ConvertOp*>(&op) ? signedSource(xs[0]) : signedSource(x);
+    std::uint64_t ignored = 0;  // varying operand bits some flip leaves the result unchanged at
     for (unsigned i = 0; i < ow; ++i) {
       if (!(vq >> i & 1)) continue;
       for (const std::uint64_t from : {std::uint64_t{0}, wmask(ow)}) {
@@ -2462,10 +2494,31 @@ class Reference {
         a[q] = from & ~(std::uint64_t{1} << i);
         b[q] = from | (std::uint64_t{1} << i);
         const auto ra = apply(op, w, sign, a, ws), rb = apply(op, w, sign, b, ws);
-        if (!ra || !rb || *ra == *rb) return false;
+        if (!ra || !rb) return false;
+        if (*ra == *rb) ignored |= std::uint64_t{1} << i;
       }
     }
-    return true;
+    if (!ignored) return true;
+    // A float's own bits with only low mantissa bits ignored: a rounding toward zero to a narrower
+    // float (sign and exponent kept), numerics inside the atom.
+    // Follow same-width bitcasts down to a float.
+    std::optional<v::Value> f = res(xs[q]);
+    for (unsigned n = 0; f && n < 16 && g_.type(*f).element().kind() != v::ElementKind::Floating; ++n) {
+      const auto y = *f;
+      if (y.conversion() && y.conversion()->spec->kind == v::TypeConversionKind::Bitcast && y.indices().empty())
+        f = res(y.conversion()->source);
+      else if (!y.conversion() && y.indices().empty() && dynamic_cast<const v::BitcastOp*>(&g_.definingNode(y).operation()))
+        f = res(g_.instanceOperands(y).toVector().at(0));
+      else
+        f.reset();
+      if (f && widthOf(*f) != ow) f.reset();
+    }
+    if (!f || widthOf(*f) != ow || g_.type(*f).element().kind() != v::ElementKind::Floating) return false;
+    const auto t = g_.type(*f).element().toString();
+    const unsigned exponent = t == "f16" ? 5 : t == "bf16" || t == "f32" ? 8 : t == "f64" ? 11 : 64;
+    unsigned kept = 0;  // the high bits no flip ignores
+    while (kept < ow && !(ignored >> (ow - 1 - kept) & 1)) ++kept;
+    return ignored == wmask(ow - kept) && kept >= 1 + exponent;
   }
   // Whether the conversion step of x reads all of its source.
   bool convertsAll(const v::Value& x) {

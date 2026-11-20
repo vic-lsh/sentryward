@@ -55,7 +55,12 @@ of a body argument, the values its producer's stored output elements hold, by va
   unpack), integer products, quotients and remainders with a fixed operand, float abs (no sign),
   copysign (one operand's sign, the other's magnitude), slct's integer selector (its sign), a
   component of an operation's matrix result; a control the launch does not fix (mask, amount,
-  position, selector, table) makes the use undecided, so partial. A partial edge counts for claims
+  position, selector, table) makes the use undecided, so partial. Exception, decided exactly: a
+  use of a float's own bits (a same-width bitcast of an f16, bf16, f32 or f64 value) that ignores
+  only a contiguous run of its low bits and keeps the sign and every exponent bit is a rounding
+  toward zero to a narrower float (`__float_as_uint(v) >> 16` storing a bf16), numerics inside
+  the atom like `cvt.rz.bf16.f32`, so full. A reload of the value from memory under an integer
+  type is not recognized as a float's bits (partial). A partial edge counts for claims
   that no path exists (avoids_transcendental, a multiplicand's bypass, an addend's non-addend
   paths) and never for claims that one does: an output's leaves must all be reached by full paths
   (`fullLeaves`), so must a factorization's cut elements and an unstored producer's operands, and

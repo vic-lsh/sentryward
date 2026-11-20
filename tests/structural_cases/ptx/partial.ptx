@@ -600,6 +600,157 @@
 	ret;
 }
 
+// partial_round_bf16: positive: p's own float bits truncated to a bf16 (sign, exponent, 7 mantissa bits): a rounding
+.visible .entry partial_round_bf16(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	and.b32 %r3, %r4, 4294901760;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_round_bf16_shr: positive: the same through shr.u32 16 (a u32 view of p's bits) and back
+.visible .entry partial_round_bf16_shr(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	shr.u32 %r5, %r4, 16;
+	shl.b32 %r3, %r5, 16;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_round_low: p's own float bits, the low half only
+.visible .entry partial_round_low(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	and.b32 %r3, %r4, 65535;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_round_no_sign: p's own float bits without the sign
+.visible .entry partial_round_no_sign(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	and.b32 %r3, %r4, 2147418112;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_round_short: p's own float bits, the top 8 only (part of the exponent)
+.visible .entry partial_round_short(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	shr.u32 %r3, %r4, 24;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
 // partial_stored_half: a read of p's low half (partial_stored_read)
 .visible .entry partial_stored_half(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
 {
