@@ -5,17 +5,25 @@ extern "C" {
 // Test 1: every iteration i < n, n bounded by a premise: contained.
 __global__ void k_copy_n(const uint32_t* hdr, const float* in, float* out) {
   const uint32_t n = hdr[0];
+#pragma unroll 1
+  for (uint32_t i = 0; i < n; i++) out[i] = in[i];
+}
+// The default -O3 shape (unrolled by 16, tails of 8, 4 and a remainder loop).
+__global__ void k_copy_unrolled(const uint32_t* hdr, const float* in, float* out) {
+  const uint32_t n = hdr[0];
   for (uint32_t i = 0; i < n; i++) out[i] = in[i];
 }
 // Test 2 (control): i <= n reads and writes one element past the extent at i = n.
 __global__ void k_copy_le(const uint32_t* hdr, const float* in, float* out) {
   const uint32_t n = hdr[0];
+#pragma unroll 1
   for (uint32_t i = 0; i <= n; i++) out[i] = in[i];
 }
 // Test 4 (control): the read index is a carried value loaded from data (havocked): not contained.
 __global__ void k_chase(const uint32_t* hdr, const uint32_t* idx, const float* in, float* out) {
   const uint32_t n = hdr[0];
   uint32_t p = 0;
+#pragma unroll 1
   for (uint32_t i = 0; i < n; i++) {
     out[i] = in[p];
     p = idx[i];
@@ -25,6 +33,7 @@ __global__ void k_chase(const uint32_t* hdr, const uint32_t* idx, const float* i
 __global__ void k_rows(const uint32_t* ends, const float* in, float* out) {
   const uint32_t s = blockIdx.x;
   const int lo = s == 0 ? 0 : (int)ends[s - 1], n = (int)ends[s] - lo;
+#pragma unroll 1
   for (int i = 0; i < n; i++) out[lo + i] = in[lo + i];
 }
 }

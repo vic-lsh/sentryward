@@ -197,5 +197,53 @@ class FootprintNativeTest(unittest.TestCase):
     def test_path_other_mask_past_the_end_refused(self):
         self.assertEqual(self.writes("path_mask_odd"), "violated")
 
+    # Stage B, loop summaries (docs/design/loop-summaries.md; src/loop.cu, #pragma unroll 1 except
+    # k_copy_unrolled). A run that stops at a data branch outside a loop is split into a choice tree
+    # (both outcomes, as coral's run.py does); every leaf must be decided.
+    def tree(self, inp, budget=24):
+        base = json.loads((HERE / "inputs" / f"{inp}.json").read_text())
+        leaves, pending = [], [[]]
+        while pending:
+            path = pending.pop()
+            self.assertLess(len(leaves) + len(pending), budget, "choice tree budget")
+            body = dict(base, branch_decisions=path) if path else base
+            tmp = HERE / "inputs" / f".tree_{os.getpid()}.json"
+            tmp.write_text(json.dumps(body))
+            try:
+                r = run("loop", tmp.stem)
+            finally:
+                tmp.unlink()
+            diag = [(d.get("code"), (d.get("details") or {}).get("location", {}).get("line")) for d in r.get("diagnostics", [])]
+            stop = next((line for code, line in diag if code == "control_predicate_not_static"), None)
+            if stop is not None and not any(c["line"] == stop for c in path) and "footprint" not in r.get("evidence", {}):
+                pending += [path + [{"line": stop, "taken": True}], path + [{"line": stop, "taken": False}]]
+                continue
+            leaves.append((path, r))
+        return leaves
+
+    def leaf_status(self, r):
+        fp = r.get("evidence", {}).get("footprint")
+        if fp is None:
+            return r["result"]
+        if any("unsatisfiable" in str(d.get("message", "")) for d in r.get("diagnostics", [])):
+            return "infeasible"
+        return (fp["writes"], fp["reads"])
+
+    def test_loop_counted_contained(self):
+        for path, r in self.tree("loop_copy_n"):
+            self.assertIn(self.leaf_status(r), [("contained", "contained"), "infeasible"], path)
+
+    def test_loop_off_by_one_refused(self):
+        statuses = [self.leaf_status(r) for _, r in self.tree("loop_copy_le")]
+        self.assertTrue(any(s != "infeasible" and "violated" in s for s in statuses), statuses)
+
+    def test_loop_havocked_index_not_contained(self):
+        statuses = [self.leaf_status(r) for _, r in self.tree("loop_chase")]
+        self.assertTrue(any(isinstance(s, tuple) and s[1] != "contained" for s in statuses), statuses)
+
+    def test_loop_rows_from_table_contained(self):
+        for path, r in self.tree("loop_rows"):
+            self.assertIn(self.leaf_status(r), [("contained", "contained"), "infeasible"], path)
+
 if __name__ == "__main__":
     unittest.main()
