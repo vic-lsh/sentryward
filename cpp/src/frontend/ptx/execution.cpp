@@ -1237,6 +1237,12 @@ struct State {
   std::map<std::string, ElementAtom> tight_atoms;
   // Global facts made by compute instructions (mask definitions), moved into the trace at the end.
   std::vector<std::string> facts;
+  // Inside a summarized loop iteration (stage B): values may depend on the iteration atom, so no
+  // global fact is recorded and no mask atom is made.
+  bool summarizing = false;
+  // This lane's relational facts as forms known nonnegative (G >= 0), for proofs the frontend
+  // makes itself (a summarized loop's trip count is nonnegative).
+  std::vector<AffineForm> nonnegative;
   std::vector<std::optional<DynamicKey>> origins;
   std::vector<std::uint64_t> occurrences, branch_visits;
   std::map<std::string, std::uint64_t> backedges;
@@ -1593,6 +1599,35 @@ private:
   // unknown predicate records the conjunctive part of its meaning as global facts (address
   // invariants). Every run with choices executes lane by lane (lane atoms are per lane).
   bool path_facts_ = false;
+  // An atom's exact range: a lane fact's tightening, else its own bounds (lane, path, iteration,
+  // mask atoms), else its tensor property's (an element atom carries no bounds of its own).
+  std::optional<std::pair<Integer, Integer>> AtomRange(const ElementAtom &a, const State &s) const;
+  std::optional<std::pair<Integer, Integer>> AffineRange(const AffineForm &f, const State &s) const;
+  // Recomputes the interval of every register value that holds `from` (after its range tightened);
+  // a lane or path atom is also replaced by `to`, its tightened version.
+  void TightenAtom(const ElementAtom &from, const ElementAtom &to, State &s) const;
+  // Stage B (loop summaries): the static plan of the loop whose data-dependent test is at a pc.
+  struct LoopPlan {
+    bool ok = false;
+    std::string refusal;
+    std::uint32_t stay_pc = 0, exit_pc = 0, test_iv = kMissing;
+    Operand bound;                                   // the loop-invariant operand of the test
+    unsigned test_width = 0;
+    std::set<std::uint32_t> carried;                 // registers written in the loop
+    std::map<std::uint32_t, Integer> steps;          // induction variable -> literal step
+    std::map<std::uint32_t, std::pair<unsigned, bool>> iv_type;  // width, signedness of its add
+  };
+  mutable std::map<std::uint32_t, LoopPlan> loop_plans_;
+  const LoopPlan &PlanLoop(std::uint32_t pc) const;
+  struct LoopSummary {
+    std::uint32_t test_pc = 0, exit_pc = 0;
+    std::set<std::uint32_t> carried;
+    std::map<std::uint32_t, Scalar> exit_values;
+  };
+  // Starts a summary at the test `pc` of an eligible loop: nullopt refuses (the lane stops as
+  // before); a summary with no iteration (trip count 0) exits at once.
+  std::optional<LoopSummary> StartSummary(const LoopPlan &plan, std::uint32_t pc, State &s, std::uint32_t warp,
+                                          std::uint32_t lane, std::uint64_t visit, LaneTrace &trace) const;
   void RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace) const;
   // This lane's CTA coordinates, as text for an atom identity.
   std::string CtaText(const State &s) const;
@@ -2079,9 +2114,31 @@ void Literals(const PredTermRef &t, bool truth, std::vector<std::pair<std::strin
   }
 }
 }  // namespace
-// Replaces `from` by `to` (the same atom with tighter bounds) in the lane's integer registers,
-// recomputing each affected value's interval from its affine form.
-void TightenAtom(const ElementAtom &from, const ElementAtom &to, State &s) {
+std::string AtomKey(const ElementAtom &a) {
+  return a.function.empty() ? "elem:" + a.object + ":" + a.element_type + ":" + a.byte_offset.str() : a.function;
+}
+std::optional<std::pair<Integer, Integer>> Executor::AtomRange(const ElementAtom &a, const State &s) const {
+  if (const auto t = s.tight_atoms.find(AtomKey(a)); t != s.tight_atoms.end())
+    return std::pair{t->second.lower, t->second.upper};
+  if (!a.function.empty()) return std::pair{a.lower, a.upper};
+  // The property the element's load used (PropertyFor over its resource, found by the object).
+  for (const auto &[resource, properties] : tensor_properties_)
+    if (std::any_of(properties.begin(), properties.end(), [&](const auto &p) { return p.object == a.object; }))
+      if (const auto *p = PropertyFor(resource, {a.byte_offset}); p && p->object == a.object && p->Type() == a.element_type)
+        return std::pair{p->lower, p->upper};
+  return std::nullopt;
+}
+std::optional<std::pair<Integer, Integer>> Executor::AffineRange(const AffineForm &f, const State &s) const {
+  Integer lo = f.constant, hi = f.constant;
+  for (const auto &[a, c] : f.terms) {
+    const auto r = AtomRange(a, s);
+    if (!r) return std::nullopt;
+    lo += c > 0 ? c * r->first : c * r->second;
+    hi += c > 0 ? c * r->second : c * r->first;
+  }
+  return std::pair{lo, hi};
+}
+void Executor::TightenAtom(const ElementAtom &from, const ElementAtom &to, State &s) const {
   const auto same = [&](const ElementAtom &a) {
     return a.object == from.object && a.element_type == from.element_type && a.byte_offset == from.byte_offset &&
            a.function == from.function;
@@ -2092,16 +2149,12 @@ void TightenAtom(const ElementAtom &from, const ElementAtom &to, State &s) {
     const auto &form = *(*b)->affine;
     if (std::none_of(form.terms.begin(), form.terms.end(), [&](const auto &t) { return same(t.first); })) continue;
     AffineForm next{form.constant, {}};
-    Integer lower = form.constant, upper = form.constant;
-    for (const auto &[a, c] : form.terms) {
-      const auto &atom = same(a) ? to : a;
-      next.terms.emplace_back(atom, c);
-      lower += c > 0 ? c * atom.lower : c * atom.upper;
-      upper += c > 0 ? c * atom.upper : c * atom.lower;
-    }
+    for (const auto &[a, c] : form.terms) next.terms.emplace_back(same(a) && !from.function.empty() ? to : a, c);
+    const auto range = AffineRange(next, s);  // every atom's real range (tensor elements: their property)
+    if (!range) continue;
     auto value = *b->value;
-    value.lower = std::max(value.lower, lower);
-    value.upper = std::min(value.upper, upper);
+    value.lower = std::max(value.lower, range->first);
+    value.upper = std::min(value.upper, range->second);
     value.affine = std::move(next);
     reg = BoundedInteger{std::make_shared<const BoundedValue>(std::move(value))};
   }
@@ -2113,10 +2166,13 @@ void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State 
   std::vector<std::pair<std::string, const PredTerm *>> literals;
   Literals(found->second, truth, literals);
   // Each atom at the tightest bounds the lane knows (function atoms only carry lane facts).
+  // An atom's key: its function identity, or its element (a tensor-property element is one value
+  // in every lane, so a lane's fact about it holds for the element).
+  const auto key = [](const ElementAtom &a) { return AtomKey(a); };
   const auto current = [&](const AffineForm &form) {
     AffineForm out{form.constant, {}};
     for (const auto &[a, c] : form.terms) {
-      const auto t = a.function.empty() ? s.tight_atoms.end() : s.tight_atoms.find(a.function);
+      const auto t = s.tight_atoms.find(key(a));
       out.terms.emplace_back(t == s.tight_atoms.end() ? a : t->second, c);
     }
     return out;
@@ -2131,15 +2187,41 @@ void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State 
   // holding it is updated, so pointer arithmetic on a guarded index stays bounded and the address
   // model keeps it a box atom decided by its hull). ne is a disjunction: no fact.
   for (const auto &[relation, term] : literals) {
-    if (relation == "ne") continue;
     const auto difference = current(AffineSum(term->left, term->right, Integer(-1)));
     if (difference.terms.empty()) continue;
-    if (difference.terms.size() > 1) { relational.emplace_back(relation, difference); continue; }
+    if (difference.terms.size() > 1) {
+      if (relation != "ne") relational.emplace_back(relation, difference);
+      continue;
+    }
     const auto &[atom, k] = difference.terms.front();
-    if (atom.function.empty()) { relational.emplace_back(relation, difference); continue; }
     // k a + c REL 0 -> k a in [lo, hi].
     std::optional<Integer> lo, hi;
     const Integer c = difference.constant;
+    const auto range = AtomRange(atom, s);
+    if (!range) {
+      if (relation != "ne") relational.emplace_back(relation, difference);
+      continue;
+    }
+    if (relation == "ne") {
+      // k a != -c is a disjunction, except at an end of a's range: a != lower is a >= lower + 1.
+      if (k != 1 && k != -1) continue;
+      const Integer v = -c * k;  // a != v
+      ElementAtom tight = atom;
+      tight.lower = range->first;
+      tight.upper = range->second;
+      if (v == range->first) tight.lower = range->first + 1;
+      else if (v == range->second) tight.upper = range->second - 1;
+      else continue;
+      if (tight.lower > tight.upper) continue;
+      s.tight_atoms[key(tight)] = tight;
+      TightenAtom(atom, tight, s);
+      if (atom.function.empty()) {
+        // A tensor element's bounds come from the input: give the model the tighter one too.
+        relational.emplace_back(v == range->first ? "ge" : "le",
+                                AffineForm{-(v == range->first ? tight.lower : tight.upper), {{atom, Integer(1)}}});
+      }
+      continue;
+    }
     if (relation == "eq") { lo = -c; hi = -c; }
     else if (relation == "lt") hi = -c - 1;
     else if (relation == "le") hi = -c;
@@ -2149,6 +2231,8 @@ void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State 
     if (k > 0) { if (lo) alo = -fdiv(-*lo, k); if (hi) ahi = fdiv(*hi, k); }
     else { if (hi) alo = -fdiv(-*hi, k); if (lo) ahi = fdiv(*lo, k); }
     ElementAtom tight = atom;
+    tight.lower = range->first;
+    tight.upper = range->second;
     if (alo && *alo > tight.lower) tight.lower = *alo;
     if (ahi && *ahi < tight.upper) tight.upper = *ahi;
     if (tight.lower > tight.upper) {
@@ -2157,14 +2241,23 @@ void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State 
       relational.emplace_back(relation, difference);
       continue;
     }
-    if (!(tight == atom)) {
-      s.tight_atoms[tight.function] = tight;
+    if (tight.lower != range->first || tight.upper != range->second) {
+      s.tight_atoms[key(tight)] = tight;
       TightenAtom(atom, tight, s);
     }
+    // A tensor element's bounds come from the input, not from the atom: keep the fact as an
+    // invariant so the address model has it.
+    if (atom.function.empty()) relational.emplace_back(relation, difference);
   }
   // Pass 2: facts over two or more atoms (or over atoms that carry no lane identity) are global
   // invariants, written with the tightest atoms.
   for (auto &[relation, difference] : relational) {
+    // Kept as nonnegative forms: d >= 0, d - 1 >= 0, -d >= 0, -d - 1 >= 0 (eq: both of the first and third).
+    const AffineForm neg = AffineScale(difference, Integer(-1));
+    if (relation == "ge" || relation == "eq") s.nonnegative.push_back(difference);
+    if (relation == "gt") s.nonnegative.push_back(AffineSum(difference, AffineForm{Integer(1), {}}, Integer(-1)));
+    if (relation == "le" || relation == "eq") s.nonnegative.push_back(neg);
+    if (relation == "lt") s.nonnegative.push_back(AffineSum(neg, AffineForm{Integer(1), {}}, Integer(-1)));
     const auto json = FactTermJson(current(difference));
     if (!json) continue;
     Json fact{{"term", *json}};
@@ -2175,6 +2268,214 @@ void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State 
     else fact["lower_bound"] = 0;
     trace.path_facts.push_back(fact.dump());
   }
+}
+// Stage B (docs/design/loop-summaries.md). A loop is summarized at its first data-dependent test:
+// the test's natural loop has one latch, no conditional branch but the test, no predicated
+// instruction, no call, barrier, atomic, collective, fence or non-global store, and the test is
+// `setp.ne` of an induction variable (one unpredicated `add/sub r, r, imm` in the loop) against a
+// loop-invariant operand, with the branch staying while the predicate is true. Every instruction
+// of the loop then runs once per iteration, on one path.
+const Executor::LoopPlan &Executor::PlanLoop(std::uint32_t pc) const {
+  if (const auto found = loop_plans_.find(pc); found != loop_plans_.end()) return found->second;
+  LoopPlan plan;
+  const auto refuse = [&](std::string why) -> const LoopPlan & {
+    plan.ok = false;
+    plan.refusal = std::move(why);
+    return loop_plans_.emplace(pc, std::move(plan)).first->second;
+  };
+  PrepareControl();
+  if (control_irreducible_) return refuse("irreducible");
+  const auto choice = ClassifyControl(pc);
+  if (choice.kind != ControlLoop::Computation || choice.loop == kMissing) return refuse("not_a_computation_loop");
+  const auto &loop = control_loops_[choice.loop];
+  if (loop.latches.size() != 1) return refuse("latches");
+  const auto &branch = *decoded_[pc].instruction;
+  if (!branch.branch_target || *branch.branch_target >= decoded_.size()) return refuse("target");
+  plan.stay_pc = choice.taken_stays ? *branch.branch_target : pc + 1;
+  plan.exit_pc = choice.taken_stays ? pc + 1 : *branch.branch_target;
+  // Stay while the predicate is true: taken == (predicate != negated) must equal taken_stays.
+  if (choice.taken_stays == branch.predicate_negated) return refuse("polarity");
+  std::map<std::uint32_t, std::vector<std::uint32_t>> defs;
+  for (const auto b : loop.blocks) {
+    const auto &block = control_blocks_[b];
+    for (auto k = block.begin; k < block.end; ++k) {
+      if (k == pc) continue;
+      const auto &e = decoded_[k];
+      const auto &ins = *e.instruction;
+      if (ins.control != "none") {
+        const bool backedge = ins.control == "direct_branch" && !ins.predicate && ins.branch_target &&
+                              *ins.branch_target < decoded_.size() &&
+                              control_block_for_pc_[*ins.branch_target] == loop.header;
+        if (!backedge) return refuse("control");
+        continue;
+      }
+      if (ins.predicate) return refuse("predicated");
+      if (In(ins.opcode, {"bar", "barrier", "atom", "red", "shfl", "vote", "match", "redux", "membar", "fence",
+                          "mbarrier", "cp", "call", "tensormap", "elect", "activemask", "nanosleep", "wgmma",
+                          "mma", "ldmatrix", "stmatrix", "prefetch", "discard", "applypriority", "createpolicy",
+                          "clusterlaunchcontrol", "griddepcontrol", "setmaxnreg"}))
+        return refuse("opcode:" + ins.opcode);
+      if (ins.opcode == "st" && !Has(ins, "global")) return refuse("store_space");
+      if (ins.opcode == "ld" && !(Has(ins, "global") || Has(ins, "param") || Has(ins, "const"))) return refuse("load_space");
+      if (ins.semantics.category == "memory" && !In(ins.opcode, {"ld", "st"})) return refuse("memory:" + ins.opcode);
+      for (const auto r : e.destinations) {
+        plan.carried.insert(r);
+        defs[r].push_back(k);
+      }
+    }
+  }
+  // The test: the setp that defines the branch's predicate earlier in its block, plain (one
+  // destination, no Boolean modifier), ne over an integer type; neither operand written between
+  // it and the branch.
+  const auto &test_block = control_blocks_[control_block_for_pc_[pc]];
+  const auto predicate = decoded_[pc].predicate;
+  std::optional<std::uint32_t> setp;
+  for (auto k = pc; k-- > test_block.begin;)
+    if (std::find(decoded_[k].destinations.begin(), decoded_[k].destinations.end(), predicate) !=
+        decoded_[k].destinations.end()) { setp = k; break; }
+  if (!setp) return refuse("test_definition");
+  const auto &te = decoded_[*setp];
+  const auto &ti = *te.instruction;
+  if (ti.opcode != "setp" || ti.predicate || te.destinations.size() != 1 || te.operands.size() != 3 ||
+      te.operands[0].text.find('|') != std::string::npos || Has(ti, "and") || Has(ti, "or") || Has(ti, "xor") ||
+      !Has(ti, "ne"))
+    return refuse("test_shape");
+  for (const auto &[type, w] : {std::pair{"u32", 32u}, std::pair{"s32", 32u}, std::pair{"b32", 32u},
+                                std::pair{"u64", 64u}, std::pair{"s64", 64u}, std::pair{"b64", 64u}})
+    if (Has(ti, type)) plan.test_width = w;
+  if (!plan.test_width) return refuse("test_type");
+  // Induction variables.
+  for (const auto &[r, at] : defs) {
+    if (at.size() != 1) continue;
+    const auto &e = decoded_[at.front()];
+    const auto &ins = *e.instruction;
+    if (!In(ins.opcode, {"add", "sub"}) || e.destinations.size() != 1 || e.operands.size() != 3 ||
+        e.operands[1].reg != r || e.operands[2].reg != kMissing)
+      continue;
+    const auto c = ScalarInteger(e.operands[2].constant);
+    if (!c || *c == 0) continue;
+    unsigned width = 0;
+    bool sign = false;
+    for (const auto &[type, w, sg] : {std::tuple{"u32", 32u, false}, std::tuple{"s32", 32u, true},
+                                      std::tuple{"u64", 64u, false}, std::tuple{"s64", 64u, true}})
+      if (Has(ins, type)) { width = w; sign = sg; }
+    if (!width) continue;
+    plan.steps[r] = ins.opcode == "add" ? *c : -*c;
+    plan.iv_type[r] = {width, sign};
+  }
+  const auto &a = te.operands[1], &b = te.operands[2];
+  const auto invariant = [&](const Operand &o) { return o.reg == kMissing || !plan.carried.contains(o.reg); };
+  if (a.reg != kMissing && plan.steps.contains(a.reg) && invariant(b)) { plan.test_iv = a.reg; plan.bound = b; }
+  else if (b.reg != kMissing && plan.steps.contains(b.reg) && invariant(a)) { plan.test_iv = b.reg; plan.bound = a; }
+  else return refuse("test_operands");
+  for (auto k = *setp + 1; k < pc; ++k)
+    for (const auto r : decoded_[k].destinations)
+      if (r == plan.test_iv || (plan.bound.reg != kMissing && r == plan.bound.reg)) return refuse("test_phase");
+  plan.ok = true;
+  return loop_plans_.emplace(pc, std::move(plan)).first->second;
+}
+namespace {
+// [lower, upper] of an affine form over its atoms' bounds.
+std::pair<Integer, Integer> AffineHull(const AffineForm &f) {
+  Integer lo = f.constant, hi = f.constant;
+  for (const auto &[a, c] : f.terms) {
+    lo += c > 0 ? c * a.lower : c * a.upper;
+    hi += c > 0 ? c * a.upper : c * a.lower;
+  }
+  return {lo, hi};
+}
+}  // namespace
+std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan, std::uint32_t pc, State &s,
+                                                            std::uint32_t warp, std::uint32_t lane,
+                                                            std::uint64_t visit, LaneTrace &trace) const {
+  const Scalar v0 = s.registers[plan.test_iv];
+  const Scalar n = plan.bound.reg == kMissing ? plan.bound.constant : s.registers[plan.bound.reg];
+  const auto fv = AffineOf(v0), fn = AffineOf(n);
+  if (!fv || !fn) return std::nullopt;
+  // Exact comparison: both values in one window of 2^width (as CompareTerm for ne).
+  const auto window = [&](bool sg) {
+    const Integer low = sg ? -(Integer(1) << (plan.test_width - 1)) : Integer(0);
+    const Integer high = (Integer(1) << (plan.test_width - unsigned(sg))) - 1;
+    const auto ra = AffineRange(*fv, s), rb = AffineRange(*fn, s);
+    return ra && rb && low <= ra->first && ra->second <= high && low <= rb->first && rb->second <= high;
+  };
+  if (!window(false) && !window(true)) return std::nullopt;
+  const Integer step = plan.steps.at(plan.test_iv);
+  // T = (n - v0) / step, exact: every coefficient and the constant divisible by the step.
+  const AffineForm difference = AffineSum(*fn, *fv, Integer(-1));
+  if (difference.constant % step != 0) return std::nullopt;
+  AffineForm trips{difference.constant / step, {}};
+  for (const auto &[atom, c] : difference.terms) {
+    if (c % step != 0) return std::nullopt;
+    trips.terms.emplace_back(atom, c / step);
+  }
+  const auto trange = AffineRange(trips, s);
+  if (!trange) return std::nullopt;
+  auto [tl, th] = *trange;
+  // T >= 0 for every entry state (else the counter could pass the bound and wrap): from the
+  // interval, or from a recorded fact G >= 0 with T = G + d for a constant d >= 0.
+  if (tl < 0) {
+    const auto same_terms = [](const AffineForm &x, const AffineForm &y) {
+      if (x.terms.size() != y.terms.size()) return false;
+      for (std::size_t j = 0; j < x.terms.size(); ++j)
+        if (!(x.terms[j].first.object == y.terms[j].first.object && x.terms[j].first.element_type == y.terms[j].first.element_type &&
+              x.terms[j].first.byte_offset == y.terms[j].first.byte_offset && x.terms[j].first.function == y.terms[j].first.function &&
+              x.terms[j].second == y.terms[j].second))
+          return false;
+      return true;
+    };
+    for (const auto &g : s.nonnegative)
+      if (same_terms(g, trips) && trips.constant - g.constant >= 0) { tl = trips.constant - g.constant; break; }
+  }
+  if (tl < 0) return std::nullopt;
+  LoopSummary summary{pc, plan.exit_pc, plan.carried, {}};
+  if (th == 0) return summary;  // no iteration: exit now with the current values
+  const std::string ident = std::to_string(pc) + ":" + CtaText(s) + std::to_string(warp) + ":" +
+                            std::to_string(lane) + ":" + std::to_string(visit);
+  const ElementAtom k{"loop_iteration", "s64", Integer(0), "iter:" + ident, Integer(0), th - 1};
+  // Local fact of the iteration atom: k <= T - 1 (only queries that name k include it).
+  {
+    AffineForm local = AffineSum(trips, AffineForm{Integer(1), {{k, Integer(1)}}}, Integer(-1));
+    const auto json = FactTermJson(local);
+    if (!json) return std::nullopt;
+    trace.path_facts.push_back(Json{{"term", *json}, {"lower_bound", 0},
+        {"scope", algorithm::TensorPropertyFunctionSymbol(k.object, k.element_type, k.function)}}.dump());
+  }
+  std::map<std::uint32_t, Scalar> start;
+  for (const auto &[r, c] : plan.steps) {
+    const Scalar v = s.registers[r];
+    const AffineForm at_k{Integer(0), {{k, c}}};
+    const AffineForm at_t = AffineScale(trips, c);
+    const auto [kl, kh] = AffineHull(at_k);
+    const auto [ul, uh] = AffineHull(at_t);
+    const Scalar step_k = MakeBounded(kl, kh, "step:" + k.function + ":" + std::to_string(r), {}, at_k);
+    const Scalar step_t = MakeBounded(ul, uh, "exit:" + k.function + ":" + std::to_string(r), {}, at_t);
+    if (const auto fr = AffineOf(v)) {
+      // An integer IV: its exact values for k in [0, T] must stay in its add's type (no wrap).
+      const auto [width, sign] = plan.iv_type.at(r);
+      const Integer low = sign ? -(Integer(1) << (width - 1)) : Integer(0);
+      const Integer high = (Integer(1) << (width - unsigned(sign))) - 1;
+      const auto vr = AffineRange(*fr, s);
+      if (!vr) continue;  // havocked
+      const auto [vl, vh] = *vr;
+      const Integer lo = std::min(vl, Integer(vl + c * th)), hi = std::max(vh, Integer(vh + c * th));
+      if (lo < low || hi > high) continue;  // havocked
+      start[r] = IntegerBinary("add", v, step_k);
+      summary.exit_values[r] = IntegerBinary("add", v, step_t);
+    } else if (std::holds_alternative<AllocationPointer>(v) || std::holds_alternative<BoundedAllocationPointer>(v)) {
+      const auto pk = PointerArithmetic("add", v, step_k, c_), pt = PointerArithmetic("add", v, step_t, c_);
+      if (pk) start[r] = *pk;
+      if (pt) summary.exit_values[r] = *pt;
+    }
+  }
+  if (!start.contains(plan.test_iv)) return std::nullopt;
+  for (const auto r : plan.carried) {
+    s.registers[r] = start.contains(r) ? start.at(r) : Scalar{};
+    s.pred_terms.erase(r);
+  }
+  s.summarizing = true;
+  ++trace.loop_summaries;
+  return summary;
 }
 void Executor::PrepareControl() const {
   if (control_ready_)
@@ -3259,7 +3560,7 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
   }
   // Stage A masks: x & -2^m and x & (2^m - 1) of an exact value that fits the unsigned width are
   // 2^m q and r for fresh lane atoms q, r with the definitional fact x = 2^m q + r, 0 <= r < 2^m.
-  if (op == "and" && path_facts_ && n > 2 && !Floating(i))
+  if (op == "and" && path_facts_ && !s.summarizing && n > 2 && !Floating(i))
     if (const auto width = Width(i); width && *width <= 64) {
       const auto a = val(1), b = val(2);
       const auto ca = ScalarInteger(a), cb = ScalarInteger(b);
@@ -3968,6 +4269,7 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
     }
     return taken;
   };
+  std::optional<LoopSummary> summary;  // the loop iteration this lane is summarizing (stage B)
   std::map<std::uint32_t, ProbeValue> probe_values;
   std::map<DynamicKey, WaitProbe> wait_probes;
   std::map<std::uint32_t, std::map<std::uint32_t, ProbeValue>> probe_joins;
@@ -3998,6 +4300,19 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
         }
         previous_block = block;
       }
+    }
+    if (summary && pc == summary->test_pc) {
+      // The summarized iteration reached the test again: leave by the exit edge with each exported
+      // induction variable at its exit value and every other register the loop writes havocked.
+      for (const auto r : summary->carried) {
+        const auto found = summary->exit_values.find(r);
+        state.registers[r] = found != summary->exit_values.end() ? found->second : Scalar{};
+        state.pred_terms.erase(r);
+      }
+      state.summarizing = false;
+      pc = summary->exit_pc;
+      summary.reset();
+      continue;
     }
     const auto &d = decoded_[pc];
     const auto &i = *d.instruction;
@@ -4137,7 +4452,7 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
       auto taken = supplied ? supplied : predicate;
       if (override && !bound && !predicate && d.predicate != kMissing && taken) {
         RefineGuard(pc, d.predicate, *taken != i.predicate_negated, state, warp.warp_id, lane, visit);
-        if (path_facts_) RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace);
+        if (path_facts_ && !state.summarizing) RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace);
       }
       if (!taken && d.predicate != kMissing && target > pc + 1)
         if (const auto *arm = MergedArmAt(pc); arm && (!arm->aligned || arm->uniform)) {
@@ -4158,6 +4473,17 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
           refusal != region_store_refusals_.end())
         throw ExecutionError("lifted_region_local_store", i.line,
                              "The data-dependent forward region of this branch holds a " + refusal->second);
+      if (!taken && path_facts_ && !state.summarizing && d.predicate != kMissing)
+        if (const auto &plan = PlanLoop(pc); plan.ok)
+          if (auto started = StartSummary(plan, pc, state, warp.warp_id, lane, visit, trace)) {
+            if (state.summarizing) {
+              pc = plan.stay_pc;
+              summary = std::move(started);
+            } else {
+              pc = plan.exit_pc;  // trip count 0
+            }
+            continue;
+          }
       if (!taken)
         UnresolvedControl(i, state, trace, d.predicate);
       auto occurrence = state.occurrences[pc]++;

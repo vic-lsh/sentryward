@@ -99,6 +99,14 @@ def _verify(ptx, *, input, reference, reference_binding, timeout_seconds, memory
                           semantic_assumptions=overrides)
         result.pop('_process', None)
         result['elapsed_seconds'] = time.monotonic() - started
+        # A summarized loop's accesses stand for every iteration: footprint containment is checked,
+        # race freedom is not (docs/design/loop-summaries.md).
+        if (result.get('frontend_assumptions') or {}).get('loop_summaries', 0) and \
+                result.get('result') in ('race_free', 'verified'):
+            result['result'] = 'unsupported'
+            result.setdefault('diagnostics', []).insert(0, {
+                'code': 'loop_summary_race_not_checked', 'stage': 'memory_check',
+                'message': 'A loop was summarized for footprint containment; race freedom is not checked.'})
         if result['elapsed_seconds'] > timeout_seconds and result.get('result') != 'timeout':
             # The completed report is public and keeps its two checks: normalize
             # reads its synchronization check as including the memory check.

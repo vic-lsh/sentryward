@@ -137,6 +137,10 @@ struct SymbolicAddressModel::Impl {
     Affine term;
     std::optional<Int> lower, upper;
     std::vector<Int> multiples;
+    // A local invariant (a summarized loop iteration's `k <= T - 1`): it holds only for the values
+    // its scope atom stands for, so a query includes it only when the query names that atom, and it
+    // takes no part in the global consistency check or bound propagation.
+    std::optional<AtomId> scope = std::nullopt;
   };
 
   struct GatherPolicy final {
@@ -236,6 +240,7 @@ struct SymbolicAddressModel::Impl {
     for (int round = 0; round < kRounds; ++round) {
       bool changed = false;
       for (const auto& bound : term_bounds) {
+        if (bound.scope) continue;  // local: not a fact about every execution
         const auto& terms = bound.term.terms;
         for (std::size_t j = 0; j < terms.size(); ++j) {
           // Interval of c + sum_{i != j} k_i a_i.
@@ -641,11 +646,20 @@ struct SymbolicAddressModel::Impl {
     for (const auto& value : values) {
       if (!value.is_object()) throw std::invalid_argument("address invariant must be an object");
       if (value.contains("term")) {
-        Keys(value, {"term", "lower_bound", "upper_bound", "multiple_of"});
+        Keys(value, {"term", "lower_bound", "upper_bound", "multiple_of", "scope"});
         auto term = Scalar(value.at("term"));
         if (!term || term->terms.empty())
           throw std::invalid_argument("invariant term must be a symbolic scalar expression");
         TermBound bound{std::move(*term), {}, {}, {}};
+        if (value.contains("scope")) {
+          if (!value.at("scope").is_string()) throw std::invalid_argument("scope must be a lookup symbol");
+          const auto symbol = value.at("scope").get<std::string>();
+          for (const auto& [atom, ignored] : bound.term.terms) {
+            (void)ignored;
+            if (atoms[atom].gather == symbol) bound.scope = atom;
+          }
+          if (!bound.scope) throw std::invalid_argument("scope names no atom of its term");
+        }
         Tighten(bound.lower, bound.upper, value);
         if (value.contains("multiple_of")) {
           const auto modulus = Required(value.at("multiple_of"), "multiple_of");
@@ -684,7 +698,8 @@ struct SymbolicAddressModel::Impl {
       for (std::size_t i = 0; i < term_bounds.size(); ++i) {
         if (used[i]) continue;
         const auto& terms = term_bounds[i].term.terms;
-        if (!std::any_of(terms.begin(), terms.end(), [&](const auto& t) { return selected.contains(t.first); }))
+        if (term_bounds[i].scope ? !selected.contains(*term_bounds[i].scope)
+                                 : !std::any_of(terms.begin(), terms.end(), [&](const auto& t) { return selected.contains(t.first); }))
           continue;
         used[i] = true;
         changed = true;
@@ -758,7 +773,8 @@ struct SymbolicAddressModel::Impl {
     if (!solver) { env_unproved = true; return; }
     std::set<AtomId> selected;
     for (const auto& bound : term_bounds)
-      for (const auto& [atom, ignored] : bound.term.terms) { (void)ignored; selected.insert(atom); }
+      if (!bound.scope)
+        for (const auto& [atom, ignored] : bound.term.terms) { (void)ignored; selected.insert(atom); }
     // Unknown is not proof of consistency; each pair rechecks its own ground
     // environment before an unsat overlap is accepted.
     std::map<AtomId, std::size_t> variables;
@@ -1039,7 +1055,11 @@ struct SymbolicAddressModel::Impl {
     // decided by arithmetic.
     Affine symbolic = offset;
     symbolic.constant = 0;
-    auto& extremes = ExtremesOf(symbolic, hull, timeout_ms);
+    // The bisection searches the symbolic part, so its seed is that part's hull (the offset's hull
+    // less the constant); the offset's own hull made a positive constant read as "unbounded below".
+    std::optional<std::pair<Int, Int>> symbolic_hull;
+    if (hull) symbolic_hull = std::pair{hull->first - offset.constant, hull->second - offset.constant};
+    auto& extremes = ExtremesOf(symbolic, symbolic_hull, timeout_ms);
     if (extremes.env_unsat)
       return unknown("address invariants and tensor properties are unsatisfiable for this access");
     const auto violated = [&](const char* side, const std::string& valuation, std::optional<Int> total) {

@@ -419,6 +419,8 @@ struct LaneTrace {
   // Global facts (address-invariant JSON) this lane recorded at chosen branches on unknown
   // predicates (relational path conditions).
   std::vector<std::string> path_facts;
+  // Loops this lane summarized (stage B): race freedom is then not checked.
+  std::uint64_t loop_summaries = 0;
 
 };
 struct ExecutionProgram {

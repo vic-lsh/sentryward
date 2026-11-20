@@ -1153,6 +1153,7 @@ struct CtaAccount {
   std::set<std::uint32_t> static_choice_lines;
   // The global facts its lanes recorded (relational path conditions).
   std::set<std::string> path_facts;
+  std::uint64_t loop_summaries = 0;  // loops its lanes summarized (stage B)
   // Whether the CTA executed one of `atomic_sites` (class mode's unit-independence precondition).
   bool executes_atomic_site = false;
 };
@@ -1175,6 +1176,7 @@ CtaAccount SummarizeCta(const ptx::CtaFacts &cta_facts, const ptx::Function &fun
     account.assumed_assertions += aggregates.assumed_assertions;
     for (const auto &[line, count] : aggregates.opaque_regions) account.opaque_regions[line] += count;
     account.path_facts.insert(aggregates.path_facts.begin(), aggregates.path_facts.end());
+    account.loop_summaries += aggregates.loop_summaries;
     for (const auto &[line, decision] : aggregates.data_branch_decisions) {
       AddDecision(account.data_branch_decisions[line], decision);
       (decision.assumption == "representative_branches" ? account.representative_branch_uses
@@ -1494,7 +1496,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
           {"clc_failure", config.fixed_input.contains("cluster_launch_cancellation") &&
               config.fixed_input["cluster_launch_cancellation"] == false},
           {"assertion_uses",0}, {"election_uses",0}, {"clc_uses",0},
-          {"representative_branch_uses",0}, {"bounded_loop_uses",0}, {"atomic_uses",0},
+          {"representative_branch_uses",0}, {"bounded_loop_uses",0}, {"atomic_uses",0}, {"loop_summaries",0},
           {"data_branch_decisions",Json::array()},
           {"opaque_compute_regions",Json::array()}};
       alg::OverridePtxAssumptions(effective_assumptions,
@@ -1678,6 +1680,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
                 AddDecision(data_branch_decisions[line], decision);
               add("representative_branch_uses", cta_account.representative_branch_uses);
               add("bounded_loop_uses", cta_account.bounded_loop_uses);
+              add("loop_summaries", cta_account.loop_summaries);
               static_choice_lines.insert(cta_account.static_choice_lines.begin(),
                                          cta_account.static_choice_lines.end());
               for (const auto &fact : cta_account.path_facts) path_facts.insert(fact);
