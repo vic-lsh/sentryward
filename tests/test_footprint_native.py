@@ -159,5 +159,34 @@ class FootprintNativeTest(unittest.TestCase):
         self.assertEqual(fp["outside_reads"][0]["object"], "next_tok")
 
 
+    # Stage A, relational path conditions (docs/design/loop-summaries.md; src/path.cu). Each case
+    # is one thread; the access sits on the not-taken side of the kernel's one data branch.
+    def writes(self, inp):
+        return self.footprint(run("path", inp))["writes"]
+
+    def test_path_eq_bounds_exactly(self):
+        self.assertEqual(self.writes("path_eq"), "contained")
+
+    def test_path_eq_past_the_end_refused(self):
+        self.assertEqual(self.writes("path_eq_past"), "violated")
+
+    def test_path_two_unknowns_relational(self):
+        self.assertEqual(self.writes("path_two"), "contained")
+
+    def test_path_two_unknowns_off_by_one_refused(self):
+        self.assertEqual(self.writes("path_two_past"), "violated")
+
+    def test_path_or_pred_not_taken_bounds_both(self):
+        self.assertEqual(self.writes("path_or"), "contained")
+
+    def test_path_and_pred_not_taken_bounds_neither(self):
+        self.assertNotEqual(self.writes("path_and"), "contained")
+
+    def test_path_low_bit_mask_quotient(self):
+        self.assertEqual(self.writes("path_mask"), "contained")
+
+    def test_path_other_mask_unknown(self):
+        self.assertNotEqual(self.writes("path_mask_odd"), "contained")
+
 if __name__ == "__main__":
     unittest.main()
