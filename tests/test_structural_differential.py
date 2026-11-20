@@ -7,7 +7,8 @@ Two seeded generators, each with an oracle independent of the checker:
    registers), also over a grid of CTAs with row-indexed objects (class mode); an unstored opaque
    producer under primitive adds; a warp-shuffle reduction (shfl.sync.bfly butterfly) read as a
    whole row, sometimes with a step missing. Expressions: f16 round trips, packed-pair components,
-   selects on data-dependent conditions, ex2/lg2, products, fmas, adds.
+   selects on data-dependent conditions, ex2/lg2, products, fmas, adds, and masked operands (a
+   value's bits through and/shr/shl/prmt/bfe that keep part of them, or xor/prmt that keep all).
 2. IR cases (sentryward-structural-ir-controls random): value IR built directly, with indexed
    selections (input elements are components of matrix loads), stored and unstored producers and
    mutations whose outcome the generator knows (an index, a recomputed cut, a second binding, a
@@ -17,7 +18,8 @@ Oracles. The reference (structural.cpp class Reference, --structural-reference) 
 leaf, cut, binding and role checks by plain reachability with its own term-element, load, output
 and binding mapping. Each generator also keeps its own dataflow model (sources reached, and
 through ex2/lg2), from which it knows whether a transcendental role holds and whether a mutation
-must be refused. Asserted: whenever the checker matches, the reference finds no failing or
+must be refused, and which sources it reaches only through partial masks (a stored value or a
+role that needs one in full must be refused). Asserted: whenever the checker matches, the reference finds no failing or
 undecided verdict and the generator's model does not say the case is wrong. Not vacuous: floors
 on matches, refusals per kind and shape, and (IR) on matches among the cases the model says are
 right.
@@ -57,9 +59,10 @@ class Kernel:
         self.name, self.objects, self.grid = name, objects, grid
         self.body, self.f, self.h, self.d, self.p, self.r = [], 0, 0, 20, 0, 3
         self.base = {}
-        # Per register, the generator's own dataflow model: the source tags some path reaches, and
-        # those reached through ex2/lg2 above them.
+        # Per register, the generator's own dataflow model: the source tags some path reaches, those
+        # reached through ex2/lg2 above them, and the same two over full paths (no partial mask).
         self.info = {}
+        self.stored, self.masks = [], Counter()
         for i, o in enumerate(objects):
             self.body.append(f"ld.param.u64 %rd{i + 1}, [{name}_param_{i}];")
             self.body.append(f"cvta.to.global.u64 %rd{10 + i}, %rd{i + 1};")
@@ -86,6 +89,7 @@ class Kernel:
         return r
 
     def store(self, o, r):
+        self.stored.append(r)
         self.body.append(f"st.global.f32 [{self.addr(o)}], {r};")
 
     def op(self, text, n=1):
@@ -116,14 +120,23 @@ def expression(rng, k, leaves, depth):
     """A random f32 expression over the registers `leaves`, using each at least once."""
     def mk(text, xs, trans=False):
         r = k.op(text)
-        alls = set().union(*(k.info[x][0] for x in xs)) if xs else set()
-        thr = set().union(*(k.info[x][1] for x in xs)) if xs else set()
-        k.info[r] = (alls, thr | (alls if trans else set()))
+        alls, thr, full, thr_full = (set().union(*(k.info[x][i] for x in xs)) if xs else set() for i in range(4))
+        k.info[r] = (alls, thr | (alls if trans else set()), full, thr_full | (full if trans else set()))
         return r
 
     def gen(d):
         if d == 0 or rng.random() < 0.25:
             return rng.choice(leaves)
+        if rng.random() < 0.08:  # a masked operand: x's bits through one bit operation
+            x = gen(d - 1)
+            text, keeps = rng.choice(MASKS)
+            i, o = k.rreg(), k.rreg()
+            k.body += [f"mov.b32 {i}, {x};", text.format(o=o, i=i)]
+            r = k.op(f"mov.b32 {{0}}, {o};")
+            alls, thr, full, thr_full = k.info[x]
+            k.info[r] = (alls, thr, full, thr_full) if keeps else (alls, thr, set(), set())
+            k.masks["full" if keeps else "partial"] += 1
+            return r
         c = rng.random()
         if c < 0.2:
             x, y = gen(d - 1), gen(d - 1)
@@ -169,13 +182,26 @@ def expression(rng, k, leaves, depth):
 
 def model_holds(k, reg, tag, role):
     """Whether the generator's model says `role` of the argument tagged `tag` holds at `reg`: True,
-    False, or None (a role the model does not decide)."""
-    alls, thr = k.info[reg]
+    False, or None (a role the model does not decide). Reaching (through ex2/lg2) needs a full path;
+    avoiding counts partial ones."""
+    alls, thr, full, thr_full = k.info[reg]
     if role == "through_transcendental":
-        return tag in thr
+        return tag in thr_full
     if role == "avoids_transcendental":
-        return tag in alls and tag not in thr
+        return tag in full and tag not in thr
     return None
+
+
+def src(tag):
+    return ({tag}, set(), {tag}, set())
+
+
+# Masks of an f32's bits: (instruction, whether every bit is kept).
+# A use of an f32's own top 16 bits (shr 16, and 0xffff0000) is a rounding toward zero to bf16: full.
+MASKS = [("and.b32 {o}, {i}, 65535;", False), ("shl.b32 {o}, {i}, 16;", False), ("shr.u32 {o}, {i}, 24;", False),
+         ("prmt.b32 {o}, {i}, 0, 4112;", False), ("bfe.u32 {o}, {i}, 8, 16;", False),
+         ("and.b32 {o}, {i}, 2147483647;", False), ("xor.b32 {o}, {i}, 2147483648;", True),
+         ("prmt.b32 {o}, {i}, 0, 12816;", True), ("shr.u32 {o}, {i}, 16;", True), ("and.b32 {o}, {i}, 4294901760;", True)]
 
 
 def roles(rng, k, reg, tag, wrong=True):
@@ -184,7 +210,7 @@ def roles(rng, k, reg, tag, wrong=True):
     refuse), else a random set. Without `wrong`: the role that holds, or none (producers, so that a
     case reaches its consumer's roles)."""
     c = rng.random()
-    alls, thr = k.info[reg]
+    alls, thr = k.info[reg][:2]
     if not wrong:
         if c < 0.6 and tag in alls:
             return ["through_transcendental" if tag in thr else "avoids_transcendental"]
@@ -226,13 +252,14 @@ def case(rng, name):
         objects = ["a", "b", "p"] + (["q"] if two else []) + ["y"]
         k = Kernel(name, objects, grid)
         a, b = k.load("a"), k.load("b")
-        k.info[a], k.info[b] = ({"a"}, set()), ({"b"}, set())
+        k.info[a], k.info[b] = src("a"), src("b")
         p = expression(rng, k, [a], rng.randint(0, 3))
         k.store("p", p)
 
         def reread(o, r):  # a cut read back through memory or used from its register
             x = k.load(o) if rng.random() < 0.5 else r
-            k.info[x] = (k.info[r][0] | {o}, k.info[r][1])
+            alls, thr, full, thr_full = k.info[r]
+            k.info[x] = (alls | {o}, thr, full | {o}, thr_full)
             return x
         nodes = [opaque("P", [{"input": 0, "reads": IDENT}], checked(k, p, ["a"], [roles(rng, k, p, "a", wrong=False)]), "p")]
         regs = {"p": p}
@@ -259,13 +286,15 @@ def case(rng, name):
         objects = ["a", "b", "c"] + [f"y{i}" for i in range(uses)]
         k = Kernel(name, objects)
         a, b, cc = k.load("a"), k.load("b"), k.load("c")
-        k.info[a] = ({"a"}, set())
+        k.info[a] = src("a")
         t = expression(rng, k, [a], rng.randint(1, 3))
         p_roles = roles(rng, k, t, "a")
         nodes = [opaque("P", [{"input": 0, "reads": IDENT}], [p_roles], None)]
         for i in range(uses):
             u = t if rng.random() < 0.8 else expression(rng, k, [a], rng.randint(1, 2))
             checked(k, u, ["a"], [p_roles])  # each value a use binds (two values: producer_binding)
+            if k.info[u][0] != k.info[u][2]:  # a bound value that reaches a only through a mask
+                truth[0] = False
             k.store(f"y{i}", k.op(f"add.f32 {{0}}, {u}, {[b, cc][i]};"))
             nodes.append({"op": "add", "atom": {"kind": "primitive", "operation": "add", "commutative": True},
                           "format": {"compute": None, "store": "f32"},
@@ -278,7 +307,7 @@ def case(rng, name):
         objects = ["a", "b", "y"]
         k = Kernel(name, objects)
         a, b = k.load("a"), k.load("b")
-        k.info[a], k.info[b] = ({"a"}, set()), ({"b"}, set())
+        k.info[a], k.info[b] = src("a"), src("b")
         v = expression(rng, k, [a], rng.randint(0, 2))
         steps = [16, 8, 4, 2, 1]
         if rng.random() < 0.25:
@@ -292,12 +321,16 @@ def case(rng, name):
         tags = ["a"] + (["b"] if use_b else [])
         nodes = [opaque("R", args, checked(k, y, tags, [roles(rng, k, y, tg) for tg in tags]), "y")]
         term = {"objects": [obj(o) for o in objects], "inputs": ["a", "b"], "nodes": nodes}
+    for r in k.stored:  # a stored value that reaches a source only through a mask
+        if r in k.info and k.info[r][0] != k.info[r][2]:
+            truth[0] = False
+    masked = "partial" if k.masks["partial"] else "full" if k.masks["full"] else None
     term.update({"schema": "sentryward.structural-term/v2", "row": f"diff/{name}", "template": f"diff/{name}"})
     inputs = {"schema": "spverify.kernel-input/v1", "entry": name,
               "launch": {"grid_dim": [grid, 1, 1], "block_dim": [THREADS, 1, 1], "dynamic_shared_bytes": 0},
               "declarations": [{"parameter": i, "type": "pointer", "space": "global", "object": o}
                                for i, o in enumerate(objects)], "arguments": []}
-    return shape, grid, truth[0], term, inputs, k.text()
+    return shape, grid, truth[0], masked, term, inputs, k.text()
 
 
 def run_case(native, d, term, inputs, ptx):
@@ -333,16 +366,18 @@ class StructuralDifferentialTest(unittest.TestCase):
     def test_checker_never_accepts_where_the_reference_or_the_model_refuses(self):
         rng = random.Random(SEED)
         keep = os.environ.get("SENTRYWARD_DIFF_KEEP")
-        outcomes, shapes, agree, violations = Counter(), Counter(), Counter(), []
+        outcomes, shapes, agree, violations, masked = Counter(), Counter(), Counter(), [], Counter()
         checks = Counter()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(keep or tmp)
             for i in range(CASES):
                 name = f"diff_{i}"
-                shape, grid, truth, term, inputs, ptx = case(rng, name)
+                shape, grid, truth, mask, term, inputs, ptx = case(rng, name)
                 r = run_case(NATIVE, root / name, term, inputs, ptx)
                 o = outcome(r)
                 outcomes[o] += 1
+                if mask:
+                    masked[(mask, o)] += 1
                 shapes[(shape + ("/class" if r.get("class_mode") else ""), "matched" if o == "matched" else "refused")] += 1
                 ref = r.get("reference", {})
                 if o != "matched":
@@ -355,11 +390,16 @@ class StructuralDifferentialTest(unittest.TestCase):
                 if problems or not truth:
                     violations.append({"case": i, "shape": shape, "reference": problems, "model": truth})
         print(f"\nPTX seed {SEED:#x}, {CASES} cases: {dict(outcomes)}\n  shapes: {dict(shapes)}\n"
-              f"  reference checks in matched cases: {dict(checks)}\n  {dict(agree)}")
+              f"  reference checks in matched cases: {dict(checks)}\n  {dict(agree)}\n  masked operands: {dict(masked)}")
         self.assertEqual(violations, [], f"checker matched where the reference or the model refuses (seed {SEED:#x})")
         self.assertGreater(outcomes["matched"], CASES // 10)
         self.assertGreater(outcomes["refused:role"], CASES // 20)
         self.assertGreater(outcomes["refused:leaves"], 0)
+        # Masked operands: a case whose model needs a source only a partial mask reaches is never
+        # matched (asserted above); some are refused partial_operand (others fail earlier, or reach
+        # the source in full elsewhere and match); cases with only full masks still match.
+        self.assertGreaterEqual(masked[("partial", "refused:partial_operand")], CASES // 100)
+        self.assertGreater(masked[("full", "matched")], 0)
         for s in ("chain/class", "reduction", "unstored"):
             self.assertGreater(shapes[(s, "matched")], 0, s)
         self.assertGreater(checks["roles"], 0)
