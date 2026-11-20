@@ -810,3 +810,257 @@
 	st.global.f32 [%rd9], %f4;
 	ret;
 }
+
+// partial_mul_var: round-6 review reproducer: p * (p << 1) = 2p^2 mod 2^32 ignores p's bit 31 (the other factor's trailing zeros are not decided zero)
+.visible .entry partial_mul_var(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shl.b32 %r4, %r2, 1;
+	mul.lo.u32 %r3, %r2, %r4;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_mul_var_even: p * (p | 2) << 1: the other factor's low bit is fixed zero
+.visible .entry partial_mul_var_even(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	or.b32 %r4, %r2, 2;
+	shl.b32 %r5, %r4, 1;
+	mul.lo.u32 %r3, %r2, %r5;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_mad_var: mad.lo with the factor p << 1, addend 0: as partial_mul_var
+.visible .entry partial_mad_var(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shl.b32 %r4, %r2, 1;
+	mad.lo.u32 %r3, %r2, %r4, 0;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_div_var: p / (p | 1): an integer quotient by a data value (bits read not decided)
+.visible .entry partial_div_var(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	or.b32 %r4, %r2, 1;
+	div.u32 %r3, %r2, %r4;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_shr_as_f32: round-6 review reproducer: p's own float bits >> 16 stored as an f32 (1.0f gives 0x00003f80): not a narrowing
+.visible .entry partial_shr_as_f32(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	shr.u32 %r5, %r4, 16;
+	mov.b32 %r3, %r5;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_mul_odd: positive: p * 3 (an odd factor: every bit of p reaches the product)
+.visible .entry partial_mul_odd(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mul.lo.u32 %r3, %r2, 3;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_mul_var_odd: positive: p * (p | 1): the other factor's low bit is fixed one
+.visible .entry partial_mul_var_odd(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	or.b32 %r4, %r2, 1;
+	mul.lo.u32 %r3, %r2, %r4;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}
+
+// partial_four_bit_mask: p & ((p>>2 ^ p>>3) & (p ^ p>>1)): a data mask whose bits each depend on four of p's bits (zero at every reference probe); the reference is undecided
+.visible .entry partial_four_bit_mask(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd5;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shr.u32 %r4, %r2, 1;
+	xor.b32 %r4, %r2, %r4;
+	shr.u32 %r5, %r2, 2;
+	shr.u32 %r6, %r2, 3;
+	xor.b32 %r5, %r5, %r6;
+	and.b32 %r5, %r5, %r4;
+	and.b32 %r3, %r2, %r5;
+	mov.b32 %f4, %r3;
+	st.global.f32 [%rd9], %f4;
+	ret;
+}

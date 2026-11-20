@@ -118,10 +118,16 @@ class StructuralNativeTest(unittest.TestCase):
     # same-width reload of a stored value) and now refutes each by its own rule.
     PARTIAL = ["and_mask", "or_mask", "shl", "shr_u", "shr_s_past", "shift_mixed", "bfe", "bfi", "prmt", "lop3",
                "shf", "cvt_narrow", "unpack", "copysign", "selp_narrow", "abs", "mul_even", "data_mask",
-               "round_low", "round_no_sign", "round_short"]
-    # round_bf16: p's own float bits truncated to their top 16 (sign, exponent, 7 mantissa bits),
-    # a rounding toward zero to bf16 (as combine's pos_store_trunc control stores its result).
-    FULL = ["xor_full", "prmt_full", "lop3_full", "round_bf16", "round_bf16_shr"]
+               "round_low", "round_no_sign", "round_short",
+               # Round-6 review: an integer product whose other factor's trailing zeros are not
+               # decided zero (p * (p << 1) = 2p^2 ignores p's bit 31; also mad.lo, a factor with
+               # its low bit fixed zero, a quotient by data), and p's float bits >> 16 used as an
+               # f32 (0x00003f80 for 1.0f: not a narrowing). round_bf16_shr (>> 16 then << 16, an
+               # f32) is refused too: a shift is not a rounding, only a narrowing store is (narrow.ptx).
+               "mul_var", "mul_var_even", "mad_var", "div_var", "shr_as_f32", "round_bf16_shr"]
+    # round_bf16: and 0xffff0000 on p's own float bits clears the low mantissa in place: p rounded
+    # toward zero, in f32. mul_odd (p * 3), mul_var_odd (p * (p | 1)): the other factor is odd.
+    FULL = ["xor_full", "prmt_full", "lop3_full", "round_bf16", "mul_odd", "mul_var_odd"]
 
     def test_partial_operands_refused_by_checker_and_reference(self):
         for name in self.PARTIAL:
@@ -137,6 +143,41 @@ class StructuralNativeTest(unittest.TestCase):
             self.assertEqual(r["result"], "matched", name)
             ref = r["reference"]
             self.assertEqual([ref[s]["fails"] + ref[s]["undecided"] for s in ("leaves", "cuts")], [[], []], name)
+
+    # Narrowing controls (ptx/narrow.ptx): p = a + b stored as f32, one 16-bit value per thread
+    # stored into y. Term pack_bf16 (y a bf16 field) or pack_f16 (an f16 field).
+    # Positives: p's float bits >> 16 stored as u16 (k_combine_pos_store_trunc's PTX: mov.b32,
+    # shr.u32 16, st.global.u16) and shr.s32 (the same 16 stored bits), cvt.rn and cvt.rz to bf16.
+    NARROW_FULL = ["shr_store", "shr_signed", "cvt_rn", "cvt_rz"]
+    # Negatives: >> 17 (not the bf16 encoding), >> 16 of p reloaded as u32 (an integer view, not
+    # p's float bits); and shr_store into an f16 field (pack_f16).
+    NARROW_PARTIAL = ["shr17", "shr_reload"]
+
+    def test_narrowing_store_is_a_rounding(self):
+        for name in self.NARROW_FULL:
+            r = run(f"narrow_{name}", "pack_bf16", "narrow", reference=True)
+            self.assertEqual(r["result"], "matched", name)
+            ref = r["reference"]
+            self.assertEqual([ref[s]["fails"] + ref[s]["undecided"] for s in ("leaves", "cuts")], [[], []], name)
+
+    def test_other_top_half_uses_refused(self):
+        cases = [(f"narrow_{n}", "pack_bf16") for n in self.NARROW_PARTIAL] + [("narrow_shr_store", "pack_f16")]
+        for entry, term in cases:
+            r = run(entry, term, "narrow", reference=True)
+            self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"), (entry, term))
+            leaves = r["reference"]["leaves"]
+            self.assertGreater(len(leaves["fails"]), 0, entry)
+            self.assertEqual(leaves["undecided"], [], entry)
+
+    def test_reference_undecided_outside_exact_probes(self):
+        # Round-6 ruling (c): y = p & ((p>>2 ^ p>>3) & (p ^ p>>1)). Each mask bit depends on four of
+        # p's bits and is zero at every reference probe; the reference reports undecided (never
+        # agreement), the checker refuses the data mask.
+        r = run("partial_four_bit_mask", "pack", "partial", reference=True)
+        self.assertEqual((r["result"], r["reason"]), ("refused", "partial_operand"))
+        leaves = r["reference"]["leaves"]
+        self.assertEqual(leaves["fails"], [])
+        self.assertIn("more than three free bits", leaves["undecided"][0]["why"])
 
     def test_partial_stored_read_refused(self):
         # p = a + b stored, its low half read back as u16 (memory, not registers).

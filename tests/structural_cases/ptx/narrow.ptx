@@ -1,0 +1,188 @@
+//
+// Narrowing controls (tests/test_structural_native.py; emitted by a script, kept as text).
+// Each kernel stores p = a + b (f32) and one 16-bit value per thread into y. Terms: pack_bf16
+// (y a bf16 field) and pack_f16 (y an f16 field): P(a, b) -> p, C(p) -> y. A narrowing of p's own
+// float bits (cvt to bf16, or the bits >> 16 stored as the 16-bit element of a bf16 field) is a
+// rounding; any other partial use of p's bits is refused (partial_operand).
+//
+
+.version 8.8
+.target sm_90a
+.address_size 64
+
+// narrow_shr_store: positive: p's own float bits >> 16 stored as u16 into the bf16 field (k_combine_pos_store_trunc's form)
+.visible .entry narrow_shr_store(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd10;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	shr.u32 %r3, %r4, 16;
+	st.global.u16 [%rd9], %r3;
+	ret;
+}
+
+// narrow_cvt_rn: positive: cvt.rn.bf16.f32 stored into the bf16 field
+.visible .entry narrow_cvt_rn(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd10;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	cvt.rn.bf16.f32 %h1, %f3;
+	st.global.b16 [%rd9], %h1;
+	ret;
+}
+
+// narrow_cvt_rz: positive: cvt.rz.bf16.f32 stored into the bf16 field
+.visible .entry narrow_cvt_rz(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd10;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	cvt.rz.bf16.f32 %h1, %f3;
+	st.global.b16 [%rd9], %h1;
+	ret;
+}
+
+// narrow_shr17: shr by 17: bits 17..31 in a bf16 field (not the bf16 encoding of p)
+.visible .entry narrow_shr17(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd10;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	shr.u32 %r3, %r4, 17;
+	st.global.u16 [%rd9], %r3;
+	ret;
+}
+
+// narrow_shr_reload: shr 16 of p reloaded as u32 (an integer view, not p's float bits) into the bf16 field
+.visible .entry narrow_shr_reload(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd10;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	shr.u32 %r3, %r2, 16;
+	st.global.u16 [%rd9], %r3;
+	ret;
+}
+
+// narrow_shr_signed: shr.s32 by 16 stored as u16: the same low 16 bits (bits 16..31) as shr.u32
+.visible .entry narrow_shr_signed(.param .u64 a, .param .u64 b, .param .u64 p, .param .u64 y)
+{
+	.reg .b32 %r<8>;
+	.reg .b16 %h<4>;
+	.reg .f32 %f<8>;
+	.reg .b64 %rd<12>;
+	.reg .pred %q<2>;
+	ld.param.u64 %rd1, [a];
+	ld.param.u64 %rd2, [b];
+	ld.param.u64 %rd3, [p];
+	ld.param.u64 %rd4, [y];
+	mov.u32 %r1, %tid.x;
+	mul.wide.u32 %rd5, %r1, 4;
+	mul.wide.u32 %rd10, %r1, 2;
+	add.u64 %rd6, %rd1, %rd5;
+	add.u64 %rd7, %rd2, %rd5;
+	add.u64 %rd8, %rd3, %rd5;
+	add.u64 %rd9, %rd4, %rd10;
+	ld.global.f32 %f1, [%rd6];
+	ld.global.f32 %f2, [%rd7];
+	add.f32 %f3, %f1, %f2;
+	st.global.f32 [%rd8], %f3;
+	ld.global.u32 %r2, [%rd8];
+	mov.b32 %r4, %f3;
+	shr.s32 %r3, %r4, 16;
+	st.global.u16 [%rd9], %r3;
+	ret;
+}
