@@ -335,13 +335,36 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
     for(const auto& [p,q]:corners)if(start(i,p)!=start(j,q))return std::pair{p,q};
     return std::nullopt;
   };
+  // Relation by base (docs/design/relation-by-base.md): two families on one resolved allocation
+  // with different symbolic suffixes, each c + S t + a(m) with the same S (MemoryModel::windowForm).
+  // For t1 != t2 their windows [S t, S (t + 1)) are disjoint; for t1 == t2 only the pairs whose
+  // within-window ranges intersect can share a byte. So R, computed from the within-window
+  // offsets alone, contains every overlapping member pair in either case, and the pair is safe
+  // when happens-before orders all of R. It never reports a race or an unresolved verdict.
+  std::vector<std::optional<std::optional<WindowForm>>> windows(families.size());
+  const auto window_of=[&](std::size_t k) -> const std::optional<WindowForm>& {
+    if(!windows[k])windows[k]=memory.windowForm(families[k],footprints[k]);
+    return *windows[k];
+  };
+  const auto related_by_base=[&](std::size_t i,std::size_t j) {
+    const auto& x=footprints[i];const auto& y=footprints[j];
+    if(i==j || x.symbolic.empty() || y.symbolic.empty() || x.symbolic==y.symbolic || copy_classes[i] || copy_classes[j] ||
+        x.space!=y.space || x.allocation.empty() || x.allocation!=y.allocation || !x.alias.empty() || !y.alias.empty())
+      return false;
+    const auto& a=window_of(i);const auto& b=window_of(j);
+    return a && b && a->stride==b->stride && a->atom!=b->atom;
+  };
+  const auto within_window=[&](std::size_t k) {
+    auto footprint=footprints[k];footprint.symbolic.clear();footprint.gathers.clear();
+    return footprint;
+  };
   auto order=ProfileCall("memory.family.conflict_order",[&] {
     auto result=FamilyConflictOrder(families,footprints,graph.traceOrder(),blocked_families);
     ProfileScope counts("memory.family.conflict_order_counts");
     counts.nodes=result.reducedFamilies();counts.edges=result.memberChecks();
     return result;
   });
-  std::size_t relation_count=0,row_enumerations=0;
+  std::size_t relation_count=0,row_enumerations=0,base_relations=0;
   std::size_t obligation_rows=0,self_rows=0;
   ProfileScope expansion("memory.family.expansion_sites");
   ObligationGroups duplicates,same_values;
@@ -396,7 +419,8 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
     profile.nodes=families.size();profile.edges=relation_count;
     profile.pruned=row_enumerations+hb.stats().member_enumerations-initial_hb_stats.member_enumerations;
     result.family_stats=MemoryRaceResult::FamilyStats{logical_accesses,families.size(),relation_count,
-        row_enumerations,hb.stats().member_enumerations-initial_hb_stats.member_enumerations,hb.stats().frontier_pieces-initial_hb_stats.frontier_pieces};
+        row_enumerations,hb.stats().member_enumerations-initial_hb_stats.member_enumerations,hb.stats().frontier_pieces-initial_hb_stats.frontier_pieces,
+        base_relations};
     result.reachability_stats.batches=hb.stats().traversals-initial_hb_stats.traversals;
     result.reachability_stats.queries=result.address_candidates;
     result.reachability_stats.edge_visits=hb.stats().relation_visits-initial_hb_stats.relation_visits;
@@ -404,6 +428,8 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
   };
   std::vector<FamilyRelationBatch> batch;
   std::vector<std::vector<std::pair<std::size_t,std::size_t>>> metadata;
+  // Per request: its relation is R of a pair related by base (docs/design/relation-by-base.md).
+  std::vector<std::vector<std::uint8_t>> by_base;
   const auto process=[&]() -> std::optional<Output> {
     const auto hb_start=std::chrono::steady_clock::now();
     hb.checkOrderBatch(batch);
@@ -412,6 +438,12 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
     const auto& requests=batch[block].requests;const auto& targets=metadata[block];
     for(std::size_t q=0;q<requests.size();++q)for(std::size_t domain=0;domain<requests[q].requested.size();++domain) {
       const auto i=targets[q].first,j=targets[q].second;
+      // R contains every member pair that can share a byte. An unordered pair of R is not a race
+      // here: give up on the launch, exactly as below, and let the exact fallback decide.
+      if(by_base[block][q]) {
+        if(requests[q].witness(domain)) {profile.pruned=2;declined=true;return {};}
+        continue;
+      }
       const bool duplicate_candidate=copy_classes[i] && copy_classes[i]==copy_classes[j];
       const bool same_candidate=!duplicate_candidate && same_value_candidate(i,j);
       // Obligations take the complete unordered residual, not one witness.
@@ -524,7 +556,7 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
     }
     }
     }
-    batch.clear();metadata.clear();return {};
+    batch.clear();metadata.clear();by_base.clear();return {};
   };
   // Query ordering is independent of program scheduling. Group source
   // domains by physical mask width before forming batches; alternating small
@@ -542,6 +574,7 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
       const auto source_family=domain_source.second;
       std::vector<FamilyRelationRequest> requests;
       std::vector<std::pair<std::size_t,std::size_t>> targets;
+      std::vector<std::uint8_t> base_requests;
       ProfileScope candidates("memory.family.generate_relations");
       for(auto i:source_accesses) {
         const auto& first=families[i];
@@ -550,7 +583,16 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
           ++candidates.edges;
           const auto& second=families[j];
           if(second.first.mode==AccessMode::kWrite && j<i)return;
-          auto overlap=ClassifyFamilyOverlap(first,footprints[i],second,footprints[j]);
+          // A pair related by base: R from the within-window offsets, by the same exact interval
+          // arithmetic; an unknown part (unrepresentable arithmetic) keeps the existing path.
+          bool base=related_by_base(i,j);
+          std::optional<FamilyOverlap> window;
+          if(base) {
+            window=ClassifyFamilyOverlap(first,within_window(i),second,within_window(j));
+            if(!window->unknown.empty()) {window.reset();base=false;}
+          }
+          auto overlap=window?std::move(*window):ClassifyFamilyOverlap(first,footprints[i],second,footprints[j]);
+          if(base)++base_relations;
           row_enumerations+=overlap.member_rows;
           expansion.nodes=row_enumerations;
           for(auto& r:overlap.unknown)overlap.overlap.push_back(std::move(r));
@@ -570,6 +612,7 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
           relation_count+=overlap.overlap.size();
           profile.edges=relation_count;
           requests.push_back({second.event_family,std::move(overlap.overlap)});targets.push_back({i,j});
+          base_requests.push_back(base);
         };
         candidates_of(i,candidate);
       }
@@ -585,6 +628,7 @@ std::optional<Result<MemoryRaceResult,MemoryAnalysisError>> TryFamilyMemoryCheck
         if(declined)return {};
       }
       batch.push_back({source_family,std::move(requests)});metadata.push_back(std::move(targets));
+      by_base.push_back(std::move(base_requests));
       ProfileSnapshot();
     }
     profile.nodes=families.size();profile.edges=relation_count;profile.pruned=row_enumerations+hb.stats().member_enumerations;

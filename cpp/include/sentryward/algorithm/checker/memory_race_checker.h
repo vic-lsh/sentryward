@@ -77,6 +77,8 @@ struct MemoryRaceResult final {
   struct FamilyStats {
     std::size_t logical_accesses=0,access_families=0,candidate_relations=0;
     std::size_t affine_member_rows=0,hb_member_enumerations=0,hb_frontier_pieces=0;
+    // Family pairs related by base (docs/design/relation-by-base.md).
+    std::size_t base_relations=0;
   };
   std::optional<FamilyStats> family_stats;
   MemoryRaceStatus status = MemoryRaceStatus::kRaceFree;
