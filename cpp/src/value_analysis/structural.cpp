@@ -15,6 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "sentryward/equivalence/constant_values.h"
 #include "sentryward/value_analysis/scalar_specialization.h"
 #include "sentryward/value_ir/operations.h"
 #include "sentryward/value_ir/ptx_operation.h"
@@ -452,6 +453,94 @@ class Checker {
     return s;
   }
 
+  // Refuses an operation of x (operands xs) where an operand whose value the launch does not fix
+  // reaches x by a dead edge: a constant (a literal, or a value the launch fixes) decides x without
+  // it. Such an edge would count as a path (a role) and a dependency (a leaf) that the value does
+  // not have: a*b + 0*ex2(a) is not a path from a through ex2. Decided exactly: a product (mul,
+  // mad, an fma's product) with a zero factor; and with zero; or with all ones; a logical shift by
+  // at least the width; bfe of length zero; a select whose condition is fixed (a fixed condition
+  // is normally resolved to its chosen operand before this step). Not decided here, and so still
+  // counted as paths: partial masks, lop3 tables, prmt selectors, copysign (see the docs).
+  // The constant value y the launch fixes, or none: the scalar specialization's facts (integers,
+  // bits, predicates) or a floating literal or specialized parameter (exact, by its literal).
+  std::optional<equivalence::ConstantValue> fixed(const v::Value& y) {
+    if (auto k = spec_.known(y)) return k;
+    const auto x = resolve(y);
+    if (x.conversion() || !x.indices().empty() || x.threadSelector()) return std::nullopt;
+    const auto& type = g_.type(x);
+    if (!type.isScalar() || type.element().kind() != v::ElementKind::Floating) return std::nullopt;
+    const auto& op = g_.definingNode(x).operation();
+    std::optional<std::string> literal;
+    if (const auto* c = dynamic_cast<const v::ConstantOp*>(&op)) literal = c->literal();
+    else if (const auto* p = dynamic_cast<const v::InputParameterOp*>(&op)) literal = p->specializedLiteral();
+    if (!literal) return std::nullopt;
+    return equivalence::constantValue(type.element().toString(), *literal);
+  }
+
+  void deadOperands(const v::Value& x, const v::Operation& op, const std::vector<v::Value>& xs) {
+    const auto known = [&](std::size_t i) { return i < xs.size() ? fixed(xs[i]) : std::nullopt; };
+    const auto live = [&](std::size_t i) { return i < xs.size() && !fixed(xs[i]); };
+    const auto zero = [&](std::size_t i) {
+      const auto k = known(i);
+      return k && (k->literal == "0" || k->literal == "-0");
+    };
+    const auto dead = [&](std::size_t i, const char* why) {
+      refuse("dead_operand", std::string("an operand reaches the value by a dead edge: ") + why,
+             {{"operation", std::string(op.name())}, {"operand", i}, {"node", x.nodeId()}, {"instance", x.instanceIndex()}});
+    };
+    // A product's factors: k kills the other factor j.
+    const auto product = [&](std::size_t f0, std::size_t f1) {
+      if (zero(f0) && live(f1)) dead(f1, "a product with a zero factor");
+      if (zero(f1) && live(f0)) dead(f0, "a product with a zero factor");
+    };
+    if (const auto* b = dynamic_cast<const v::BinaryOp*>(&op); b && xs.size() == 2) {
+      using B = v::BinaryOpcode;
+      const auto& type = g_.type(x).element();
+      const auto width = type.kind() == v::ElementKind::Floating ? 0u : type.width();
+      const auto ones = [&](std::size_t i) {
+        const auto k = known(i);
+        return k && width && width <= 64 &&
+               (k->literal == "-1" || k->literal == std::to_string(width == 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << width) - 1));
+      };
+      switch (b->opcode()) {
+        case B::Multiply: product(0, 1); break;
+        case B::BitAnd:
+          if (zero(0) && live(1)) dead(1, "and with zero");
+          if (zero(1) && live(0)) dead(0, "and with zero");
+          break;
+        case B::BitOr:
+          if (ones(0) && live(1)) dead(1, "or with all ones");
+          if (ones(1) && live(0)) dead(0, "or with all ones");
+          break;
+        case B::ShiftLeft:
+        case B::ShiftRight:
+          if (const auto k = known(1); k && width && live(0) &&
+              (b->opcode() == B::ShiftLeft || type.kind() != v::ElementKind::SignedInteger)) {
+            std::uint64_t amount = 0;
+            try { amount = std::stoull(k->literal); } catch (const std::exception&) { break; }
+            if (k->literal[0] != '-' && amount >= width) dead(0, "a logical shift by at least the width");
+          }
+          break;
+        default: break;
+      }
+    } else if (dynamic_cast<const v::FmaOp*>(&op)) {
+      product(0, 1);
+    } else if (const auto* p = dynamic_cast<const v::PtxScalarOp*>(&op)) {
+      using O = v::PtxScalarOpcode;
+      if (p->opcode() == O::MultiplyAdd || p->opcode() == O::MultiplyAddCarry) product(0, 1);
+      if (p->opcode() == O::BitExtract && xs.size() == 3 && live(0)) {
+        if (const auto k = known(2)) {
+          std::uint64_t len = 1;
+          try { len = std::stoull(k->literal); } catch (const std::exception&) {}
+          if (k->literal[0] != '-' && (len & 0xff) == 0) dead(0, "bfe of length zero");
+        }
+      }
+    } else if (dynamic_cast<const v::SelectOp*>(&op) && xs.size() == 3 && known(0)) {
+      const std::size_t unchosen = known(0)->literal == "1" ? 2 : 1;
+      if (live(unchosen)) dead(unchosen, "a select whose condition is fixed");
+    }
+  }
+
   // One step of the complete dataflow of a resolved value x (no thread selector): its successors
   // (index values first, then the conversion source, the replaced load's stored value or the
   // operation's operands), whether x is a leaf (an initial-memory load, a constant, a parameter or
@@ -506,7 +595,9 @@ class Checker {
       unsupported("operation_kind", "an operation kind the structural check does not classify",
                   {{"operation", std::string(op.name())}});
     f.trans = transcendental(op);
-    for (const auto& a : g_.instanceOperands(x)) f.next.push_back(a);
+    const auto operands = g_.instanceOperands(x).toVector();
+    deadOperands(x, op, operands);
+    for (const auto& a : operands) f.next.push_back(a);
     return f;
   }
 
@@ -530,7 +621,9 @@ class Checker {
       } else if (dynamic_cast<const v::OpaqueValueOp*>(&op) || dynamic_cast<const v::FailedClcResponseOp*>(&op)) {
         unsupported("undetermined_value", "a value whose bits the IR does not determine");
       } else {
-        for (const auto& a : g_.instanceOperands(x)) s = unite(s, leaves(a, depth + 1));
+        const auto operands = g_.instanceOperands(x).toVector();
+        deadOperands(x, op, operands);
+        for (const auto& a : operands) s = unite(s, leaves(a, depth + 1));
         for (const auto& i : x.indices()) s = unite(s, leaves(i, depth + 1));
       }
     }

@@ -1,0 +1,147 @@
+//
+// Dead-edge controls for tests/test_structural_native.py (hand-written; nvcc folds them away).
+// Each computes y = a * b + D(a), where D(a) passes ex2 but a constant decides D without a:
+// dead_and: and.b32 of ex2(a)'s bits with 0; dead_shl: shl.b32 of ex2(a)'s bits by 32;
+// dead_sel: selp(ex2(a), 0, tid < 0) (the condition is fixed per thread, so the select resolves to
+// 0); live_and (positive): and.b32 of ex2(a)'s bits with 0x7fffffff (|ex2(a)|, a live path).
+// Term silu_mul: through_transcendental on a, avoids_transcendental on b.
+//
+
+.version 8.8
+.target sm_90a
+.address_size 64
+
+.visible .entry dead_and(
+	.param .u64 dead_and_param_0,
+	.param .u64 dead_and_param_1,
+	.param .u64 dead_and_param_2
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<8>;
+	.reg .b32 	%r<4>;
+	.reg .b64 	%rd<11>;
+
+	ld.param.u64 	%rd1, [dead_and_param_0];
+	ld.param.u64 	%rd2, [dead_and_param_1];
+	ld.param.u64 	%rd3, [dead_and_param_2];
+	cvta.to.global.u64 	%rd4, %rd3;
+	cvta.to.global.u64 	%rd5, %rd2;
+	cvta.to.global.u64 	%rd6, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd7, %r1, 4;
+	add.s64 	%rd8, %rd6, %rd7;
+	ld.global.f32 	%f1, [%rd8];
+	add.s64 	%rd9, %rd5, %rd7;
+	ld.global.f32 	%f2, [%rd9];
+	ex2.approx.f32 	%f5, %f1;
+	mov.b32 	%r2, %f5;
+	and.b32 	%r3, %r2, 0;
+	mov.b32 	%f6, %r3;
+	mul.f32 	%f7, %f1, %f2;
+	add.f32 	%f3, %f7, %f6;
+	add.s64 	%rd10, %rd4, %rd7;
+	st.global.f32 	[%rd10], %f3;
+	ret;
+}
+
+.visible .entry dead_shl(
+	.param .u64 dead_shl_param_0,
+	.param .u64 dead_shl_param_1,
+	.param .u64 dead_shl_param_2
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<8>;
+	.reg .b32 	%r<4>;
+	.reg .b64 	%rd<11>;
+
+	ld.param.u64 	%rd1, [dead_shl_param_0];
+	ld.param.u64 	%rd2, [dead_shl_param_1];
+	ld.param.u64 	%rd3, [dead_shl_param_2];
+	cvta.to.global.u64 	%rd4, %rd3;
+	cvta.to.global.u64 	%rd5, %rd2;
+	cvta.to.global.u64 	%rd6, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd7, %r1, 4;
+	add.s64 	%rd8, %rd6, %rd7;
+	ld.global.f32 	%f1, [%rd8];
+	add.s64 	%rd9, %rd5, %rd7;
+	ld.global.f32 	%f2, [%rd9];
+	ex2.approx.f32 	%f5, %f1;
+	mov.b32 	%r2, %f5;
+	shl.b32 	%r3, %r2, 32;
+	mov.b32 	%f6, %r3;
+	mul.f32 	%f7, %f1, %f2;
+	add.f32 	%f3, %f7, %f6;
+	add.s64 	%rd10, %rd4, %rd7;
+	st.global.f32 	[%rd10], %f3;
+	ret;
+}
+
+.visible .entry dead_sel(
+	.param .u64 dead_sel_param_0,
+	.param .u64 dead_sel_param_1,
+	.param .u64 dead_sel_param_2
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<8>;
+	.reg .b32 	%r<4>;
+	.reg .b64 	%rd<11>;
+
+	ld.param.u64 	%rd1, [dead_sel_param_0];
+	ld.param.u64 	%rd2, [dead_sel_param_1];
+	ld.param.u64 	%rd3, [dead_sel_param_2];
+	cvta.to.global.u64 	%rd4, %rd3;
+	cvta.to.global.u64 	%rd5, %rd2;
+	cvta.to.global.u64 	%rd6, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd7, %r1, 4;
+	add.s64 	%rd8, %rd6, %rd7;
+	ld.global.f32 	%f1, [%rd8];
+	add.s64 	%rd9, %rd5, %rd7;
+	ld.global.f32 	%f2, [%rd9];
+	ex2.approx.f32 	%f5, %f1;
+	setp.lt.u32 	%p1, %r1, 0;
+	selp.f32 	%f6, %f5, 0f00000000, %p1;
+	mul.f32 	%f7, %f1, %f2;
+	add.f32 	%f3, %f7, %f6;
+	add.s64 	%rd10, %rd4, %rd7;
+	st.global.f32 	[%rd10], %f3;
+	ret;
+}
+
+.visible .entry live_and(
+	.param .u64 live_and_param_0,
+	.param .u64 live_and_param_1,
+	.param .u64 live_and_param_2
+)
+{
+	.reg .pred 	%p<2>;
+	.reg .f32 	%f<8>;
+	.reg .b32 	%r<4>;
+	.reg .b64 	%rd<11>;
+
+	ld.param.u64 	%rd1, [live_and_param_0];
+	ld.param.u64 	%rd2, [live_and_param_1];
+	ld.param.u64 	%rd3, [live_and_param_2];
+	cvta.to.global.u64 	%rd4, %rd3;
+	cvta.to.global.u64 	%rd5, %rd2;
+	cvta.to.global.u64 	%rd6, %rd1;
+	mov.u32 	%r1, %tid.x;
+	mul.wide.s32 	%rd7, %r1, 4;
+	add.s64 	%rd8, %rd6, %rd7;
+	ld.global.f32 	%f1, [%rd8];
+	add.s64 	%rd9, %rd5, %rd7;
+	ld.global.f32 	%f2, [%rd9];
+	ex2.approx.f32 	%f5, %f1;
+	mov.b32 	%r2, %f5;
+	and.b32 	%r3, %r2, 2147483647;
+	mov.b32 	%f6, %r3;
+	mul.f32 	%f7, %f1, %f2;
+	add.f32 	%f3, %f7, %f6;
+	add.s64 	%rd10, %rd4, %rd7;
+	st.global.f32 	[%rd10], %f3;
+	ret;
+}

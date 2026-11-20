@@ -109,6 +109,31 @@ class StructuralNativeTest(unittest.TestCase):
         r = run("pack", "pack", "pack")
         self.assertEqual((r["result"], r["reason"]), ("refused", "partial_stored_read"))
 
+    def test_product_with_zero_refused(self):
+        # Round-5 reproducer: y = a * b + 0 * ex2(a) is not a path from a through ex2.
+        r = run("mult_pos", "silu_mul", "dead")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "dead_operand"))
+
+    def test_and_with_zero_refused(self):
+        r = run("dead_and", "silu_mul", "dead_paths")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "dead_operand"))
+
+    def test_shift_past_width_refused(self):
+        r = run("dead_shl", "silu_mul", "dead_paths")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "dead_operand"))
+
+    def test_select_with_fixed_condition_not_credited(self):
+        # selp(ex2(a), 0, tid < 0): the condition is fixed per thread, the select resolves to 0, so
+        # no path from a passes ex2 and the through role fails.
+        r = run("dead_sel", "silu_mul", "dead_paths")
+        self.assertEqual((r["result"], r["reason"]), ("refused", "role"))
+        self.assertEqual(r["detail"]["role"], "through_transcendental")
+
+    def test_live_mask_matches(self):
+        # and with 0x7fffffff (|ex2(a)|) keeps the path: the dead-edge rule is not a blanket refusal.
+        self.assertEqual(run("live_and", "silu_mul", "dead_paths")["result"], "matched")
+
+
 
 if __name__ == "__main__":
     unittest.main()
