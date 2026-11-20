@@ -1,15 +1,32 @@
-"""Property-based differential test of the structural mode's role predicates.
+"""Property-based differential tests of the structural mode.
 
-Generates seeded random small terms and PTX kernels (hand-emitted PTX, no compiler: stored and
-unstored producers, cuts read back through memory or from registers, f16 conversion round trips,
-component selections of packed pairs, ex2/lg2, products, fmas and adds), runs the native checker
-with --structural-reference and asserts: whenever the checker matches, the reference
-implementation (plain reachability over the value DAG, cpp/src/value_analysis/structural.cpp
-class Reference) decides every role check of the term and finds none failing.
+Two seeded generators, each with an oracle independent of the checker:
 
-Skipped unless SENTRYWARD_PTX_NATIVE names a built sentryward-ptx. SENTRYWARD_DIFF_CASES (default
-400) and SENTRYWARD_DIFF_SEED (default 0xD263) set the size and seed; SENTRYWARD_DIFF_KEEP names a
-directory that keeps every case (PTX, input, term, report).
+1. PTX cases (sentryward-ptx --structural-reference): hand-emitted PTX, no compiler. Shapes:
+   stored producer chains under an opaque consumer (cuts read back through memory or used from
+   registers), also over a grid of CTAs with row-indexed objects (class mode); an unstored opaque
+   producer under primitive adds; a warp-shuffle reduction (shfl.sync.bfly butterfly) read as a
+   whole row, sometimes with a step missing. Expressions: f16 round trips, packed-pair components,
+   selects on data-dependent conditions, ex2/lg2, products, fmas, adds.
+2. IR cases (sentryward-structural-ir-controls random): value IR built directly, with indexed
+   selections (input elements are components of matrix loads), stored and unstored producers and
+   mutations whose outcome the generator knows (an index, a recomputed cut, a second binding, a
+   wrong role).
+
+Oracles. The reference (structural.cpp class Reference, --structural-reference) restates the
+leaf, cut, binding and role checks by plain reachability with its own term-element, load, output
+and binding mapping. Each generator also keeps its own dataflow model (sources reached, and
+through ex2/lg2), from which it knows whether a transcendental role holds and whether a mutation
+must be refused. Asserted: whenever the checker matches, the reference finds no failing or
+undecided verdict and the generator's model does not say the case is wrong. Not vacuous: floors
+on matches, refusals per kind and shape, and (IR) on matches among the cases the model says are
+right.
+
+Skipped unless SENTRYWARD_PTX_NATIVE names a built sentryward-ptx (the IR test: also
+sentryward-structural-ir-controls, SENTRYWARD_STRUCTURAL_IR or next to the native).
+SENTRYWARD_DIFF_CASES (default 400), SENTRYWARD_DIFF_IR_CASES (default 2000) and
+SENTRYWARD_DIFF_SEED (default 0xD263) set size and seed; SENTRYWARD_DIFF_KEEP names a directory
+that keeps every PTX case (PTX, input, term, report).
 """
 import json
 import os
@@ -21,33 +38,42 @@ from collections import Counter
 from pathlib import Path
 
 NATIVE = os.environ.get("SENTRYWARD_PTX_NATIVE")
+IR = os.environ.get("SENTRYWARD_STRUCTURAL_IR") or (
+    str(Path(NATIVE).parent / "sentryward-structural-ir-controls") if NATIVE else None)
 CASES = int(os.environ.get("SENTRYWARD_DIFF_CASES", "400"))
+IR_CASES = int(os.environ.get("SENTRYWARD_DIFF_IR_CASES", "2000"))
 SEED = int(os.environ.get("SENTRYWARD_DIFF_SEED", str(0xD263)), 0)
 THREADS = 32
 ROLE_SETS = [[], [], ["through_transcendental"], ["avoids_transcendental"], ["addend"], ["multiplicand"],
              ["avoids_transcendental", "addend"], ["through_transcendental", "multiplicand"]]
 IDENT = [[{"out": 0}, {"out": 1}]]
+SECTIONS = ("leaves", "cuts", "bindings")
 
 
 class Kernel:
-    """Straight-line PTX: thread i reads and writes element i of each f32 object."""
+    """Straight-line PTX: in CTA c, thread i reads and writes element (c, i) of each f32 object."""
 
-    def __init__(self, name, objects):
-        self.name, self.objects = name, objects
-        self.body, self.f, self.h, self.d = [], 0, 0, 20
+    def __init__(self, name, objects, grid=1):
+        self.name, self.objects, self.grid = name, objects, grid
+        self.body, self.f, self.h, self.d, self.p, self.r = [], 0, 0, 20, 0, 3
         self.base = {}
         # Per register, the generator's own dataflow model: the source tags some path reaches, and
-        # those reached through ex2/lg2 above them. Used only to bias roles toward ones that hold.
+        # those reached through ex2/lg2 above them.
         self.info = {}
         for i, o in enumerate(objects):
             self.body.append(f"ld.param.u64 %rd{i + 1}, [{name}_param_{i}];")
             self.body.append(f"cvta.to.global.u64 %rd{10 + i}, %rd{i + 1};")
             self.base[o] = f"%rd{10 + i}"
-        self.body += ["mov.u32 %r1, %tid.x;", "mul.wide.s32 %rd9, %r1, 4;"]
+        self.body += ["mov.u32 %r1, %tid.x;", "mov.u32 %r2, %ctaid.x;", f"mad.lo.s32 %r3, %r2, {THREADS}, %r1;",
+                      "mul.wide.s32 %rd9, %r3, 4;"]
 
     def freg(self):
         self.f += 1
         return f"%f{self.f}"
+
+    def rreg(self):
+        self.r += 1
+        return f"%r{self.r}"
 
     def addr(self, o):
         self.d += 1
@@ -67,10 +93,20 @@ class Kernel:
         self.body.append(text.format(*rs))
         return rs[0] if n == 1 else rs
 
+    def warp_sum(self, x, steps):
+        """x summed over the lanes a butterfly with these xor offsets reaches."""
+        for off in steps:
+            a, b, y = self.rreg(), self.rreg(), self.freg()
+            self.body += [f"mov.b32 {a}, {x};", f"shfl.sync.bfly.b32 {b}, {a}, {off}, 31, -1;", f"mov.b32 {y}, {b};"]
+            s = self.op(f"add.f32 {{0}}, {x}, {y};")
+            self.info[s] = self.info[x]
+            x = s
+        return x
+
     def text(self):
         params = ",\n".join(f"\t.param .u64 {self.name}_param_{i}" for i in range(len(self.objects)))
-        regs = [f".reg .f32 %f<{self.f + 1}>;", f".reg .b16 %h<{self.h + 1}>;", ".reg .b32 %r<2>;",
-                f".reg .b64 %rd<{self.d + 1}>;"]
+        regs = [f".reg .f32 %f<{self.f + 1}>;", f".reg .b16 %h<{self.h + 1}>;", f".reg .pred %p<{self.p + 1}>;",
+                f".reg .b32 %r<{self.r + 1}>;", f".reg .b64 %rd<{self.d + 1}>;"]
         body = "\n".join("\t" + x for x in regs + [""] + self.body + ["ret;"])
         return (".version 8.8\n.target sm_90a\n.address_size 64\n\n"
                 f".visible .entry {self.name}(\n{params}\n)\n{{\n{body}\n}}\n")
@@ -89,30 +125,35 @@ def expression(rng, k, leaves, depth):
         if d == 0 or rng.random() < 0.25:
             return rng.choice(leaves)
         c = rng.random()
-        if c < 0.22:
+        if c < 0.2:
             x, y = gen(d - 1), gen(d - 1)
             return mk(f"add.f32 {{0}}, {x}, {y};", [x, y])
-        if c < 0.42:
+        if c < 0.38:
             x, y = gen(d - 1), gen(d - 1)
             return mk(f"mul.f32 {{0}}, {x}, {y};", [x, y])
-        if c < 0.52:
+        if c < 0.47:
             x, y = gen(d - 1), gen(d - 1)
             return mk(f"fma.rn.f32 {{0}}, {x}, {y}, 0f3F800000;", [x, y])
-        if c < 0.62:
+        if c < 0.55:
             x = gen(d - 1)
             return mk(f"add.f32 {{0}}, {x}, 0f40400000;", [x])
-        if c < 0.72:
+        if c < 0.64:
             x = gen(d - 1)
             return mk(f"ex2.approx.f32 {{0}}, {x};", [x], True)
-        if c < 0.77:
+        if c < 0.69:
             x = gen(d - 1)
             return mk(f"lg2.approx.f32 {{0}}, {x};", [x], True)
-        if c < 0.88:  # f16 round trip: a conversion chain
+        if c < 0.78:  # f16 round trip: a conversion chain
             k.h += 1
             x = gen(d - 1)
             k.body.append(f"cvt.rn.f16.f32 %h{k.h}, {x};")
             return mk(f"cvt.f32.f16 {{0}}, %h{k.h};", [x])
-        # a component of a packed pair (a selection)
+        if c < 0.88:  # a select on a data-dependent condition: the condition's paths count too
+            x, y, z = gen(d - 1), gen(d - 1), gen(d - 1)
+            k.p += 1
+            k.body.append(f"setp.gt.f32 %p{k.p}, {z}, 0f00000000;")
+            return mk(f"selp.f32 {{0}}, {x}, {y}, %p{k.p};", [x, y, z])
+        # a component of a packed pair
         x, y = gen(d - 1), gen(d - 1)
         k.d += 1
         k.body.append(f"mov.b64 %rd{k.d}, {{{x}, {y}}};")
@@ -126,11 +167,22 @@ def expression(rng, k, leaves, depth):
     return e
 
 
+def model_holds(k, reg, tag, role):
+    """Whether the generator's model says `role` of the argument tagged `tag` holds at `reg`: True,
+    False, or None (a role the model does not decide)."""
+    alls, thr = k.info[reg]
+    if role == "through_transcendental":
+        return tag in thr
+    if role == "avoids_transcendental":
+        return tag in alls and tag not in thr
+    return None
+
+
 def roles(rng, k, reg, tag, wrong=True):
     """A role set for the argument tagged `tag` of the atom whose value is `reg`: half the time the
-    transcendental role the generator's model says holds, a quarter the opposite one (a wrong
-    role, which the checker must refuse), else a random set. Without `wrong`: the role that holds,
-    or none (producers, so that a case reaches its consumer's roles)."""
+    transcendental role the model says holds, a quarter the opposite one (which the checker must
+    refuse), else a random set. Without `wrong`: the role that holds, or none (producers, so that a
+    case reaches its consumer's roles)."""
     c = rng.random()
     alls, thr = k.info[reg]
     if not wrong:
@@ -139,14 +191,14 @@ def roles(rng, k, reg, tag, wrong=True):
         return []
     if c < 0.75 and tag in alls:
         holds = "through_transcendental" if tag in thr else "avoids_transcendental"
-        wrong = "avoids_transcendental" if tag in thr else "through_transcendental"
-        return [holds if c < 0.5 else wrong]
+        opposite = "avoids_transcendental" if tag in thr else "through_transcendental"
+        return [holds if c < 0.5 else opposite]
     return rng.choice(ROLE_SETS)
 
 
-def obj(name):
+def obj(name, rows=1):
     return {"name": name, "element": "f32", "element_bytes": 4, "base_bytes": 0,
-            "row_stride_bytes": 4 * THREADS, "rows": 1, "cols": THREADS, "row_indexed": False}
+            "row_stride_bytes": 4 * THREADS, "rows": rows, "cols": THREADS, "row_indexed": rows > 1}
 
 
 def opaque(op, args, roles, out):
@@ -155,12 +207,24 @@ def opaque(op, args, roles, out):
 
 
 def case(rng, name):
-    """A random (term, kernel) pair. Shapes: stored producer chains under an opaque consumer, and
-    an unstored opaque producer under primitive adds."""
-    if rng.random() < 0.7:
+    """A random (term, kernel) pair and the model's verdict: False when the case must not match
+    (a missing reduction step, or a transcendental role the model says fails), else True."""
+    c = rng.random()
+    truth = [True]
+
+    def checked(k, reg, tags, role_sets):
+        for tag, rs in zip(tags, role_sets):
+            for role in rs:
+                if model_holds(k, reg, tag, role) is False:
+                    truth[0] = False
+        return role_sets
+    grid = 1
+    if c < 0.55:
+        shape = "chain"
+        grid = rng.choice([1, 1, 4])
         two = rng.random() < 0.5
         objects = ["a", "b", "p"] + (["q"] if two else []) + ["y"]
-        k = Kernel(name, objects)
+        k = Kernel(name, objects, grid)
         a, b = k.load("a"), k.load("b")
         k.info[a], k.info[b] = ({"a"}, set()), ({"b"}, set())
         p = expression(rng, k, [a], rng.randint(0, 3))
@@ -170,13 +234,13 @@ def case(rng, name):
             x = k.load(o) if rng.random() < 0.5 else r
             k.info[x] = (k.info[r][0] | {o}, k.info[r][1])
             return x
-        nodes = [opaque("P", [{"input": 0, "reads": IDENT}], [roles(rng, k, p, "a", wrong=False)], "p")]
+        nodes = [opaque("P", [{"input": 0, "reads": IDENT}], checked(k, p, ["a"], [roles(rng, k, p, "a", wrong=False)]), "p")]
         regs = {"p": p}
         if two:
             q = expression(rng, k, [reread("p", p)] + ([a] if rng.random() < 0.2 else []), rng.randint(0, 3))
             k.store("q", q)
             regs["q"] = q
-            nodes.append(opaque("Q", [{"body": 0, "reads": IDENT}], [roles(rng, k, q, "p", wrong=False)], "q"))
+            nodes.append(opaque("Q", [{"body": 0, "reads": IDENT}], checked(k, q, ["p"], [roles(rng, k, q, "p", wrong=False)]), "q"))
         pool = [("body", 0, "p")] + ([("body", 1, "q")] if two else []) + [("input", 0, "a"), ("input", 1, "b")]
         if two and rng.random() < 0.5:  # a consumer of both producers: a path from p behind q's cut
             args = [pool[0], pool[1]] + rng.sample(pool[2:], rng.randint(0, 1))
@@ -187,29 +251,53 @@ def case(rng, name):
         y = expression(rng, k, leaves, rng.randint(0, 3))
         k.store("y", y)
         nodes.append(opaque("C", [{kind: ref, "reads": IDENT} for kind, ref, _ in args],
-                            [roles(rng, k, y, n) for _, _, n in args], "y"))
-        term = {"objects": [obj(o) for o in objects], "inputs": ["a", "b"], "nodes": nodes}
-    else:
+                            checked(k, y, [n for _, _, n in args], [roles(rng, k, y, n) for _, _, n in args]), "y"))
+        term = {"objects": [obj(o, grid) for o in objects], "inputs": ["a", "b"], "nodes": nodes}
+    elif c < 0.8:
+        shape = "unstored"
         uses = rng.randint(1, 2)
         objects = ["a", "b", "c"] + [f"y{i}" for i in range(uses)]
         k = Kernel(name, objects)
-        a, b, c = k.load("a"), k.load("b"), k.load("c")
+        a, b, cc = k.load("a"), k.load("b"), k.load("c")
         k.info[a] = ({"a"}, set())
         t = expression(rng, k, [a], rng.randint(1, 3))
-        nodes = [opaque("P", [{"input": 0, "reads": IDENT}], [roles(rng, k, t, "a")], None)]
+        p_roles = roles(rng, k, t, "a")
+        nodes = [opaque("P", [{"input": 0, "reads": IDENT}], [p_roles], None)]
         for i in range(uses):
             u = t if rng.random() < 0.8 else expression(rng, k, [a], rng.randint(1, 2))
-            k.store(f"y{i}", k.op(f"add.f32 {{0}}, {u}, {[b, c][i]};"))
+            checked(k, u, ["a"], [p_roles])  # each value a use binds (two values: producer_binding)
+            k.store(f"y{i}", k.op(f"add.f32 {{0}}, {u}, {[b, cc][i]};"))
             nodes.append({"op": "add", "atom": {"kind": "primitive", "operation": "add", "commutative": True},
                           "format": {"compute": None, "store": "f32"},
                           "args": [{"body": 0, "reads": IDENT}, {"input": 1 + i, "reads": IDENT}], "out": f"y{i}"})
         term = {"objects": [obj(o) for o in objects], "inputs": ["a", "b", "c"], "nodes": nodes}
+    else:
+        # A row reduction through warp shuffles: y[i] = g(sum over lanes of f(a[lane]), b[i]); the
+        # term reads all of a's row. A missing butterfly step leaves half the row unread.
+        shape = "reduction"
+        objects = ["a", "b", "y"]
+        k = Kernel(name, objects)
+        a, b = k.load("a"), k.load("b")
+        k.info[a], k.info[b] = ({"a"}, set()), ({"b"}, set())
+        v = expression(rng, k, [a], rng.randint(0, 2))
+        steps = [16, 8, 4, 2, 1]
+        if rng.random() < 0.25:
+            steps.remove(rng.choice(steps))
+            truth[0] = False
+        s = k.warp_sum(v, steps)
+        use_b = rng.random() < 0.6
+        y = expression(rng, k, [s] + ([b] if use_b else []), rng.randint(0, 2))
+        k.store("y", y)
+        args = [{"input": 0, "reads": [[{"out": 0}, {"all": THREADS}]]}] + ([{"input": 1, "reads": IDENT}] if use_b else [])
+        tags = ["a"] + (["b"] if use_b else [])
+        nodes = [opaque("R", args, checked(k, y, tags, [roles(rng, k, y, tg) for tg in tags]), "y")]
+        term = {"objects": [obj(o) for o in objects], "inputs": ["a", "b"], "nodes": nodes}
     term.update({"schema": "sentryward.structural-term/v2", "row": f"diff/{name}", "template": f"diff/{name}"})
     inputs = {"schema": "spverify.kernel-input/v1", "entry": name,
-              "launch": {"grid_dim": [1, 1, 1], "block_dim": [THREADS, 1, 1], "dynamic_shared_bytes": 0},
+              "launch": {"grid_dim": [grid, 1, 1], "block_dim": [THREADS, 1, 1], "dynamic_shared_bytes": 0},
               "declarations": [{"parameter": i, "type": "pointer", "space": "global", "object": o}
                                for i, o in enumerate(objects)], "arguments": []}
-    return term, inputs, k.text()
+    return shape, grid, truth[0], term, inputs, k.text()
 
 
 def run_case(native, d, term, inputs, ptx):
@@ -223,38 +311,87 @@ def run_case(native, d, term, inputs, ptx):
     return json.loads((d / "report.json").read_text())
 
 
+def reference_problems(ref):
+    """The reference's failing or undecided verdicts (roles and each section), or its error."""
+    if "error" in ref or "checks" not in ref:
+        return [ref.get("error", "no reference")]
+    out = [f"roles.{k}" for k in ("fails", "undecided") if ref[k]]
+    return out + [f"{s}.{k}" for s in SECTIONS for k in ("fails", "undecided") if ref[s][k]]
+
+
+def reference_refutes(ref):
+    """Whether the reference finds a failing verdict (it confirms a refusal)."""
+    return "checks" in ref and bool(ref["fails"] or any(ref[s]["fails"] for s in SECTIONS))
+
+
+def outcome(r):
+    return r["result"] if r["result"] == "matched" else f'{r["result"]}:{r.get("reason")}'
+
+
 @unittest.skipUnless(NATIVE, "SENTRYWARD_PTX_NATIVE is not set")
 class StructuralDifferentialTest(unittest.TestCase):
-    def test_checker_never_accepts_where_the_reference_refuses(self):
+    def test_checker_never_accepts_where_the_reference_or_the_model_refuses(self):
         rng = random.Random(SEED)
         keep = os.environ.get("SENTRYWARD_DIFF_KEEP")
-        outcomes, role_checks, violations, agree = Counter(), 0, [], Counter()
+        outcomes, shapes, agree, violations = Counter(), Counter(), Counter(), []
+        checks = Counter()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(keep or tmp)
             for i in range(CASES):
                 name = f"diff_{i}"
-                term, inputs, ptx = case(rng, name)
+                shape, grid, truth, term, inputs, ptx = case(rng, name)
                 r = run_case(NATIVE, root / name, term, inputs, ptx)
-                outcomes[r["result"] if r["result"] == "matched" else f'{r["result"]}:{r.get("reason")}'] += 1
+                o = outcome(r)
+                outcomes[o] += 1
+                shapes[(shape + ("/class" if r.get("class_mode") else ""), "matched" if o == "matched" else "refused")] += 1
                 ref = r.get("reference", {})
-                if r["result"] == "refused" and r.get("reason") == "role" and "checks" in ref:
-                    # Informational: a role refusal the reference confirms, one it holds (the checker is
-                    # stricter), or one it did not see (an unstored producer refused while matching,
-                    # before any binding was committed).
-                    agree["role refusal: reference fails" if ref["fails"] else
-                          "role refusal: reference holds" if ref["checks"] else "role refusal: not compared"] += 1
-                if r["result"] != "matched":
+                if o != "matched":
+                    agree["refusal: reference refutes" if reference_refutes(ref) else "refusal: reference holds"] += 1
                     continue
-                role_checks += ref["checks"]
-                if ref["fails"] or ref["undecided"]:
-                    violations.append({"case": i, "fails": ref["fails"][:3], "undecided": ref["undecided"][:3]})
-        print(f"\nseed {SEED:#x}, {CASES} cases: {dict(outcomes)}; role checks in matched cases: "
-              f"{role_checks}; {dict(agree)}")
-        self.assertEqual(violations, [], f"checker matched where the reference refuses (seed {SEED:#x})")
-        # Not vacuous: both outcomes occur, and matched cases carry role checks.
+                checks["roles"] += ref.get("checks", 0)
+                for s in SECTIONS:
+                    checks[s] += ref.get(s, {}).get("checks", 0)
+                problems = reference_problems(ref)
+                if problems or not truth:
+                    violations.append({"case": i, "shape": shape, "reference": problems, "model": truth})
+        print(f"\nPTX seed {SEED:#x}, {CASES} cases: {dict(outcomes)}\n  shapes: {dict(shapes)}\n"
+              f"  reference checks in matched cases: {dict(checks)}\n  {dict(agree)}")
+        self.assertEqual(violations, [], f"checker matched where the reference or the model refuses (seed {SEED:#x})")
         self.assertGreater(outcomes["matched"], CASES // 10)
         self.assertGreater(outcomes["refused:role"], CASES // 20)
-        self.assertGreater(role_checks, 0)
+        self.assertGreater(outcomes["refused:leaves"], 0)
+        for s in ("chain/class", "reduction", "unstored"):
+            self.assertGreater(shapes[(s, "matched")], 0, s)
+        self.assertGreater(checks["roles"], 0)
+        self.assertGreater(checks["cuts"], 0)
+        self.assertGreater(checks["bindings"], 0)
+
+    @unittest.skipUnless(IR and Path(IR).exists(), "sentryward-structural-ir-controls is not built")
+    def test_ir_cases_with_indexed_selections(self):
+        out = subprocess.run([IR, "random", str(SEED), str(IR_CASES)], capture_output=True, text=True,
+                             check=True, timeout=600).stdout
+        rows = [json.loads(x) for x in out.splitlines()]
+        self.assertEqual(len(rows), IR_CASES)
+        kinds, agree, violations = Counter(), Counter(), []
+        for row in rows:
+            r = row["report"]
+            o = outcome(r)
+            kinds[(row["shape"], row["mutation"], o)] += 1
+            if o != "matched":
+                agree["refusal: reference refutes" if reference_refutes(r.get("reference", {})) else "refusal: reference holds"] += 1
+                continue
+            problems = reference_problems(r.get("reference", {}))
+            if problems or not row["truth"]:
+                violations.append({"case": row["case"], "mutation": row["mutation"], "reference": problems})
+        print(f"\nIR seed {SEED:#x}, {IR_CASES} cases: {dict(sorted(kinds.items()))}\n  {dict(agree)}")
+        self.assertEqual(violations, [], f"checker matched where the reference or the generator refuses (seed {SEED:#x})")
+        # Not vacuous: each mutation is refused, and the checker matches nearly every case the
+        # generator says is right (an identity that conflates values over-refuses).
+        right = [row for row in rows if row["truth"]]
+        matched = sum(row["report"]["result"] == "matched" for row in right)
+        self.assertGreater(matched, 0.9 * len(right))
+        for m in ("index", "recompute", "rebind", "role"):
+            self.assertGreater(sum(row["mutation"] == m for row in rows), 0, m)
 
 
 if __name__ == "__main__":
