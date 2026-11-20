@@ -8,6 +8,10 @@
 //   3 per-thread table word: thread t reads src_tab[t] (the atom varies with the thread)
 //   4 unequal widths: thread t reads 8 bytes at 8t, writes 4 bytes at 4t
 //   5 per-head offset, as k_gdn's rec_off: block (s, h) reads and writes float 64 h + t of its windows
+//   6 k_gdn's destination row: block s writes at window dst_tab[2 s] (next[s * positions], positions 2)
+//   7 as 0, and thread 0 of block s also stores to dst_tab[s] (the table is written by the launch)
+//   8 two read rows: block s writes float t at window src_tab[s] (both words are rows of `read`)
+//   9 row atom varying from row 2: thread t reads window src_tab[(t + 2) & 63]; thread 62 reads row 0
 #include <stdint.h>
 #ifndef VARIANT
 #define VARIANT 0
@@ -17,11 +21,15 @@ extern "C" __global__ void __launch_bounds__(128) k_rb(const uint64_t* src_tab, 
   const int s = blockIdx.x, t = threadIdx.x;
 #if VARIANT == 3
   const int32_t src_u = (int32_t)((int64_t)src_tab[t] * entry_units);
+#elif VARIANT == 9
+  const int32_t src_u = (int32_t)((int64_t)src_tab[(t + 2) & 63] * entry_units);
 #else
   const int32_t src_u = (int32_t)((int64_t)src_tab[s] * entry_units);
 #endif
-#if VARIANT == 2
+#if VARIANT == 2 || VARIANT == 8
   const int32_t dst_u = (int32_t)((int64_t)src_tab[s] * entry_units);
+#elif VARIANT == 6
+  const int32_t dst_u = (int32_t)((int64_t)dst_tab[s * 2] * entry_units);
 #else
   const int32_t dst_u = (int32_t)((int64_t)dst_tab[s] * entry_units);
 #endif
@@ -32,7 +40,9 @@ extern "C" __global__ void __launch_bounds__(128) k_rb(const uint64_t* src_tab, 
 #endif
   const char* src = state + (size_t)src_u * 256 + rec_off;
   float* dst = (float*)(state + (size_t)dst_u * 256 + rec_off);
-#if VARIANT == 4
+#if VARIANT == 8
+  const float v = (float)t;
+#elif VARIANT == 4
   const float2 v2 = ((const float2*)src)[t];
   const float v = v2.x + v2.y;
 #else
@@ -44,5 +54,8 @@ extern "C" __global__ void __launch_bounds__(128) k_rb(const uint64_t* src_tab, 
   dst[t / 2] = 2.f * v;
 #else
   dst[t] = 2.f * v;
+#endif
+#if VARIANT == 7
+  if (t == 0) ((uint64_t*)dst_tab)[s] = (uint64_t)src_u;
 #endif
 }
