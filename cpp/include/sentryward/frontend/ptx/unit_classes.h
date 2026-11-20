@@ -42,6 +42,25 @@ struct PreconditionReport {
 };
 [[nodiscard]] PreconditionReport PreconditionScan(const Function &function);
 
+// The CTA-row shard allowlist (docs/design/cta-row-shards.md): a launch may be checked as row
+// shards (input `cta_rows`) only when every instruction of the entry and of every function it
+// reaches by direct call has a listed opcode, only listed modifiers and only listed operand kinds:
+// integer and predicate arithmetic, mov of registers, immediates and %tid/%ntid/%ctaid/%nctaid/
+// %laneid, bra/bra.uni to a label of the same function, ret, exit, a direct call, ld.param, weak
+// ld.global/st.global of a register address and cvta.to.global. Anything else (other special
+// registers, ordered, generic-space, non-coherent or asynchronous memory, atomics, shared memory,
+// fences, barriers, warp operations, indirect calls) refuses. With it, a shard's execution is the
+// launch restricted to its CTAs: no input depends on placement or time, and CTAs communicate only
+// through plain global memory, which the cross-shard check compares exactly.
+struct ShardScanReport {
+  bool admitted = true;
+  std::string function;              // the function of the first refused instruction
+  std::uint32_t line = 0;            // its PTX line
+  std::string reason;                // what is not listed
+  std::vector<std::string> scanned;  // the entry and its direct callees, in scan order
+};
+[[nodiscard]] ShardScanReport ShardScan(const Module &module, const Function &entry);
+
 // The run options that keep class mode off.
 struct UnitGates {
   // Values are lifted through the scalar fold; values analysed
@@ -50,6 +69,9 @@ struct UnitGates {
   bool value_thread_range = false, trusted_reference = false, value_dump = false;
   bool branch_scope = false, scalar_fold_dump = false;
   bool exhaustive_search = false, continue_search = false, development_exports = false;
+  // A CTA-row shard (input `cta_rows`): only the CTAs of its rows execute, per CTA (the unit
+  // tables number units over the whole grid).
+  bool cta_rows = false;
 };
 
 struct UnitPlan {
