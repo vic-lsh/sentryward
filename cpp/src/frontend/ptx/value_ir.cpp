@@ -3605,11 +3605,16 @@ class AddressDagWriter {
   // The exact value modulo 2^width of an integer `value` built only from non-pointer constants,
   // this instance's thread and CTA coordinates and wrap-exact integer operations (add, sub, low
   // and wide multiply, shift left by less than the width, and, or, xor, bitcasts and plain
-  // integer conversions); nullopt for anything else (loads, parameters, pointers, saturation).
+  // integer conversions, integer comparisons and selects on them; a predicate is 0 or 1);
+  // nullopt for anything else (loads, parameters, pointers, saturation).
+  static bool Predicate(const v::ValueType& type) {
+    return type.isScalar() && type.element().kind() == v::ElementKind::Predicate;
+  }
   std::optional<std::uint64_t> Fixed(v::Value value, unsigned depth = 0) const {
     if (depth > 256) return {};
     try { value = Selected(value); } catch (const std::invalid_argument&) { return {}; }
-    if (!value.indices().empty() || !IntegerScalar(value.type(graph))) return {};
+    if (!value.indices().empty()) return {};
+    if (!IntegerScalar(value.type(graph)) && !(Predicate(value.type(graph)) && !value.conversion())) return {};
     const Key key{value.nodeId(), value.instanceIndex(), value.resultIndex(), value.conversion().get()};
     if (const auto found = fixed_values.find(key); found != fixed_values.end()) return found->second;
     auto result = FixedUncached(value, depth);
@@ -3627,7 +3632,8 @@ class AddressDagWriter {
   }
   std::optional<std::uint64_t> FixedUncached(v::Value value, unsigned depth) const {
     const auto type = value.type(graph);
-    const auto bits = type.element().width();
+    const bool predicate = Predicate(type);
+    const auto bits = predicate ? 1u : type.element().width();
     const auto mask = Mask(bits);
     if (value.conversion()) {
       const auto& spec = *value.conversion()->spec;
@@ -3657,6 +3663,41 @@ class AddressDagWriter {
       else return {};
       return x & mask;
     }
+    if (const auto* compare = dynamic_cast<const v::CompareOp*>(&op)) {
+      // An integer comparison, signed for signed operands (setp.{lt,..}.s), unsigned otherwise.
+      const auto operands = instance.operands;
+      if (!predicate || compare->flushToZero() || compare->unorderedTrue() ||
+          !IntegerScalar(operands.at(0).type(graph)) || operands.at(0).type(graph) != operands.at(1).type(graph))
+        return {};
+      const auto element = operands.at(0).type(graph).element();
+      const bool is_signed = element.kind() == v::ElementKind::SignedInteger;
+      if (!is_signed && element.kind() != v::ElementKind::UnsignedInteger &&
+          compare->predicate() != v::ComparePredicate::Equal && compare->predicate() != v::ComparePredicate::NotEqual)
+        return {};
+      const auto a = Fixed(operands.at(0), depth + 1), b = Fixed(operands.at(1), depth + 1);
+      if (!a || !b) return {};
+      const auto width = element.width();
+      // Order-preserving map of a signed value to unsigned: flip the sign bit.
+      const auto key = [&](std::uint64_t x) { return is_signed ? (x ^ (std::uint64_t(1) << (width - 1))) : x; };
+      const auto x = key(*a), y = key(*b);
+      switch (compare->predicate()) {
+        case v::ComparePredicate::Equal: return std::uint64_t(x == y);
+        case v::ComparePredicate::NotEqual: return std::uint64_t(x != y);
+        case v::ComparePredicate::Less: return std::uint64_t(x < y);
+        case v::ComparePredicate::LessEqual: return std::uint64_t(x <= y);
+        case v::ComparePredicate::Greater: return std::uint64_t(x > y);
+        case v::ComparePredicate::GreaterEqual: return std::uint64_t(x >= y);
+        default: return {};
+      }
+    }
+    if (dynamic_cast<const v::SelectOp*>(&op)) {
+      const auto operands = instance.operands;
+      if (!Predicate(operands.at(0).type(graph))) return {};
+      const auto condition = Fixed(operands.at(0), depth + 1);
+      if (!condition) return {};
+      const auto chosen = Fixed(operands.at(*condition ? 1 : 2), depth + 1);
+      return chosen ? std::optional<std::uint64_t>(*chosen & mask) : std::nullopt;
+    }
     const auto* binary = dynamic_cast<const v::BinaryOp*>(&op);
     if (!binary) return {};
     const auto& attributes = binary->attributes();
@@ -3667,6 +3708,8 @@ class AddressDagWriter {
     if (!a) return {};
     const auto b = Fixed(operands.at(1), depth + 1);
     if (!b) return {};
+    if (predicate && binary->opcode() != v::BinaryOpcode::BitAnd && binary->opcode() != v::BinaryOpcode::BitOr &&
+        binary->opcode() != v::BinaryOpcode::BitXor) return {};
     const auto mode = attributes.multiply_mode;
     if (binary->opcode() != v::BinaryOpcode::Multiply && mode != v::IntegerMultiplyMode::Low) return {};
     switch (binary->opcode()) {
