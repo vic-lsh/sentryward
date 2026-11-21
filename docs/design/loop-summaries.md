@@ -366,3 +366,24 @@ Tests (test-first). (1) The wrapped compare's two disjuncts each give their fact
 (3) control: a case whose facts contradict an earlier fact reports `infeasible_path`, not contained;
 (4) control: without `fact_cases` the run stops with `fact_disjunction`, never contained;
 (5) a disjunction with more than 8 disjuncts records nothing.
+
+## Lane-scoped facts (Codex review of stage C: P0 for stages A and C)
+
+Finding. One global fact set is unsound for choice trees. A leaf forces one outcome per line on
+every lane, but in a real execution lanes take different outcomes. Lane A's access in execution E
+is covered by the leaf with A's own choices; in that leaf, another lane B's facts (B forced onto
+A's choices) may constrain an input element A reads, excluding E from A's query. Likewise a leaf
+whose global fact set is unsat may still be the leaf that covers A.
+
+Rule. Every path fact carries the identity of the lane that recorded it (CTA coordinates, warp,
+lane). A containment query for an access uses the input's invariants, the facts of the access's
+own lane, and (stage B) the local facts of iteration atoms the access names. Per-lane coverage:
+lane A's facts are the conditions A's own path satisfies in E, so every concrete access of A in E is
+an instance of the leaf's access under A's facts. If A's facts are proved unsat, no execution has A
+on this path: A's accesses in this leaf are vacuous (reported, counted, not violations). Unknown
+satisfiability is undecided, never vacuous. There is no leaf-level infeasible_path.
+
+Consequences. The global consistency check and global bound propagation cover only the input's
+invariants; per-lane consistency and propagation are computed for the lane of the query (cached
+per lane). Stage C's cases are chosen per line like branch choices and their facts are lane facts;
+a case unsat for one lane is vacuous for that lane only.
