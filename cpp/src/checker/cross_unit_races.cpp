@@ -3,6 +3,8 @@
 #include "sentryward/algorithm/memory/model.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <set>
@@ -147,9 +149,11 @@ bool UnitPrivateSpace(std::string_view space) noexcept {
 }
 } // namespace
 
-CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const UnitQuotient &quotient,
-                                MemoryModel &model, const CrossUnitLimits &limits) {
-  std::uint64_t unit_pairs = 0, refinements = 0, decisions = 0; // the work counted against `limits`
+namespace {
+CrossUnitOutcome CheckCrossUnitWith(std::span<const CrossUnitPart> parts, const UnitQuotient &quotient,
+                                    MemoryModel &model, const CrossUnitLimits &limits, CrossUnitStats &stats) {
+  // The work counted against `limits`.
+  std::uint64_t &unit_pairs = stats.unit_pairs, refinements = 0, &decisions = stats.symbolic_decisions;
   const auto outcome = [](Status status, std::string reason) {
     CrossUnitOutcome result;
     result.status = status;
@@ -423,6 +427,9 @@ CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const Unit
       PartIndex all;                 // residual spans (the footprint without its lookups)
       std::vector<std::size_t> writes;
       Interval write_hull{0, 0}, all_hull{0, 0};
+      // A lookup bucket whose every part has a window form (MemoryModel::windowForm): its translated
+      // region may be decided by the window rule (regionWindowForm).
+      bool windowed = false;
     };
     struct On {
       std::vector<Bucket> buckets;
@@ -443,7 +450,7 @@ CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const Unit
         std::vector<std::tuple<std::string, I, I>> key;
         for (const auto &t : terms) key.emplace_back(t.symbol, t.arg, t.coefficient);
         const auto [it, added] = index.try_emplace(std::move(key), entry.buckets.size());
-        if (added) entry.buckets.push_back({true, std::move(terms), {}, {}, {0, 0}, {0, 0}});
+        if (added) entry.buckets.push_back({true, std::move(terms), {}, {}, {0, 0}, {0, 0}, false});
         auto &bucket = entry.buckets[it->second];
         bucket.all.parts.push_back(k);
       }
@@ -475,6 +482,10 @@ CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const Unit
         };
         bucket.write_hull = hull(bucket.writes);
         bucket.all_hull = hull(bucket.all.parts);
+        bucket.windowed = bucket.lookup && bucket.terms.size() == 1 && !bucket.all.parts.empty() &&
+                          std::all_of(bucket.all.parts.begin(), bucket.all.parts.end(), [&](std::size_t k) {
+                            return model.windowForm(parts[k].family, parts[k].footprint).has_value();
+                          });
         entry.write |= !bucket.writes.empty();
         for (const auto &g : bucket.terms) {
           entry.uniform &= g.uniform;
@@ -555,7 +566,113 @@ CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const Unit
                     if (y.symbol == x.symbol) meets[c].insert(std::int64_t(x.arg - y.arg));
         }
         const bool relative = A.uniform && B.uniform;
+        // Objects whose lookups' bounds, premises or rows can differ by element: a decision over a
+        // translated lookup of one reads its absolute element (field policy bounds, distinct rows),
+        // so the key holds the absolute shift of each, on both sides, and then the allocation's
+        // absolute shifts too (the window rule's residual range [lo, hi) inside [0, S) and its
+        // 2^63 bound are absolute). docs/design/gdn-multi-request.md, A1.
+        const auto varying = [&](const On &side) {
+          std::vector<std::size_t> result;
+          for (std::size_t o = 1; o < side.objects.size(); ++o) {
+            bool any = false;
+            for (const auto &bucket : side.buckets)
+              for (const auto &t : bucket.terms)
+                any = any || (t.object == side.objects[o] && model.lookupVariesByElement(t.symbol, t.object));
+            if (any) result.push_back(o);
+          }
+          return result;
+        };
+        const auto vary_a = varying(A), vary_b = varying(B);
+        const bool absolute = !vary_a.empty() || !vary_b.empty();
+        // A trace of every decision a group pair makes, in order: a memo hit stands for a group pair
+        // whose decisions would all repeat the first one's (the memo audit checks this).
+        using Trace = std::vector<std::string>;
+        // Decides group pair (G, H): nullopt when every pair of its parts is disjoint.
+        const auto decide = [&](const Group &G, const Group &H, std::int64_t d,
+                                Trace *trace) -> std::optional<CrossUnitOutcome> {
+          const auto note = [&](std::string entry) {
+            if (trace) trace->push_back(std::move(entry));
+          };
+          const auto describe = [](const OverlapResult &r) {
+            return std::to_string(static_cast<int>(r.status)) + ":" + std::string(r.code) + ":" + r.reason;
+          };
+          for (std::size_t pi = 0; pi < A.buckets.size(); ++pi) {
+            const auto &P = A.buckets[pi];
+            if (P.writes.empty()) continue;
+            const auto x_terms = shift_terms(P.terms, A.objects, G.delta);
+            for (std::size_t qi = 0; qi < B.buckets.size(); ++qi) {
+              const auto &Q = B.buckets[qi];
+              if (!P.lookup && !Q.lookup) continue; // the constant pass
+              const auto tag = std::to_string(pi) + "/" + std::to_string(qi);
+              if (P.lookup && Q.lookup && same_terms(x_terms, shift_terms(Q.terms, B.objects, H.delta))) {
+                note(tag + ":cancel");
+                // Equal lookups cancel: residual spans, exactly.
+                for (const auto k : P.writes) {
+                  const auto &p = parts[k];
+                  const auto span = Span(p);
+                  auto x = p.footprint;
+                  x.symbolic.clear();
+                  x.gathers.clear();
+                  std::optional<CrossUnitOutcome> found;
+                  Q.all.Query(span.lo - I(d), span.hi - I(d), [&](std::size_t index) {
+                    const auto &q = parts[Q.all.parts[index]];
+                    if (++refinements > limits.refinements) {
+                      found = cap("refinements");
+                      return false;
+                    }
+                    auto y = q.footprint;
+                    y.symbolic.clear();
+                    y.gathers.clear();
+                    y.offset += I(d);
+                    const auto relation = ClassifyFamilyOverlap(p.family, x, q.family, y);
+                    if (!relation.overlap.empty() || !relation.unknown.empty()) {
+                      found = unknown("symbolic_overlap:" + allocation);
+                      return false;
+                    }
+                    return true;
+                  });
+                  if (found) return found;
+                }
+                continue;
+              }
+              const auto x = region(A, P, G, P.write_hull), y = region(B, Q, H, Q.all_hull);
+              // The window rule on the bucket regions: every part of both buckets has a window form,
+              // and each region covers its parts' translated bytes.
+              if (x && y && P.windowed && Q.windowed) {
+                const auto fx = model.regionWindowForm(*x), fy = model.regionWindowForm(*y);
+                if (fx && fy && fx->stride == fy->stride && model.distinctRows(*fx, *fy)) {
+                  ++stats.window_regions;
+                  note(tag + ":window");
+                  continue;
+                }
+              }
+              if (x && y) {
+                const auto r = model.translatedFamilyOverlap(single, *x, single, *y);
+                note(tag + ":region:" + describe(r));
+                if (r.status == OverlapStatus::kDisjoint) continue;
+              }
+              // The hulls may meet: part by part.
+              for (const auto k : P.writes) {
+                const auto &p = parts[k];
+                const auto px = placed(p, A, G);
+                for (const auto l : Q.all.parts) {
+                  const auto &q = parts[l];
+                  if (++decisions > limits.symbolic_decisions) return cap("symbolic_decisions");
+                  const auto r = model.translatedFamilyOverlap(p.family, px, q.family, placed(q, B, H));
+                  note(tag + ":" + std::to_string(k) + "," + std::to_string(l) + ":" + describe(r));
+                  if (r.code == "distinct_rows_window") ++stats.window_parts;
+                  if (r.status != OverlapStatus::kDisjoint) return unknown("symbolic_overlap:" + allocation);
+                }
+              }
+            }
+          }
+          return std::nullopt;
+        };
+#ifdef SENTRYWARD_CROSS_UNIT_MEMO_AUDIT
+        std::map<std::vector<std::int64_t>, Trace> memo;
+#else
         std::set<std::vector<std::int64_t>> memo;
+#endif
         for (std::size_t g = 0; g < A.groups.size(); ++g)
           for (std::size_t h = 0; h < B.groups.size(); ++h) {
             const auto &G = A.groups[g], &H = B.groups[h];
@@ -565,6 +682,7 @@ CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const Unit
             const std::uint64_t excluded = a == b ? (g == h ? G.units.size() : 0) : (zero ? 1 : 0);
             if (pairs == excluded) continue;
             if (++unit_pairs > limits.unit_pairs) return cap("unit_pairs");
+            ++stats.group_pairs;
             std::int64_t d;
             if (__builtin_sub_overflow(H.delta.front(), G.delta.front(), &d)) return unknown("delta_overflow:" + allocation);
             std::vector<std::int64_t> key;
@@ -578,66 +696,55 @@ CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const Unit
                 key.push_back(meet);
                 key.push_back(meet ? t : 0);
               }
+              if (absolute) {
+                key.push_back(G.delta.front());
+                key.push_back(H.delta.front());
+                for (const auto o : vary_a) key.push_back(G.delta[o]);
+                for (const auto o : vary_b) key.push_back(H.delta[o]);
+              }
             } else {
               key = {std::int64_t(g), std::int64_t(h)};
             }
-            if (!memo.insert(std::move(key)).second) continue;
-            for (const auto &P : A.buckets) {
-              if (P.writes.empty()) continue;
-              const auto x_terms = shift_terms(P.terms, A.objects, G.delta);
-              for (const auto &Q : B.buckets) {
-                if (!P.lookup && !Q.lookup) continue; // the constant pass
-                if (P.lookup && Q.lookup && same_terms(x_terms, shift_terms(Q.terms, B.objects, H.delta))) {
-                  // Equal lookups cancel: residual spans, exactly.
-                  for (const auto k : P.writes) {
-                    const auto &p = parts[k];
-                    const auto span = Span(p);
-                    auto x = p.footprint;
-                    x.symbolic.clear();
-                    x.gathers.clear();
-                    std::optional<CrossUnitOutcome> found;
-                    Q.all.Query(span.lo - I(d), span.hi - I(d), [&](std::size_t index) {
-                      const auto &q = parts[Q.all.parts[index]];
-                      if (++refinements > limits.refinements) {
-                        found = cap("refinements");
-                        return false;
-                      }
-                      auto y = q.footprint;
-                      y.symbolic.clear();
-                      y.gathers.clear();
-                      y.offset += I(d);
-                      const auto relation = ClassifyFamilyOverlap(p.family, x, q.family, y);
-                      if (!relation.overlap.empty() || !relation.unknown.empty()) {
-                        found = unknown("symbolic_overlap:" + allocation);
-                        return false;
-                      }
-                      return true;
-                    });
-                    if (found) return std::move(*found);
-                  }
-                  continue;
-                }
-                const auto x = region(A, P, G, P.write_hull), y = region(B, Q, H, Q.all_hull);
-                if (x && y && model.translatedFamilyOverlap(single, *x, single, *y).status == OverlapStatus::kDisjoint)
-                  continue;
-                // The hulls may meet: part by part.
-                for (const auto k : P.writes) {
-                  const auto &p = parts[k];
-                  const auto px = placed(p, A, G);
-                  for (const auto l : Q.all.parts) {
-                    const auto &q = parts[l];
-                    if (++decisions > limits.symbolic_decisions) return cap("symbolic_decisions");
-                    if (model.translatedFamilyOverlap(p.family, px, q.family, placed(q, B, H)).status !=
-                        OverlapStatus::kDisjoint)
-                      return unknown("symbolic_overlap:" + allocation);
-                  }
-                }
+#ifdef SENTRYWARD_CROSS_UNIT_MEMO_AUDIT
+            // Memo audit (test build): a hit is decided again and must repeat the first decision for
+            // its key, every status, code and solver detail included.
+            if (const auto hit = memo.find(key); hit != memo.end()) {
+              ++stats.memo_hits;
+              ++stats.memo_audited;
+              Trace again;
+              const auto outcome = decide(G, H, d, &again);
+              if (outcome || again != hit->second) {
+                std::fprintf(stderr, "cross-unit memo audit: group pair (%zu, %zu) on %s differs from the first "
+                                     "decision of its key\n", g, h, allocation.c_str());
+                std::abort();
               }
+              continue;
             }
+            Trace trace;
+            if (auto outcome = decide(G, H, d, &trace)) return std::move(*outcome);
+            memo.emplace(std::move(key), std::move(trace));
+            ++stats.memo_keys;
+#else
+            if (!memo.insert(std::move(key)).second) {
+              ++stats.memo_hits;
+              continue;
+            }
+            ++stats.memo_keys;
+            if (auto outcome = decide(G, H, d, nullptr)) return std::move(*outcome);
+#endif
           }
       }
     }
   }
   return {};
+}
+} // namespace
+
+CrossUnitOutcome CheckCrossUnit(std::span<const CrossUnitPart> parts, const UnitQuotient &quotient,
+                                MemoryModel &model, const CrossUnitLimits &limits) {
+  CrossUnitStats stats;
+  auto outcome = CheckCrossUnitWith(parts, quotient, model, limits, stats);
+  outcome.stats = stats;
+  return outcome;
 }
 } // namespace sentryward::algorithm

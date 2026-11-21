@@ -1148,7 +1148,7 @@ struct SymbolicAddressModel::Impl {
         first->alias_scope != 0 || names[first->space] != footprint.space || names[first->identity] != footprint.allocation ||
         first->offset->terms.size() != 1)
       return std::nullopt;
-    const auto [atom, stride] = first->offset->terms.front();
+    auto [atom, stride] = first->offset->terms.front();
     if (stride <= 0 || atoms[atom].gather.empty()) return std::nullopt;
     // Atom invariance and full widths over every member (Footprint checks the progression).
     for (std::size_t k = 1; k < family.count; ++k) {
@@ -1159,9 +1159,23 @@ struct SymbolicAddressModel::Impl {
           !current->offset || current->offset->terms != first->offset->terms || access.bytes != family.first.bytes)
         return std::nullopt;
     }
+    // A translated footprint: the member reads the element its one lookup term names.
+    if (!footprint.gathers.empty()) {
+      const auto& term = footprint.gathers.front();
+      if (footprint.gathers.size() != 1 || term.symbol != atoms[atom].gather || term.coefficient != stride ||
+          atoms[atom].args.size() != 1)
+        return std::nullopt;
+      atom = Intern(GatherKey(term.symbol, {term.arg}), term.symbol, {term.arg});
+    }
+    const auto [lo, hi] = FootprintSpan(family, footprint);
+    return FormOf(atom, stride, lo, hi);
+  }
+
+  // The window conditions of revision 4 for atom `atom` (its own premise bounds), stride S and
+  // residual byte range [lo, hi): 0 <= lower <= upper, [lo, hi) inside [0, S), S x upper + hi < 2^63.
+  std::optional<WindowForm> FormOf(AtomId atom, Int stride, Int lo, Int hi) const {
     const auto [lower, upper] = BoundsOf(atom);
     if (!lower || !upper || *lower < 0 || *upper < *lower) return std::nullopt;
-    const auto [lo, hi] = FootprintSpan(family, footprint);
     if (lo < 0 || hi > stride) return std::nullopt;
     const auto top = Checked(stride, *upper, true);
     const auto end = top ? Checked(*top, hi, false) : std::nullopt;
@@ -1172,6 +1186,20 @@ struct SymbolicAddressModel::Impl {
       form.arg = atoms[atom].args.front();
     }
     return form;
+  }
+
+  // The window form of one translated region [offset, offset + bytes) + S x t (the cross-unit pass's
+  // bucket hull in a unit), from the footprint alone: one lookup term with S > 0 and no alias scope.
+  // The caller vouches for the members (every part of the bucket has a windowForm).
+  std::optional<WindowForm> RegionWindow(const FamilyFootprint& footprint) {
+    if (error || !footprint.affine || footprint.empty || !footprint.region_axes.empty() || footprint.bytes == 0 ||
+        footprint.step != 0 || !KnownSpace(footprint.space) || footprint.allocation.empty() || !footprint.alias.empty() ||
+        footprint.gathers.size() != 1)
+      return std::nullopt;
+    const auto& term = footprint.gathers.front();
+    if (term.coefficient <= 0 || term.symbol.empty()) return std::nullopt;
+    const auto atom = Intern(GatherKey(term.symbol, {term.arg}), term.symbol, {term.arg});
+    return FormOf(atom, term.coefficient, footprint.offset, footprint.offset + Int(footprint.bytes));
   }
 
   // Row k of `field` when the form's atom is the lookup of the 64-bit element at byte
@@ -1328,6 +1356,17 @@ OverlapResult SymbolicAddressModel::translatedFamilyOverlap(const MemoryAccessFa
   if(impl_->error)return OverlapResult::Unknown("invalid symbolic-address model: "+impl_->error->message,"invalid_address_model");
   auto sa=impl_->FamilyShape(a,x),sb=impl_->FamilyShape(b,y);
   if(!sa || !sb)return OverlapResult::Unknown("family footprint is not an affine lookup form","translated_family_unsupported");
+  // The window rule: t1 != t2 by a distinct_rows relation and each family's bytes inside [0, S) of
+  // its window [S t, S (t + 1)), so the two share no byte.
+  if(!x.gathers.empty() && !y.gathers.empty() && x.space==y.space && x.allocation==y.allocation) {
+    const auto fx=impl_->Window(a,x),fy=impl_->Window(b,y);
+    if(fx && fy && fx->stride==fy->stride && impl_->Distinct(*fx,*fy)) {
+      ++impl_->stats.window_disjoint;
+      auto result=OverlapResult::Disjoint();
+      result.code="distinct_rows_window";
+      return result;
+    }
+  }
   return impl_->Decide(*sa,x.bytes,*sb,y.bytes);
 }
 std::optional<WindowForm> SymbolicAddressModel::windowForm(const MemoryAccessFamily& family,
@@ -1336,6 +1375,16 @@ std::optional<WindowForm> SymbolicAddressModel::windowForm(const MemoryAccessFam
 }
 bool SymbolicAddressModel::distinctRows(const WindowForm& a, const WindowForm& b) const {
   return impl_->Distinct(a, b);
+}
+std::optional<WindowForm> SymbolicAddressModel::regionWindowForm(const FamilyFootprint& footprint) {
+  return impl_->RegionWindow(footprint);
+}
+bool SymbolicAddressModel::lookupVariesByElement(std::string_view symbol, std::string_view object) const {
+  const std::string name(symbol);
+  if (impl_->field_policies.contains(name) || impl_->pinned_gathers.contains(name)) return true;
+  return std::any_of(impl_->distinct_rows.begin(), impl_->distinct_rows.end(), [&](const auto& relation) {
+    return relation.write.object == object || relation.read.object == object;
+  });
 }
 const ConstantAddressModel& SymbolicAddressModel::constantModel() const noexcept { return impl_->constants; }
 std::unique_ptr<MemoryConflictCandidates> SymbolicAddressModel::conflictCandidatesWithExemptions(

@@ -56,8 +56,16 @@ struct CrossUnitPart {
 struct CrossUnitLimits {
   std::uint64_t unit_pairs = 10'000'000, refinements = 1'000'000, symbolic_decisions = 100'000;
 };
+// Work of one pass (reported in memory_analysis.cross_unit): unit pairs counted against the cap, the
+// lookup pass's group pairs, memo keys and hits, and bucket regions and part pairs the window rule
+// with distinct rows decided (docs/design/gdn-multi-request.md, A1).
+struct CrossUnitStats {
+  std::uint64_t unit_pairs = 0, group_pairs = 0, memo_keys = 0, memo_hits = 0, memo_audited = 0;
+  std::uint64_t window_regions = 0, window_parts = 0, symbolic_decisions = 0;
+};
 struct CrossUnitOutcome {
   enum class Status : std::uint8_t { kNone, kRace, kUnknown, kCap };
+  CrossUnitStats stats;
   Status status = Status::kNone;
   // kRace: parts[first_part] member first_member (a write) in unit first_unit meets
   // parts[second_part] member second_member in unit second_unit, on `allocation`, whose δ in the two

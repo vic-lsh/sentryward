@@ -61,6 +61,9 @@ struct SymbolicAddressStats final {
   // Two different elements of one injective input object, with opposite
   // coefficients, differ by at least the coefficient.
   std::size_t injective_disjoint = 0;
+  // Translated family pairs (class mode's cross-unit pass) decided by the window rule with
+  // distinct rows, before the solver (docs/design/gdn-multi-request.md, A1).
+  std::size_t window_disjoint = 0;
   std::size_t solver_queries = 0;
   std::size_t solver_unsat = 0;
   std::size_t solver_sat = 0;
@@ -157,16 +160,28 @@ class SymbolicAddressModel final : public MemoryModel {
   // Footprints whose symbolic suffix is tensor-property lookups (FamilyFootprint::gathers): each
   // family is its lowest member's address plus one progression axis, decided like a pair of
   // bindings. Unknown when either footprint has another suffix or is not affine.
+  // Before the solver, the window rule (docs/design/gdn-multi-request.md, A1): when both families
+  // have a window form over their translated atoms (windowForm with the footprint's one lookup term)
+  // with equal S and distinctRows holds for the two translated atoms, Disjoint (code
+  // "distinct_rows_window").
   [[nodiscard]] OverlapResult translatedFamilyOverlap(const MemoryAccessFamily& a, const FamilyFootprint& x,
                                                       const MemoryAccessFamily& b, const FamilyFootprint& y) override;
   // A family on one resolved allocation without alias scope whose members' offsets have one
   // tensor-property lookup term S x t (the same atom and S > 0 for every member, all of one width),
   // the atom with both premise bounds and 0 <= lower; the footprint's span within [0, S) and
-  // S x upper + span < 2^63, in checked 128-bit arithmetic. Otherwise null.
+  // S x upper + span < 2^63, in checked 128-bit arithmetic. Otherwise null. A footprint with lookup
+  // terms (crossUnitFootprint, translated to a class member by the cross-unit pass) must have exactly
+  // that one term, same symbol and coefficient S; the form's atom, bounds and row are then the
+  // translated element's (never the representative's).
   [[nodiscard]] std::optional<WindowForm> windowForm(const MemoryAccessFamily&, const FamilyFootprint&) override;
+  // A translated bucket region's window form from its footprint alone (no members to check).
+  [[nodiscard]] std::optional<WindowForm> regionWindowForm(const FamilyFootprint&) override;
   // True when a distinct_rows relation makes the two forms' atoms rows i != j of its write field,
   // or row i of its write field and row j of its read field (either order): then t1 != t2.
   [[nodiscard]] bool distinctRows(const WindowForm&, const WindowForm&) const override;
+  // True for a lookup symbol with field policies or named by an address invariant, or an object
+  // named by a distinct_rows field.
+  [[nodiscard]] bool lookupVariesByElement(std::string_view symbol, std::string_view object) const override;
   // Footprint containment. `extent_bytes` null: only the touched interval is computed. Shapes the
   // address model cannot express (unresolved allocation, TMA regions, non-affine offsets) are
   // kUnknown, never kContained. Symbolic offsets are decided by the address solver over the

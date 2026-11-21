@@ -55,9 +55,23 @@ class MemoryModel {
     return std::nullopt;
   }
 
+  // The window form of one translated region of the cross-unit pass (FamilyFootprint with one lookup
+  // term, step 0, `bytes` the bucket's residual hull), from the footprint alone: the caller
+  // must have a windowForm for every part the region covers. Null: no window form.
+  [[nodiscard]] virtual std::optional<WindowForm> regionWindowForm(const FamilyFootprint&) { return std::nullopt; }
+
   // True only when a trusted field relation (docs/design/distinct-rows.md) makes the two window
   // forms' atoms unequal at every valuation; false keeps the relation-by-base rule unchanged.
   [[nodiscard]] virtual bool distinctRows(const WindowForm&, const WindowForm&) const { return false; }
+
+  // Whether a lookup of `symbol` on input object `object` can have bounds or premises that differ
+  // by element (a field policy, an address invariant naming its elements, or a distinct_rows field
+  // on the object): then a decision over a translated lookup depends on the absolute element, not
+  // only on relative shifts (the cross-unit memo key, docs/design/gdn-multi-request.md A1). True
+  // by default, the conservative answer.
+  [[nodiscard]] virtual bool lookupVariesByElement(std::string_view /*symbol*/, std::string_view /*object*/) const {
+    return true;
+  }
 
   [[nodiscard]] virtual std::optional<MemoryAnalysisError> validate() const {
     return std::nullopt;
