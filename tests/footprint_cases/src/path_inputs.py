@@ -60,6 +60,8 @@ CASES = {
     "path_or_known_past": inp("k_or_known_past", 32, taken=False, z=0),
     "path_eq16_wrapped": inp("k_eq16_wrapped", 262144, taken=False),
     "path_cross_lane": inp("k_cross_lane", 32, taken=False, premise=(0, 100), nth=2),
+    "path_wrap_cases": inp("k_wrap_cases", 20, taken=False, premise=(0, 16)),
+    "path_wrap_cases_small": inp("k_wrap_cases", 16, taken=False, premise=(0, 16)),
     "path_mask": inp("k_mask", 64, premise=(0, 15)),
     "path_mask_odd": inp("k_mask_odd", 64, premise=(0, 63)),
 }

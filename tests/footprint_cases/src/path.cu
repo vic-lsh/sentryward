@@ -89,4 +89,12 @@ __global__ void k_cross_lane(const uint32_t* hdr, uint32_t* out) {
     out[x] = 2;
   }
 }
+// Stage C: v = hdr[0] - 8 in [-8, 8] (premise hdr[0] in [0, 16]); the unsigned guard's meaning on
+// the store's side is a disjunction (v >= 0 && v > 2^32 - 6) || (v < 0 && v > -6): only the second
+// can hold, so v in [-5, -1] and out[v + 5] is inside 5 elements.
+__global__ void k_wrap_cases(const uint32_t* hdr, uint32_t* out) {
+  const int v = (int)hdr[0] - 8;
+  if ((unsigned)v <= 0xFFFFFFFAu) return;
+  out[v + 5] = 1;
+}
 }

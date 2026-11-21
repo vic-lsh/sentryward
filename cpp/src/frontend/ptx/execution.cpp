@@ -1211,11 +1211,33 @@ PredTermRef CompareTerm(const Instruction &i, std::string relation, const Scalar
     if (sign || bits || !In(relation, {"lt", "le", "gt", "ge"})) return nullptr;
     const bool c_right = ScalarInteger(right).has_value();
     const Scalar &var = c_right ? left : right;
-    const auto c = ScalarInteger(c_right ? right : left);
+    auto c = ScalarInteger(c_right ? right : left);
+    // An unsigned comparison reads the constant as its residue (-4 is 2^w - 4).
+    if (c) c = ((*c % (Integer(1) << width)) + (Integer(1) << width)) % (Integer(1) << width);
     const auto *b = std::get_if<BoundedInteger>(&var);
     if (!c || !b || !(*b)->affine) return nullptr;
     const Integer modulus = Integer(1) << width, L = (*b)->lower, U = (*b)->upper;
-    if (!(L >= -modulus && L < 0 && U >= 0 && U < modulus && *c >= 0 && *c < modulus + L - 1)) return nullptr;
+    if (L >= -modulus && U < 0 && *c >= 0 && *c < modulus) {
+      // Every value negative: its residue is v + 2^w, so v REL c on residues is v REL c - 2^w.
+      std::string r = relation;
+      if (!c_right) r = r == "lt" ? "gt" : r == "le" ? "ge" : r == "gt" ? "lt" : "le";
+      return std::make_shared<const PredTerm>(PredTerm{PredTerm::Kind::Compare, r, *(*b)->affine,
+                                                       AffineForm{*c - modulus, {}}, nullptr, nullptr});
+    }
+    if (!(L >= -modulus && L < 0 && U >= 0 && U < modulus && *c >= 0 && *c < modulus)) return nullptr;
+    if (*c >= modulus + L - 1) {
+      // Stage C: the exact disjunction. The residue of v is v for v >= 0 and v + 2^w for v < 0, so
+      // (v REL c) on residues is (v >= 0 && v REL c) || (v < 0 && v REL c - 2^w).
+      std::string r = relation;
+      if (!c_right) r = r == "lt" ? "gt" : r == "le" ? "ge" : r == "gt" ? "lt" : "le";
+      const AffineForm v = *(*b)->affine, zero{Integer(0), {}};
+      const auto cmp = [](std::string q, AffineForm x, AffineForm y) {
+        return std::make_shared<const PredTerm>(PredTerm{PredTerm::Kind::Compare, std::move(q), std::move(x), std::move(y), nullptr, nullptr});
+      };
+      return JoinTerm(PredTerm::Kind::Or,
+                      JoinTerm(PredTerm::Kind::And, cmp("ge", v, zero), cmp(r, v, AffineForm{*c, {}})),
+                      JoinTerm(PredTerm::Kind::And, cmp("lt", v, zero), cmp(r, v, AffineForm{*c - modulus, {}})));
+    }
     // Normalize to v REL c.
     std::string rel = relation;
     if (!c_right) rel = rel == "lt" ? "gt" : rel == "le" ? "ge" : rel == "gt" ? "lt" : "le";
@@ -1631,7 +1653,7 @@ private:
                                           std::uint32_t lane, std::uint64_t visit, LaneTrace &trace,
                                           std::string &why) const;
   void RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace, std::uint32_t warp,
-                       std::uint32_t lane) const;
+                       std::uint32_t lane, std::uint32_t line) const;
   // The lane a fact belongs to: CTA coordinates, warp, lane (the footprint checker computes the
   // same key from an access's actor). A containment query uses only its own lane's facts.
   std::string LaneKey(const State &s, std::uint32_t warp, std::uint32_t lane) const {
@@ -2103,6 +2125,42 @@ std::optional<Json> FactTermJson(const AffineForm &form) {
 }
 // The literals a term asserts with value `truth`, as far as that is a conjunction: a disjunctive
 // part asserts nothing here (fewer facts, still sound).
+using Literal = std::pair<std::string, const PredTerm *>;
+// The asserted formula (t with value `truth`) in disjunctive normal form: each element a
+// conjunction of literals. None when it would have more than `cap` disjuncts (sizes are counted
+// before any product is built).
+std::optional<std::vector<std::vector<Literal>>> Dnf(const PredTermRef &t, bool truth, std::size_t cap) {
+  using D = std::vector<std::vector<Literal>>;
+  if (!t) return D{{}};
+  static const std::map<std::string, std::string> negate{
+      {"eq", "ne"}, {"ne", "eq"}, {"lt", "ge"}, {"ge", "lt"}, {"le", "gt"}, {"gt", "le"}};
+  switch (t->kind) {
+    case PredTerm::Kind::Compare: return D{{{truth ? t->relation : negate.at(t->relation), t.get()}}};
+    case PredTerm::Kind::Not: return Dnf(t->a, !truth, cap);
+    case PredTerm::Kind::And:
+    case PredTerm::Kind::Or: {
+      const auto a = Dnf(t->a, truth, cap), b = Dnf(t->b, truth, cap);
+      if (!a || !b) return std::nullopt;
+      const bool conj = (t->kind == PredTerm::Kind::And) == truth;
+      if (!conj) {
+        if (a->size() + b->size() > cap) return std::nullopt;
+        D out = *a;
+        out.insert(out.end(), b->begin(), b->end());
+        return out;
+      }
+      if (a->size() * b->size() > cap) return std::nullopt;
+      D out;
+      for (const auto &x : *a)
+        for (const auto &y : *b) {
+          auto z = x;
+          z.insert(z.end(), y.begin(), y.end());
+          out.push_back(std::move(z));
+        }
+      return out;
+    }
+  }
+  return std::nullopt;
+}
 void Literals(const PredTermRef &t, bool truth, std::vector<std::pair<std::string, const PredTerm *>> &out) {
   if (!t) return;
   switch (t->kind) {
@@ -2168,12 +2226,34 @@ void Executor::TightenAtom(const ElementAtom &from, const ElementAtom &to, State
   }
 }
 void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State &cs, LaneTrace &trace,
-                               std::uint32_t warp, std::uint32_t lane) const {
+                               std::uint32_t warp, std::uint32_t lane, std::uint32_t line) const {
   auto &s = const_cast<State &>(cs);
   const auto found = s.pred_terms.find(predicate);
   if (found == s.pred_terms.end()) return;
   std::vector<std::pair<std::string, const PredTerm *>> literals;
   Literals(found->second, truth, literals);
+  // Stage C: a meaning that is a disjunction with no common conjunct needs a case. The input's
+  // fact_cases names it per line, with the number of cases the tree expanded: a lane whose own
+  // disjunction has another number refuses (never a pass); with no entry the run stops at the
+  // branch (fact_disjunction, with the number of cases) for the tree to expand.
+  if (literals.empty())
+    if (const auto dnf = Dnf(found->second, truth, 8); dnf && dnf->size() > 1) {
+      const auto cases = c_.raw.value("fact_cases", Json::array());
+      const auto entry = std::find_if(cases.begin(), cases.end(), [&](const Json &e) {
+        return e.value("line", std::uint64_t(0)) == line;
+      });
+      if (entry == cases.end())
+        throw ExecutionError("fact_disjunction", line,
+                             "the chosen branch's meaning is a disjunction: choose a case (fact_cases)",
+                             Json{{"cases", dnf->size()}});
+      if (entry->value("cases", std::uint64_t(0)) != dnf->size())
+        throw ExecutionError("fact_cases_mismatch", line,
+                             "this lane's disjunction has another number of cases than the input's",
+                             Json{{"cases", dnf->size()}});
+      const auto k = entry->value("case", std::uint64_t(0));
+      if (k >= dnf->size()) throw ExecutionError("fact_cases_mismatch", line, "case out of range", Json{{"cases", dnf->size()}});
+      literals = (*dnf)[k];
+    }
   // Each atom at the tightest bounds the lane knows (function atoms only carry lane facts).
   // An atom's key: its function identity, or its element (a tensor-property element is one value
   // in every lane, so a lane's fact about it holds for the element).
@@ -4461,7 +4541,7 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
       if (override && !bound && !predicate && d.predicate != kMissing && taken) {
         RefineGuard(pc, d.predicate, *taken != i.predicate_negated, state, warp.warp_id, lane, visit);
         if (path_facts_ && !state.summarizing)
-          RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace, warp.warp_id, lane);
+          RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace, warp.warp_id, lane, i.line);
       }
       if (!taken && d.predicate != kMissing && target > pc + 1)
         if (const auto *arm = MergedArmAt(pc); arm && (!arm->aligned || arm->uniform)) {

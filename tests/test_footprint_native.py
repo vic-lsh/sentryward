@@ -195,8 +195,37 @@ class FootprintNativeTest(unittest.TestCase):
         # Lane 0's x < 8 on the shared element must not bound lane 1's unguarded out[x].
         self.assertEqual(self.writes("path_cross_lane"), "violated")
 
+    # Stage C: a disjunctive meaning stops the run (fact_disjunction, with its number of cases);
+    # each case is then a run of its own (fact_cases). Cases contradicting the lane's facts are
+    # vacuous for the lane.
+    def case_writes(self, inp):
+        base = json.loads((HERE / "inputs" / f"{inp}.json").read_text())
+        first = run("path", inp)
+        stop = [d for d in first.get("diagnostics", []) if d.get("code") == "fact_disjunction"]
+        self.assertEqual(len(stop), 1, first.get("diagnostics"))
+        line = stop[0]["details"]["location"]["line"]
+        n = stop[0]["details"]["required_parameters"]["cases"]
+        self.assertGreater(n, 1)
+        out = []
+        for k in range(n):
+            tmp = HERE / "inputs" / f".case_{os.getpid()}.json"
+            tmp.write_text(json.dumps(dict(base, fact_cases=[{"line": line, "case": k, "cases": n}])))
+            try:
+                out.append(self.footprint(run("path", tmp.stem))["writes"])
+            finally:
+                tmp.unlink()
+        return out
+
+    def test_path_disjunction_cases_contained(self):
+        self.assertEqual(set(self.case_writes("path_wrap_cases")), {"contained"})
+
+    def test_path_disjunction_cases_off_by_one_refused(self):
+        self.assertIn("violated", self.case_writes("path_wrap_cases_small"))
+
     def test_path_and_pred_not_taken_bounds_neither(self):
-        self.assertNotEqual(self.writes("path_and"), "contained")
+        # Not (s >= 8 && last) is (s < 8) || !last: a case split (stage C); the !last case leaves s
+        # unbounded, so some case is violated.
+        self.assertIn("violated", self.case_writes("path_and"))
 
     def test_path_low_bit_mask_inside(self):
         self.assertEqual(self.writes("path_mask"), "contained")

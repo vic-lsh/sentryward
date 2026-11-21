@@ -208,6 +208,12 @@ struct SymbolicAddressModel::Impl {
   // on the first query of the lane. `current_lane` is the lane of the query in progress: Instantiate
   // and BoundsOf read its facts and bounds; empty outside a lane query.
   std::set<std::string> fact_lanes;
+  std::map<std::string, std::string> lane_signature;  // lane -> its fact set's signature
+  const std::string& Signature(const std::string& lane) const {
+    static const std::string none;
+    const auto found = lane_signature.find(lane);
+    return found == lane_signature.end() ? none : found->second;
+  }
   std::map<std::string, AtomBounds> lane_propagated;
   enum class LaneState { kSat, kUnsat, kUnknown };
   std::map<std::string, LaneState> lane_states;
@@ -231,7 +237,7 @@ struct SymbolicAddressModel::Impl {
   // Otherwise the input invariants and that lane's facts into lane_propagated[lane] (false on a
   // contradiction: the lane's facts are unsat).
   bool PropagateBounds(const std::string& lane = {}) {
-    AtomBounds& target = lane.empty() ? propagated : lane_propagated[lane];
+    AtomBounds& target = lane.empty() ? propagated : lane_propagated[Signature(lane)];
     if (!lane.empty()) active_lane = &target;
     constexpr int kRounds = 16;
     // Checked floor and ceiling division (no negation of the minimum; MIN / -1 abandoned).
@@ -376,6 +382,21 @@ struct SymbolicAddressModel::Impl {
       (void)PropagateBounds();
       for (const auto& bound : term_bounds)
         if (!bound.lane.empty()) fact_lanes.insert(bound.lane);
+      // Lanes whose facts are the same set (terms and bounds, lane key aside) share every per-lane
+      // result: consistency, propagated bounds and extremes are cached by that signature.
+      {
+        std::map<std::string, std::set<std::string>> parts;
+        for (const auto& bound : term_bounds)
+          if (!bound.lane.empty())
+            parts[bound.lane].insert(bound.term.key() + "[" + (bound.lower ? ToString(*bound.lower) : "") + "," +
+                                     (bound.upper ? ToString(*bound.upper) : "") + "]" +
+                                     (bound.scope ? "@" + std::to_string(*bound.scope) : ""));
+        for (const auto& [lane, set] : parts) {
+          std::string sig;
+          for (const auto& part : set) sig += part + ";";
+          lane_signature[lane] = std::move(sig);
+        }
+      }
     } catch (const std::exception& failure) {
       if (!error) error = MemoryAnalysisError{
           std::string("invalid symbolic-address model: ") + failure.what(), std::nullopt, std::nullopt};
@@ -1009,7 +1030,10 @@ struct SymbolicAddressModel::Impl {
 
   // The lane's facts proved consistent? Cached; the propagation pass also fills its bounds.
   LaneState LaneStatus(const std::string& lane) {
-    if (const auto found = lane_states.find(lane); found != lane_states.end()) return found->second;
+    if (const auto found = lane_states.find(Signature(lane)); found != lane_states.end()) {
+      if (!lane_propagated.contains(Signature(lane))) (void)PropagateBounds(lane);
+      return found->second;
+    }
     LaneState state = LaneState::kUnknown;
     if (!PropagateBounds(lane)) state = LaneState::kUnsat;  // empty interval from true facts
     else if (solver) {
@@ -1022,7 +1046,7 @@ struct SymbolicAddressModel::Impl {
       state = answer == address_solver::Verdict::kUnsat ? LaneState::kUnsat
             : answer == address_solver::Verdict::kSat   ? LaneState::kSat : LaneState::kUnknown;
     }
-    return lane_states.emplace(lane, state).first->second;
+    return lane_states.emplace(Signature(lane), state).first->second;
   }
   ContainmentVerdict Contain(const MemoryAccess& access, std::optional<std::uint64_t> extent,
                              unsigned timeout_ms, std::int64_t lower = 0, const std::string& lane = {}) {
@@ -1031,7 +1055,7 @@ struct SymbolicAddressModel::Impl {
       Impl& self;
       LaneScope(Impl& s, const std::string& l) : self(s) {
         self.current_lane = s.fact_lanes.contains(l) ? l : std::string();
-        self.active_lane = self.current_lane.empty() ? nullptr : &self.lane_propagated[self.current_lane];
+        self.active_lane = self.current_lane.empty() ? nullptr : &self.lane_propagated[self.Signature(self.current_lane)];
       }
       ~LaneScope() { self.current_lane.clear(); self.active_lane = nullptr; }
     } scope(*this, lane);
@@ -1050,7 +1074,7 @@ struct SymbolicAddressModel::Impl {
     if (env_unproved) return unknown("address invariants (path facts) are not proved consistent");
     if (!current_lane.empty()) {
       const auto state = LaneStatus(current_lane);
-      active_lane = &lane_propagated[current_lane];
+      active_lane = &lane_propagated[Signature(current_lane)];
       if (state == LaneState::kUnknown) return unknown("the access's lane path facts are not proved consistent");
       if (state == LaneState::kUnsat) {
         // No execution has this lane on this path: the access does not occur (vacuous).
@@ -1164,7 +1188,7 @@ struct SymbolicAddressModel::Impl {
   std::map<std::string, Extremes> extreme_cache;
 
   Extremes& ExtremesOf(const Affine& symbolic, const std::optional<std::pair<Int, Int>>& hull, unsigned timeout_ms) {
-    auto [slot, fresh] = extreme_cache.try_emplace(symbolic.key() + "|" + current_lane);
+    auto [slot, fresh] = extreme_cache.try_emplace(symbolic.key() + "|" + Signature(current_lane));
     auto& result = slot->second;
     if (!fresh) return result;
     std::set<AtomId> selected;
