@@ -319,3 +319,41 @@ $L__BB10_2:
 	ret;
 
 }
+	// .globl	k_cross_lane
+.visible .entry k_cross_lane(
+	.param .u64 .ptr .align 1 k_cross_lane_param_0,
+	.param .u64 .ptr .align 1 k_cross_lane_param_1
+)
+{
+	.reg .pred 	%p<4>;
+	.reg .b32 	%r<6>;
+	.reg .b64 	%rd<10>;
+
+	ld.param.u64 	%rd3, [k_cross_lane_param_0];
+	ld.param.u64 	%rd4, [k_cross_lane_param_1];
+	cvta.to.global.u64 	%rd1, %rd4;
+	cvta.to.global.u64 	%rd5, %rd3;
+	ld.global.u32 	%r1, [%rd5];
+	cvt.u64.u32 	%rd2, %r1;
+	mov.u32 	%r2, %tid.x;
+	setp.eq.s32 	%p1, %r2, 1;
+	@%p1 bra 	$L__BB12_4;
+	setp.ne.s32 	%p2, %r2, 0;
+	@%p2 bra 	$L__BB12_5;
+	cvt.u32.u64 	%r4, %rd2;
+	setp.gt.u32 	%p3, %r4, 7;
+	@%p3 bra 	$L__BB12_5;
+	shl.b64 	%rd8, %rd2, 2;
+	add.s64 	%rd9, %rd1, %rd8;
+	mov.b32 	%r5, 1;
+	st.global.u32 	[%rd9], %r5;
+	bra.uni 	$L__BB12_5;
+$L__BB12_4:
+	mul.wide.u32 	%rd6, %r1, 4;
+	add.s64 	%rd7, %rd1, %rd6;
+	mov.b32 	%r3, 2;
+	st.global.u32 	[%rd7], %r3;
+$L__BB12_5:
+	ret;
+
+}

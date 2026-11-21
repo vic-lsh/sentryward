@@ -141,6 +141,10 @@ struct SymbolicAddressModel::Impl {
     // its scope atom stands for, so a query includes it only when the query names that atom, and it
     // takes no part in the global consistency check or bound propagation.
     std::optional<AtomId> scope = std::nullopt;
+    // A lane fact (relational path conditions): true of the recording lane's own path only, so only
+    // a query for an access of that lane includes it (docs/design/loop-summaries.md, lane-scoped
+    // facts). Empty: an input invariant, true of every execution.
+    std::string lane = {};
   };
 
   struct GatherPolicy final {
@@ -197,19 +201,38 @@ struct SymbolicAddressModel::Impl {
   // policy whose elements include the atom's offset.
   // Atom bounds the term invariants imply (bound propagation over the linear facts, computed once
   // when the model is built): sound, since each invariant holds of every execution the run covers.
-  std::map<AtomId, std::pair<std::optional<Int>, std::optional<Int>>> propagated;
+  using AtomBounds = std::map<AtomId, std::pair<std::optional<Int>, std::optional<Int>>>;
+  AtomBounds propagated;
+  // Lane facts: the lanes that recorded any, each lane's propagated bounds (over the input
+  // invariants and its own facts) and its consistency (proved sat, proved unsat, unknown), computed
+  // on the first query of the lane. `current_lane` is the lane of the query in progress: Instantiate
+  // and BoundsOf read its facts and bounds; empty outside a lane query.
+  std::set<std::string> fact_lanes;
+  std::map<std::string, AtomBounds> lane_propagated;
+  enum class LaneState { kSat, kUnsat, kUnknown };
+  std::map<std::string, LaneState> lane_states;
+  std::string current_lane;
+  const AtomBounds* active_lane = nullptr;
   std::pair<std::optional<Int>, std::optional<Int>> BoundsOf(AtomId atom) const {
     auto [lower, upper] = DeclaredBoundsOf(atom);
-    if (const auto p = propagated.find(atom); p != propagated.end()) {
-      if (p->second.first) lower = lower ? std::max(*lower, *p->second.first) : *p->second.first;
-      if (p->second.second) upper = upper ? std::min(*upper, *p->second.second) : *p->second.second;
+    for (const AtomBounds* table : {&propagated, active_lane}) {
+      if (!table) continue;
+      if (const auto p = table->find(atom); p != table->end()) {
+        if (p->second.first) lower = lower ? std::max(*lower, *p->second.first) : *p->second.first;
+        if (p->second.second) upper = upper ? std::min(*upper, *p->second.second) : *p->second.second;
+      }
     }
     return {lower, upper};
   }
   // Interval propagation: for each invariant c + sum k_i a_i in [L, U] and each atom a_j, the
   // others' intervals bound k_j a_j; repeated to a fixpoint (at most kRounds rounds). Integer
   // division rounds inward. Only tightens; an empty interval is left to the consistency check.
-  void PropagateBounds() {
+  // `lane` empty: the input invariants into `propagated` (a contradiction: environment unproved).
+  // Otherwise the input invariants and that lane's facts into lane_propagated[lane] (false on a
+  // contradiction: the lane's facts are unsat).
+  bool PropagateBounds(const std::string& lane = {}) {
+    AtomBounds& target = lane.empty() ? propagated : lane_propagated[lane];
+    if (!lane.empty()) active_lane = &target;
     constexpr int kRounds = 16;
     // Checked floor and ceiling division (no negation of the minimum; MIN / -1 abandoned).
     const auto floor_div = [](const Int& a, const Int& b) -> std::optional<Int> {
@@ -241,6 +264,7 @@ struct SymbolicAddressModel::Impl {
       bool changed = false;
       for (const auto& bound : term_bounds) {
         if (bound.scope) continue;  // local: not a fact about every execution
+        if (!bound.lane.empty() && bound.lane != lane) continue;  // another lane's (or any, globally)
         const auto& terms = bound.term.terms;
         for (std::size_t j = 0; j < terms.size(); ++j) {
           // Interval of c + sum_{i != j} k_i a_i.
@@ -268,16 +292,20 @@ struct SymbolicAddressModel::Impl {
             if (khi) alo = ceil_div(*khi, k);
             if (klo) ahi = floor_div(*klo, k);
           }
-          auto& slot = propagated[terms[j].first];
+          auto& slot = target[terms[j].first];
           const auto [cl, cu] = BoundsOf(terms[j].first);
           if (alo && (!cl || *alo > *cl)) { slot.first = alo; changed = true; }
           if (ahi && (!cu || *ahi < *cu)) { slot.second = ahi; changed = true; }
           const auto [nl, nu] = BoundsOf(terms[j].first);
-          if (nl && nu && *nl > *nu) { env_unproved = true; return; }  // contradiction: no pass
+          if (nl && nu && *nl > *nu) {  // contradiction
+            if (lane.empty()) env_unproved = true;
+            return false;
+          }
         }
       }
       if (!changed) break;
     }
+    return true;
   }
   std::pair<std::optional<Int>, std::optional<Int>> DeclaredBoundsOf(AtomId atom) const {
     std::optional<Int> lower, upper;
@@ -345,7 +373,9 @@ struct SymbolicAddressModel::Impl {
         binding_shapes.emplace(binding.address.value(), shape);
       }
       CheckInvariantsConsistent();
-      PropagateBounds();
+      (void)PropagateBounds();
+      for (const auto& bound : term_bounds)
+        if (!bound.lane.empty()) fact_lanes.insert(bound.lane);
     } catch (const std::exception& failure) {
       if (!error) error = MemoryAnalysisError{
           std::string("invalid symbolic-address model: ") + failure.what(), std::nullopt, std::nullopt};
@@ -646,11 +676,16 @@ struct SymbolicAddressModel::Impl {
     for (const auto& value : values) {
       if (!value.is_object()) throw std::invalid_argument("address invariant must be an object");
       if (value.contains("term")) {
-        Keys(value, {"term", "lower_bound", "upper_bound", "multiple_of", "scope"});
+        Keys(value, {"term", "lower_bound", "upper_bound", "multiple_of", "scope", "lane"});
         auto term = Scalar(value.at("term"));
         if (!term || term->terms.empty())
           throw std::invalid_argument("invariant term must be a symbolic scalar expression");
         TermBound bound{std::move(*term), {}, {}, {}};
+        if (value.contains("lane")) {
+          if (!value.at("lane").is_string() || value.at("lane").get<std::string>().empty())
+            throw std::invalid_argument("lane must be a nonempty string");
+          bound.lane = value.at("lane").get<std::string>();
+        }
         if (value.contains("scope")) {
           if (!value.at("scope").is_string()) throw std::invalid_argument("scope must be a lookup symbol");
           const auto symbol = value.at("scope").get<std::string>();
@@ -691,6 +726,7 @@ struct SymbolicAddressModel::Impl {
   // share atoms and over joint-injectivity siblings, then emits bounds,
   // alignment and the finite injectivity lemmas of Proposition 4.1.
   address_solver::Query Instantiate(std::set<AtomId> selected, std::map<AtomId, std::size_t>& variables) {
+    const std::string& lane = current_lane;
     address_solver::Query query;
     std::vector<bool> used(term_bounds.size());
     // A scoped (local) invariant joins only a query that names its scope atom itself, never one that
@@ -700,6 +736,7 @@ struct SymbolicAddressModel::Impl {
       changed = false;
       for (std::size_t i = 0; i < term_bounds.size(); ++i) {
         if (used[i]) continue;
+        if (!term_bounds[i].lane.empty() && term_bounds[i].lane != lane) continue;  // another lane's fact
         const auto& terms = term_bounds[i].term.terms;
         if (term_bounds[i].scope ? !named.contains(*term_bounds[i].scope)
                                  : !std::any_of(terms.begin(), terms.end(), [&](const auto& t) { return selected.contains(t.first); }))
@@ -776,7 +813,7 @@ struct SymbolicAddressModel::Impl {
     if (!solver) { env_unproved = true; return; }
     std::set<AtomId> selected;
     for (const auto& bound : term_bounds)
-      if (!bound.scope)
+      if (!bound.scope && bound.lane.empty())
         for (const auto& [atom, ignored] : bound.term.terms) { (void)ignored; selected.insert(atom); }
     // Unknown is not proof of consistency; each pair rechecks its own ground
     // environment before an unsat overlap is accepted.
@@ -970,8 +1007,34 @@ struct SymbolicAddressModel::Impl {
     return static_cast<std::int64_t>(std::max(-limit, std::min(limit, value)));
   }
 
+  // The lane's facts proved consistent? Cached; the propagation pass also fills its bounds.
+  LaneState LaneStatus(const std::string& lane) {
+    if (const auto found = lane_states.find(lane); found != lane_states.end()) return found->second;
+    LaneState state = LaneState::kUnknown;
+    if (!PropagateBounds(lane)) state = LaneState::kUnsat;  // empty interval from true facts
+    else if (solver) {
+      std::set<AtomId> selected;
+      for (const auto& bound : term_bounds)
+        if (bound.lane == lane && !bound.scope)
+          for (const auto& [atom, ignored] : bound.term.terms) { (void)ignored; selected.insert(atom); }
+      std::map<AtomId, std::size_t> variables;
+      const auto answer = solver->consistent(Instantiate(std::move(selected), variables), options.timeout_ms);
+      state = answer == address_solver::Verdict::kUnsat ? LaneState::kUnsat
+            : answer == address_solver::Verdict::kSat   ? LaneState::kSat : LaneState::kUnknown;
+    }
+    return lane_states.emplace(lane, state).first->second;
+  }
   ContainmentVerdict Contain(const MemoryAccess& access, std::optional<std::uint64_t> extent,
-                             unsigned timeout_ms, std::int64_t lower = 0) {
+                             unsigned timeout_ms, std::int64_t lower = 0, const std::string& lane = {}) {
+    // The query's lane: its facts and bounds for the whole query, restored on return.
+    struct LaneScope {
+      Impl& self;
+      LaneScope(Impl& s, const std::string& l) : self(s) {
+        self.current_lane = s.fact_lanes.contains(l) ? l : std::string();
+        self.active_lane = self.current_lane.empty() ? nullptr : &self.lane_propagated[self.current_lane];
+      }
+      ~LaneScope() { self.current_lane.clear(); self.active_lane = nullptr; }
+    } scope(*this, lane);
     ContainmentVerdict verdict;
     const auto unknown = [&](std::string reason) { verdict.status = ContainmentVerdict::Status::kUnknown;
                                                    verdict.reason = std::move(reason); return verdict; };
@@ -985,6 +1048,17 @@ struct SymbolicAddressModel::Impl {
     if (shape.base == Base::kAllocation) verdict.allocation = names[shape.identity];
     // Classified (space, allocation) first, so a caller does not drop the access as another space.
     if (env_unproved) return unknown("address invariants (path facts) are not proved consistent");
+    if (!current_lane.empty()) {
+      const auto state = LaneStatus(current_lane);
+      active_lane = &lane_propagated[current_lane];
+      if (state == LaneState::kUnknown) return unknown("the access's lane path facts are not proved consistent");
+      if (state == LaneState::kUnsat) {
+        // No execution has this lane on this path: the access does not occur (vacuous).
+        verdict.status = ContainmentVerdict::Status::kContained;
+        verdict.reason = "vacuous: the access's lane path facts are unsat";
+        return verdict;
+      }
+    }
     if (shape.absent) { verdict.status = ContainmentVerdict::Status::kContained; return verdict; }
     if (shape.base != Base::kAllocation) return unknown("allocation is unresolved: " + Describe(shape));
     if (shape.region_bytes) return unknown("TMA region footprint is not an exact byte range");
@@ -1090,7 +1164,7 @@ struct SymbolicAddressModel::Impl {
   std::map<std::string, Extremes> extreme_cache;
 
   Extremes& ExtremesOf(const Affine& symbolic, const std::optional<std::pair<Int, Int>>& hull, unsigned timeout_ms) {
-    auto [slot, fresh] = extreme_cache.try_emplace(symbolic.key());
+    auto [slot, fresh] = extreme_cache.try_emplace(symbolic.key() + "|" + current_lane);
     auto& result = slot->second;
     if (!fresh) return result;
     std::set<AtomId> selected;
@@ -1366,8 +1440,9 @@ std::unique_ptr<MemoryConflictCandidates> SymbolicAddressModel::conflictCandidat
 
 ContainmentVerdict SymbolicAddressModel::containment(const MemoryAccess& access,
                                                      std::optional<std::uint64_t> extent_bytes,
-                                                     unsigned timeout_ms, std::int64_t lower) {
-  return impl_->Contain(access, extent_bytes, timeout_ms, lower);
+                                                     unsigned timeout_ms, std::int64_t lower,
+                                                     const std::string& lane) {
+  return impl_->Contain(access, extent_bytes, timeout_ms, lower, lane);
 }
 
 SymbolicAddressStats SymbolicAddressModel::stats() const noexcept { return impl_->stats; }

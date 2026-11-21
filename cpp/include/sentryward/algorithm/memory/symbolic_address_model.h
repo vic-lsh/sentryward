@@ -145,9 +145,11 @@ class SymbolicAddressModel final : public MemoryModel {
   // kUnknown, never kContained. Symbolic offsets are decided by the address solver over the
   // tensor-property and address-invariant environment, with `timeout_ms` per query. `lower`: the
   // range is [lower, extent_bytes) (a CTA-class representative's range narrowed by its members' δ).
+  // `lane`: the access's lane ("x,y,z,warp:lane"); the query uses that lane's path facts only.
   [[nodiscard]] ContainmentVerdict containment(const MemoryAccess& access,
                                                 std::optional<std::uint64_t> extent_bytes,
-                                                unsigned timeout_ms = 2000, std::int64_t lower = 0);
+                                                unsigned timeout_ms = 2000, std::int64_t lower = 0,
+                                                const std::string& lane = {});
   [[nodiscard]] SymbolicAddressStats stats() const noexcept;
   // Whether this build links an SMT backend, and its name ("z3" or "unavailable").
   [[nodiscard]] static bool SolverAvailable() noexcept;

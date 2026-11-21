@@ -78,4 +78,15 @@ __global__ void k_eq16_wrapped(const uint16_t* hdr16, uint32_t* out) {
 __global__ void k_index(const uint32_t* hdr, uint32_t* out) {
   out[hdr[0]] = 1;
 }
+// Control (lane-scoped facts): x = hdr[0] is one shared element (premise [0, 100]). Lane 0 writes
+// out[x] under x < 8; lane 1 writes out[x] with no guard. Lane 0's fact must not cover lane 1.
+__global__ void k_cross_lane(const uint32_t* hdr, uint32_t* out) {
+  const uint32_t x = hdr[0];
+  if (threadIdx.x == 0) {
+    if (x >= 8) return;
+    out[x] = 1;
+  } else if (threadIdx.x == 1) {
+    out[x] = 2;
+  }
+}
 }

@@ -7,18 +7,19 @@ HERE = pathlib.Path(__file__).resolve().parents[1]
 PTX = (HERE / "ptx" / "path.ptx").read_text()
 
 
-def branch_line(entry):
-    """The PTX line of the entry's one conditional branch."""
+def branch_line(entry, nth=0):
+    """The PTX line of the entry's nth conditional branch (0: the first)."""
     lines = PTX.splitlines()
     start = next(i for i, l in enumerate(lines) if l.startswith(f".visible .entry {entry}("))
-    return next(i + 1 for i in range(start, len(lines)) if re.match(r"\s*@%p\d+ bra", lines[i]))
+    found = [i + 1 for i in range(start, len(lines)) if re.match(r"\s*@%p\d+ bra", lines[i])]
+    return found[nth]
 
 
 def piece(n, direction):
     return {"base": 0, "rows": 1, "stride": n, "period": n, "count": 1, "width": n, "direction": direction}
 
 
-def inp(entry, out_bytes, taken=None, premise=None, z=None):
+def inp(entry, out_bytes, taken=None, premise=None, z=None, nth=0):
     d = {
         "schema": "spverify.kernel-input/v1", "entry": entry,
         "launch": {"grid_dim": [1, 1, 1], "block_dim": [32, 1, 1], "dynamic_shared_bytes": 0},
@@ -30,7 +31,7 @@ def inp(entry, out_bytes, taken=None, premise=None, z=None):
         "footprint_reads": "noninterference",
     }
     if taken is not None:
-        d["branch_decisions"] = [{"line": branch_line(entry), "taken": taken}]
+        d["branch_decisions"] = [{"line": branch_line(entry, nth), "taken": taken}]
     if premise is not None:
         lo, hi = premise
         d["tensor_properties"] = [{"object": "hdr", "element_type": "u32", "property": p, "value": v,
@@ -58,6 +59,7 @@ CASES = {
     "path_or_known": inp("k_or_known", 32, taken=False, z=0),
     "path_or_known_past": inp("k_or_known_past", 32, taken=False, z=0),
     "path_eq16_wrapped": inp("k_eq16_wrapped", 262144, taken=False),
+    "path_cross_lane": inp("k_cross_lane", 32, taken=False, premise=(0, 100), nth=2),
     "path_mask": inp("k_mask", 64, premise=(0, 15)),
     "path_mask_odd": inp("k_mask_odd", 64, premise=(0, 63)),
 }

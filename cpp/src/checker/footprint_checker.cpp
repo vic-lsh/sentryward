@@ -253,7 +253,16 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     // Only a known zero width has no bytes to check; an unknown width is classified below.
     if ((access.bytes && *access.bytes == 0) || !std::holds_alternative<AddressId>(access.address)) continue;
     // The verdict without an extent names the allocation and space; global memory only.
-    auto probe = model.containment(access, std::nullopt);
+    // The access's lane key, as the frontend writes it on the lane's path facts: block
+    // coordinates, then warp and lane of its thread ordinal (warps of 32).
+    std::string lane_key;
+    if (const auto cta = ctas(access.actor); cta != ActorCtas::kNoCta && thread_of.count(access.actor.value())) {
+      const auto b = Unflatten(cta, grid);
+      const auto t = thread_of.at(access.actor.value());
+      lane_key = std::to_string(b[0]) + "," + std::to_string(b[1]) + "," + std::to_string(b[2]) + "," +
+                 std::to_string(t / 32) + ":" + std::to_string(t % 32);
+    }
+    auto probe = model.containment(access, std::nullopt, 2000, 0, lane_key);
     // A probe that could not classify the access (no space: model error, unproved invariants,
     // missing binding) is undecided, never skipped.
     if (probe.address_space.empty() && probe.status == ContainmentVerdict::Status::kUnknown) {
@@ -301,7 +310,7 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     const std::int64_t lower = -shift.low;
     const std::uint64_t upper = shift.high > 0 ? (decl.extent > std::uint64_t(shift.high) ? decl.extent - shift.high : 0)
                                                : decl.extent;
-    const auto verdict = model.containment(access, upper, 2000, lower);
+    const auto verdict = model.containment(access, upper, 2000, lower, lane_key);
     if (shift.units > 1 && !verdict.constant_offset && (!verdict.min_byte || verdict.field_bounded))
       throw UnitClassRestart{"footprint_symbolic_member:" + object};
     if (!verdict.constant_offset) st.symbolic += shift.units;

@@ -1630,7 +1630,13 @@ private:
   std::optional<LoopSummary> StartSummary(const LoopPlan &plan, std::uint32_t pc, State &s, std::uint32_t warp,
                                           std::uint32_t lane, std::uint64_t visit, LaneTrace &trace,
                                           std::string &why) const;
-  void RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace) const;
+  void RecordPathFacts(std::uint32_t predicate, bool truth, const State &s, LaneTrace &trace, std::uint32_t warp,
+                       std::uint32_t lane) const;
+  // The lane a fact belongs to: CTA coordinates, warp, lane (the footprint checker computes the
+  // same key from an access's actor). A containment query uses only its own lane's facts.
+  std::string LaneKey(const State &s, std::uint32_t warp, std::uint32_t lane) const {
+    return CtaText(s) + std::to_string(warp) + ":" + std::to_string(lane);
+  }
   // This lane's CTA coordinates, as text for an atom identity.
   std::string CtaText(const State &s) const;
   // The index of the `setp` RefineGuard reads for the branch at `pc`, when it has that shape.
@@ -2161,7 +2167,8 @@ void Executor::TightenAtom(const ElementAtom &from, const ElementAtom &to, State
     reg = BoundedInteger{std::make_shared<const BoundedValue>(std::move(value))};
   }
 }
-void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State &cs, LaneTrace &trace) const {
+void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State &cs, LaneTrace &trace,
+                               std::uint32_t warp, std::uint32_t lane) const {
   auto &s = const_cast<State &>(cs);
   const auto found = s.pred_terms.find(predicate);
   if (found == s.pred_terms.end()) return;
@@ -2262,7 +2269,7 @@ void Executor::RecordPathFacts(std::uint32_t predicate, bool truth, const State 
     if (relation == "lt") s.nonnegative.push_back(AffineSum(neg, AffineForm{Integer(1), {}}, Integer(-1)));
     const auto json = FactTermJson(current(difference));
     if (!json) continue;
-    Json fact{{"term", *json}};
+    Json fact{{"term", *json}, {"lane", LaneKey(s, warp, lane)}};
     if (relation == "eq") { fact["lower_bound"] = 0; fact["upper_bound"] = 0; }
     else if (relation == "lt") fact["upper_bound"] = -1;
     else if (relation == "le") fact["upper_bound"] = 0;
@@ -2431,7 +2438,8 @@ std::optional<Executor::LoopSummary> Executor::StartSummary(const LoopPlan &plan
     const auto json = FactTermJson(local);
     if (!json) { why = "summary_fact_out_of_range"; return std::nullopt; }
     trace.path_facts.push_back(Json{{"term", *json}, {"lower_bound", 0},
-        {"scope", algorithm::TensorPropertyFunctionSymbol(k.object, k.element_type, k.function)}}.dump());
+        {"scope", algorithm::TensorPropertyFunctionSymbol(k.object, k.element_type, k.function)},
+        {"lane", LaneKey(s, warp, lane)}}.dump());
   }
   std::map<std::uint32_t, Scalar> start;
   for (const auto &[r, c] : plan.steps) {
@@ -3592,7 +3600,8 @@ void Executor::Data(const Decoded &d, State &s, std::uint32_t warp,
           // x - p q - r == 0 (a fact over two or more atoms: an address invariant).
           AffineForm definition = AffineSum(*(*bx)->affine, AffineForm{Integer(0), {{q, p}, {r, Integer(1)}}}, Integer(-1));
           if (const auto json = FactTermJson(definition)) {
-            s.facts.push_back(Json{{"term", *json}, {"lower_bound", 0}, {"upper_bound", 0}}.dump());
+            s.facts.push_back(Json{{"term", *json}, {"lower_bound", 0}, {"upper_bound", 0},
+                                   {"lane", LaneKey(s, warp, lane)}}.dump());
             Set(d, s, {high ? MakeBounded(q.lower * p, q.upper * p, q.function + "*", {}, AffineForm{Integer(0), {{q, p}}})
                             : MakeBounded(Integer(0), p - 1, r.function, {}, AffineForm{Integer(0), {{r, Integer(1)}}})});
             return;
@@ -4451,7 +4460,8 @@ LaneTask Executor::Lane(const WarpContract &warp, std::uint32_t lane,
       auto taken = supplied ? supplied : predicate;
       if (override && !bound && !predicate && d.predicate != kMissing && taken) {
         RefineGuard(pc, d.predicate, *taken != i.predicate_negated, state, warp.warp_id, lane, visit);
-        if (path_facts_ && !state.summarizing) RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace);
+        if (path_facts_ && !state.summarizing)
+          RecordPathFacts(d.predicate, *taken != i.predicate_negated, state, trace, warp.warp_id, lane);
       }
       if (!taken && d.predicate != kMissing && target > pc + 1)
         if (const auto *arm = MergedArmAt(pc); arm && (!arm->aligned || arm->uniform)) {

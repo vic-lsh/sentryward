@@ -191,6 +191,10 @@ class FootprintNativeTest(unittest.TestCase):
     def test_piece_rows_straddling_store_not_contained(self):
         self.assertNotEqual(self.writes("path_index_rows"), "contained")
 
+    def test_path_facts_are_lane_scoped(self):
+        # Lane 0's x < 8 on the shared element must not bound lane 1's unguarded out[x].
+        self.assertEqual(self.writes("path_cross_lane"), "violated")
+
     def test_path_and_pred_not_taken_bounds_neither(self):
         self.assertNotEqual(self.writes("path_and"), "contained")
 
