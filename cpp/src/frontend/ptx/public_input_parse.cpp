@@ -385,7 +385,10 @@ KernelInput ParseKernelInput(const Json &value) {
         const auto type = f.value("element_type", Json());
         if (!type.is_string() || !element_bytes.contains(type.get<std::string>()))
           Fail("invalid_footprint", path + ".element_type", "extent_elements requires a scalar element_type");
-        f["extent_bytes"] = count * element_bytes.at(type.get<std::string>());
+        std::uint64_t bytes = 0;
+        if (__builtin_mul_overflow(std::uint64_t(count), std::uint64_t(element_bytes.at(type.get<std::string>())), &bytes))
+          Fail("invalid_footprint", path + ".extent_elements", "extent_elements times the element size overflows 64 bits");
+        f["extent_bytes"] = bytes;
         f.erase("extent_elements");
         f.erase("element_type");
       }
