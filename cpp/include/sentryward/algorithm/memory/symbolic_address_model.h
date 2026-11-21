@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "sentryward/algorithm/memory/address_solver.h"
 #include "sentryward/algorithm/memory/constant_address_model.h"
 
 namespace sentryward::algorithm {
@@ -85,6 +86,22 @@ struct ContainmentVerdict final {
   // Some atom's bounds come from a field property: they hold for this element, not necessarily
   // for the element a CTA-class member reads in its place.
   bool field_bounded = false;
+  // What decided the status (docs/design/gdn-multi-request.md, A2): kConstant, the exact constant
+  // offset; kPolicyHull, the interval hull of the atoms over their tensor-property policies alone
+  // (BoundsOf: object policy tightened by the field policies containing the element); kSolver, the
+  // solver over the address-invariant environment (term bounds, joint injectivity, injectivity).
+  // kNone: no status was decided (no extent, or kUnknown before either step).
+  enum class Basis { kNone, kConstant, kPolicyHull, kSolver };
+  Basis basis = Basis::kNone;
+  // The offset's atoms as tensor-property lookups (symbol, input object, element byte offset), in
+  // atom order; `lookups_complete` false when some atom is not a one-argument lookup of a known
+  // input object (then a class member's translated element is undefined).
+  struct Lookup {
+    std::string symbol, object;
+    address_solver::Int element = 0;
+  };
+  std::vector<Lookup> lookups;
+  bool lookups_complete = true;
   // kViolated: which side ("below_zero" or "past_extent") and the offset (constant) or the
   // solver's candidate valuation (symbolic); kUnknown: why.
   std::string side, witness, reason;
@@ -158,6 +175,9 @@ class SymbolicAddressModel final : public MemoryModel {
   [[nodiscard]] ContainmentVerdict containment(const MemoryAccess& access,
                                                 std::optional<std::uint64_t> extent_bytes,
                                                 unsigned timeout_ms = 2000, std::int64_t lower = 0);
+  // The indexes of the field policies (tensor_properties with a `field`) of lookup symbol `symbol`
+  // whose elements include byte offset `element`, ascending. Equal sets give equal BoundsOf.
+  [[nodiscard]] std::vector<std::size_t> fieldPolicySet(std::string_view symbol, address_solver::Int element) const;
   [[nodiscard]] SymbolicAddressStats stats() const noexcept;
   // Whether this build links an SMT backend, and its name ("z3" or "unavailable").
   [[nodiscard]] static bool SolverAvailable() noexcept;

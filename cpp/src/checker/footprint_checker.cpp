@@ -158,6 +158,40 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     return out;
   };
 
+  // A2 (docs/design/gdn-multi-request.md): a class member u reads element arg + δ_u(object) of each
+  // lookup in place of the representative's arg. The representative's symbolic verdict stands for u
+  // only when it was decided by the policy hull and every translated element lies in exactly the
+  // field policies of arg (then BoundsOf, and so the hull moved by u's allocation δ, are the same).
+  // Nullopt when it transfers, else why not. Memoized per (class, symbol, element).
+  std::map<std::tuple<std::uint32_t, std::string, address_solver::Int>, bool> same_policies;
+  const auto transfer_refusal = [&](std::uint32_t cta, const ContainmentVerdict& v) -> std::optional<std::string> {
+    if (v.basis != ContainmentVerdict::Basis::kPolicyHull) {
+      return v.basis == ContainmentVerdict::Basis::kSolver ? "basis_solver"
+                                                           : (v.min_byte ? "basis_undecided" : "no_hull");
+    }
+    if (!v.lookups_complete) return "non_lookup_atom";
+    const auto klass = units->units.at(units->UnitOf(cta)).klass;
+    const auto& c = units->classes.at(klass);
+    for (const auto& lookup : v.lookups) {
+      auto [slot, fresh] = same_policies.try_emplace({klass, lookup.symbol, lookup.element}, true);
+      if (!fresh) {
+        if (!slot->second) return "policy_set";
+        continue;
+      }
+      if (c.pieces.contains(lookup.object)) { slot->second = false; return "policy_set"; }
+      const auto mine = model.fieldPolicySet(lookup.symbol, lookup.element);
+      for (std::size_t i = 1; i < c.units.size() && slot->second; ++i) {
+        const auto found = i < c.delta.size() ? c.delta[i].find(lookup.object) : c.delta.front().end();
+        if (i >= c.delta.size() || found == c.delta[i].end()) { slot->second = false; break; }
+        if (model.fieldPolicySet(lookup.symbol, lookup.element + address_solver::Int(found->second)) != mine)
+          slot->second = false;
+      }
+      if (!slot->second) return "policy_set";
+    }
+    return std::nullopt;
+  };
+  std::map<ContainmentVerdict::Basis, std::size_t> basis_counts;
+
   std::map<std::string, ObjectStats> stats;
   std::map<std::tuple<std::string, std::string, std::string>, std::size_t> kind_counts;
   Json violations = Json::array(), undecided = Json::array();
@@ -245,15 +279,16 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     if (access.mode == AccessMode::kRead && decl.direction == "write")
       violation(access, "read_from_write_only", object, probe, decl.extent);
     // Every member's range [o + δ, o + δ + w) inside [0, extent): the representative's in
-    // [-min δ, extent - max δ). A symbolic offset in a shared class needs atoms bounded per object
-    // (the member reads another element of the same table, under the same bounds); otherwise the
-    // launch is analysed per unit.
+    // [-min δ, extent - max δ). A symbolic offset in a shared class transfers to the members only as
+    // transfer_refusal allows; otherwise the launch is analysed per unit.
     const std::int64_t lower = -shift.low;
     const std::uint64_t upper = shift.high > 0 ? (decl.extent > std::uint64_t(shift.high) ? decl.extent - shift.high : 0)
                                                : decl.extent;
     const auto verdict = model.containment(access, upper, 2000, lower);
-    if (shift.units > 1 && !verdict.constant_offset && (!verdict.min_byte || verdict.field_bounded))
-      throw UnitClassRestart{"footprint_symbolic_member:" + object};
+    ++basis_counts[verdict.basis];
+    if (shift.units > 1 && !verdict.constant_offset)
+      if (const auto why = transfer_refusal(ctas(access.actor), verdict))
+        throw UnitClassRestart{"footprint_symbolic_member:" + object + ":" + *why};
     if (!verdict.constant_offset) st.symbolic += shift.units;
     if (verdict.min_byte && verdict.max_byte_exclusive) {
       const auto lo = *verdict.min_byte + shift.low, hi = *verdict.max_byte_exclusive + shift.high;
@@ -363,6 +398,11 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
            {"writes", write_violations ? "violated" : write_unknown ? "inconclusive" : "contained"},
            {"reads", read_violations ? "violated" : reads_outside ? "not_contained" : read_unknown ? "inconclusive" : "contained"},
            {"reads_outside_declared", reads_outside}, {"outside_reads", std::move(outside_reads)},
+           // Analysed accesses (class representatives in class mode) by what decided the verdict.
+           {"verdict_basis", {{"constant", basis_counts[ContainmentVerdict::Basis::kConstant]},
+                              {"policy_hull", basis_counts[ContainmentVerdict::Basis::kPolicyHull]},
+                              {"solver", basis_counts[ContainmentVerdict::Basis::kSolver]},
+                              {"none", basis_counts[ContainmentVerdict::Basis::kNone]}}},
            {"scope", "all CTAs of the stated launch (class representatives moved by each member's delta in class mode); trusted: declared extents, directions and tensor_properties"}};
   report.json = out.dump();
   return report;

@@ -200,16 +200,27 @@ struct SymbolicAddressModel::Impl {
       upper = p->second.upper;
     }
     if (const auto f = field_policies.find(a.gather); f != field_policies.end() && a.args.size() == 1) {
-      const Int byte = a.args[0];
-      for (const auto& field : f->second) {
-        if (byte < Int(field.offset)) continue;
-        const Int rel = byte - Int(field.offset);
-        if (rel % Int(field.stride) != 0 || rel / Int(field.stride) >= Int(field.count)) continue;
+      for (const auto k : FieldPolicySet(a.gather, a.args[0])) {
+        const auto& field = f->second[k];
         if (field.lower) lower = lower ? std::max(*lower, *field.lower) : *field.lower;
         if (field.upper) upper = upper ? std::min(*upper, *field.upper) : *field.upper;
       }
     }
     return {lower, upper};
+  }
+  // The field policies of `symbol` whose elements include byte offset `byte` (BoundsOf's test).
+  std::vector<std::size_t> FieldPolicySet(const std::string& symbol, Int byte) const {
+    std::vector<std::size_t> result;
+    const auto f = field_policies.find(symbol);
+    if (f == field_policies.end()) return result;
+    for (std::size_t k = 0; k < f->second.size(); ++k) {
+      const auto& field = f->second[k];
+      if (byte < Int(field.offset)) continue;
+      const Int rel = byte - Int(field.offset);
+      if (rel % Int(field.stride) != 0 || rel / Int(field.stride) >= Int(field.count)) continue;
+      result.push_back(k);
+    }
+    return result;
   }
   // The input object of each tensor-property lookup symbol.
   std::map<std::string, std::string> gather_objects;
@@ -896,7 +907,14 @@ struct SymbolicAddressModel::Impl {
     verdict.constant_offset = offset.terms.empty();
     for (const auto& [atom, coefficient] : offset.terms) {
       (void)coefficient;
-      if (!atoms[atom].gather.empty() && field_policies.contains(atoms[atom].gather)) verdict.field_bounded = true;
+      const auto& a = atoms[atom];
+      if (!a.gather.empty() && field_policies.contains(a.gather)) verdict.field_bounded = true;
+      const auto object = a.gather.empty() ? gather_objects.end() : gather_objects.find(a.gather);
+      if (object == gather_objects.end() || a.args.size() != 1) {
+        verdict.lookups_complete = false;
+        continue;
+      }
+      verdict.lookups.push_back({a.gather, object->second, a.args.front()});
     }
     if (offset.constant >= Int(std::numeric_limits<std::int64_t>::min()) &&
         offset.constant <= Int(std::numeric_limits<std::int64_t>::max())) {
@@ -921,12 +939,14 @@ struct SymbolicAddressModel::Impl {
       } else {
         verdict.status = ContainmentVerdict::Status::kContained;
       }
+      verdict.basis = ContainmentVerdict::Basis::kConstant;
       return verdict;
     }
     if (!solver) return unknown("symbolic offset needs the SMT layer, which this build lacks");
     // Interval arithmetic first: a hull inside [0, extent) needs no solver.
     if (hull && hull->first >= Int(lower) && hull->second + width <= Int(*extent)) {
       verdict.status = ContainmentVerdict::Status::kContained;
+      verdict.basis = ContainmentVerdict::Basis::kPolicyHull;
       return verdict;
     }
     // The supremum and infimum of the symbolic part (offset without its constant) over the
@@ -940,6 +960,7 @@ struct SymbolicAddressModel::Impl {
       return unknown("address invariants and tensor properties are unsatisfiable for this access");
     const auto violated = [&](const char* side, const std::string& valuation, std::optional<Int> total) {
       verdict.status = ContainmentVerdict::Status::kViolated;
+      verdict.basis = ContainmentVerdict::Basis::kSolver;
       verdict.side = side;
       verdict.witness = valuation + (total ? ", offset=" + ToString(*total) : std::string{});
       return verdict;
@@ -952,6 +973,7 @@ struct SymbolicAddressModel::Impl {
                       extremes.sup ? std::optional<Int>(offset.constant + *extremes.sup) : std::nullopt);
     if (extremes.inf_unknown || extremes.sup_unknown) return unknown(extremes.reason);
     verdict.status = ContainmentVerdict::Status::kContained;
+    verdict.basis = ContainmentVerdict::Basis::kSolver;
     return verdict;
   }
 
@@ -1329,6 +1351,9 @@ ContainmentVerdict SymbolicAddressModel::containment(const MemoryAccess& access,
   return impl_->Contain(access, extent_bytes, timeout_ms, lower);
 }
 
+std::vector<std::size_t> SymbolicAddressModel::fieldPolicySet(std::string_view symbol, Int element) const {
+  return impl_->FieldPolicySet(std::string(symbol), element);
+}
 SymbolicAddressStats SymbolicAddressModel::stats() const noexcept { return impl_->stats; }
 bool SymbolicAddressModel::SolverAvailable() noexcept {
   return std::string_view(address_solver::BackendName()) != "unavailable";

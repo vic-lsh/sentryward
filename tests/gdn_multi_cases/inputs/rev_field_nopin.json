@@ -1,0 +1,80 @@
+{
+ "schema": "spverify.kernel-input/v1",
+ "entry": "k_rev",
+ "launch": {
+  "grid_dim": [
+   2,
+   1,
+   1
+  ],
+  "block_dim": [
+   32,
+   1,
+   1
+  ]
+ },
+ "declarations": [
+  {
+   "parameter": 0,
+   "type": "pointer",
+   "space": "global",
+   "object": "tab",
+   "name": "tab"
+  },
+  {
+   "parameter": 1,
+   "type": "pointer",
+   "space": "global",
+   "object": "state",
+   "name": "state"
+  },
+  {
+   "parameter": 2,
+   "type": "pointer",
+   "space": "global",
+   "object": "out",
+   "name": "out"
+  }
+ ],
+ "footprints": [
+  {
+   "object": "tab",
+   "direction": "read",
+   "extent_bytes": 8
+  },
+  {
+   "object": "state",
+   "direction": "read",
+   "extent_bytes": 4
+  },
+  {
+   "object": "out",
+   "direction": "write",
+   "extent_bytes": 8
+  }
+ ],
+ "tensor_properties": [
+  {
+   "object": "tab",
+   "element_type": "u32",
+   "property": "lower_bound",
+   "value": 0,
+   "field": {
+    "offset": 0,
+    "stride": 4,
+    "count": 2
+   }
+  },
+  {
+   "object": "tab",
+   "element_type": "u32",
+   "property": "upper_bound",
+   "value": 1,
+   "field": {
+    "offset": 0,
+    "stride": 4,
+    "count": 2
+   }
+  }
+ ]
+}
