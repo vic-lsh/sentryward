@@ -140,6 +140,13 @@ FootprintReport CheckFootprints(MemoryAccessView accesses, std::span<const Actor
     const __int128 limit = __int128(1) << 62;
     if (__int128(decl.extent) >= limit) decl.unrepresentable = true;
     for (const auto& p : decl.pieces) {
+      // Each field below 2^62 first: then every product of two (< 2^124) and the sums below fit.
+      if (p.base >= (std::uint64_t(1) << 62) || p.rows >= (std::uint64_t(1) << 62) ||
+          p.stride >= (std::uint64_t(1) << 62) || p.period >= (std::uint64_t(1) << 62) ||
+          p.count >= (std::uint64_t(1) << 62) || p.width >= (std::uint64_t(1) << 62)) {
+        decl.unrepresentable = true;
+        continue;
+      }
       const __int128 run = __int128(p.count ? p.count - 1 : 0) * __int128(p.count > 1 ? p.period : p.width) + p.width;
       const __int128 reach = __int128(p.base) + __int128(p.rows) * __int128(p.stride) + run;
       if (reach >= limit || __int128(p.base) + run >= limit) decl.unrepresentable = true;
