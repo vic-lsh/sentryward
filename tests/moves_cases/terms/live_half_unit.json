@@ -1,0 +1,25 @@
+{
+ "schema": "sentryward.moves-term/v1",
+ "row": "sm121/k_gather",
+ "unit_bytes": 64,
+ "source": {
+  "object": "hn",
+  "base_bytes": 0,
+  "unit_stride_bytes": 128,
+  "units": 2
+ },
+ "destination": {
+  "object": "hs",
+  "base_bytes": 0,
+  "unit_stride_bytes": 128,
+  "units": 2,
+  "index": {
+   "object": "meta",
+   "element": "s32",
+   "offset_bytes": 44,
+   "stride_bytes": 16,
+   "none": -1
+  }
+ },
+ "live": "all"
+}
