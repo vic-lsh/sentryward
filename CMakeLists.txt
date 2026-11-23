@@ -283,7 +283,7 @@ target_include_directories(sentryward_ptx SYSTEM PUBLIC
 target_link_libraries(sentryward_ptx PUBLIC sentryward_io sentryward::value_ir OpenSSL::Crypto)
 target_link_libraries(sentryward_value_analysis PUBLIC sentryward_ptx)
 # Structural mode (docs/structural-mode.md): a binding term's wiring over the value IR.
-add_library(sentryward_structural STATIC cpp/src/value_analysis/structural.cpp)
+add_library(sentryward_structural STATIC cpp/src/value_analysis/structural.cpp cpp/src/value_analysis/moves.cpp)
 target_include_directories(sentryward_structural SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/vendor/nlohmann_json/single_include)
 target_link_libraries(sentryward_structural PUBLIC sentryward::value_analysis)
 target_compile_options(sentryward_structural PRIVATE $<TARGET_PROPERTY:sentryward_algorithm,COMPILE_OPTIONS>)

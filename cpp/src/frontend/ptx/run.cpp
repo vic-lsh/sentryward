@@ -29,6 +29,7 @@
 #include "sentryward/frontend/ptx/look_ahead.h"
 #include "sentryward/value_ir/operations.h"
 #include "sentryward/value_analysis/passes.h"
+#include "sentryward/value_analysis/moves.h"
 #include "sentryward/value_analysis/structural.h"
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
 #include "sentryward/development/runner/checkpoint_headers.inc"
@@ -73,6 +74,7 @@ struct Options {
   std::string ptx, config, report, dump_source, dump_value_ir, dump_output_expressions, dump_scalar_fold;
   // Structural mode (docs/structural-mode.md): the binding term's file and the report's path.
   std::string structural_term, structural_report;
+  std::string moves_term, moves_report;  // moves mode (docs/moves-mode.md)
   bool structural_reference = false;  // tests only: the reference role verdicts in the report
   std::string cache_correctness, resume_correctness;
   std::string dump_branch_scope;
@@ -171,6 +173,8 @@ Options Arguments(int argc, char **argv) {
       o.analyze_values = true;
     else if (a == "--structural-term") { o.structural_term = value(); o.analyze_values = true; }
     else if (a == "--structural-report") o.structural_report = value();
+    else if (a == "--moves-term") { o.moves_term = value(); o.analyze_values = true; }
+    else if (a == "--moves-report") o.moves_report = value();
     else if (a == "--structural-reference") o.structural_reference = true;
 
 #ifdef SENTRYWARD_DEVELOPMENT_EXPORTS
@@ -1297,7 +1301,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
     auto effective_assumptions = alg::DefaultPtxAssumptions();
     std::function<void(ptx::CheckedMemoryActions)> run_values;
     // The structural report of the latest value analysis attempt (written with the result).
-    std::optional<std::string> structural_text;
+    std::optional<std::string> structural_text, moves_text;
     // Value lifting: a value stage of the class-mode quotient whose result
     // cannot stand for the members refuses lifting (RefuseLifting); the launch
     // re-runs per unit before the later (more expensive) stages, or, above the
@@ -1311,6 +1315,7 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
     const auto class_lifting = [&] { return unit_lifting.has_value(); };
     run_values = [&](ptx::CheckedMemoryActions actions) {
       structural_text.reset();
+      moves_text.reset();
       monitor.Stage("value_analysis.prepare");
       if (!semantic_program->valuesComplete()) {
         const auto& diagnostic = semantic_program->value_diagnostics.front();
@@ -1374,6 +1379,13 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
         structural_text = sentryward::value_analysis::checkStructuralTerm(
             semantic_program->values, *eliminated, term_text.str(), class_lifting() ? &*unit_lifting : nullptr,
             options.structural_reference);
+      }
+      if (!options.moves_term.empty()) {
+        std::ifstream term_file(options.moves_term);
+        std::stringstream term_text;
+        term_text << term_file.rdbuf();
+        moves_text = sentryward::value_analysis::checkMovesTerm(
+            semantic_program->values, *eliminated, term_text.str(), class_lifting() ? &*unit_lifting : nullptr);
       }
       value_analysis = {{"status", eliminated->complete ? "expressions_ready" : "unsupported"},
           {"passes", Json::array({
@@ -2526,6 +2538,9 @@ int RunAttempt(int argc, char **argv, CallInputs &inputs, const std::optional<Pe
     if (!options.structural_report.empty())
       std::ofstream(options.structural_report) << structural_text.value_or(
           R"({"schema":"sentryward.structural-report/v1","result":"unsupported","reason":"value_analysis_not_reached"})");
+    if (!options.moves_report.empty())
+      std::ofstream(options.moves_report) << moves_text.value_or(
+          R"({"schema":"sentryward.moves-report/v1","result":"unsupported","reason":"value_analysis_not_reached"})");
     const auto exit_status = result.value("status", "");
     result = sentryward::results::PublicReport(
         std::move(result), options.extract ? "extraction" : options.semantic ? "semantic_analysis" : "kernel_verification");
